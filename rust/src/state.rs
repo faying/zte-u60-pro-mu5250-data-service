@@ -27,11 +27,17 @@ fn string(v: &Value, key: &str) -> String {
     }
 }
 fn integer(v: &Value, key: &str) -> i64 {
+    integer_or(v, key, 0)
+}
+/// Like `integer`, but with an explicit default instead of 0 — for fields
+/// where 0 is a valid reading and "no data" needs its own sentinel (e.g.
+/// battery percent/time_to_full, matching the C implementation's -1).
+fn integer_or(v: &Value, key: &str, default: i64) -> i64 {
     match v.get(key) {
-        Some(Value::Number(x)) => x.as_i64().unwrap_or_default(),
-        Some(Value::String(x)) => x.parse().unwrap_or_default(),
+        Some(Value::Number(x)) => x.as_i64().unwrap_or(default),
+        Some(Value::String(x)) => x.parse().unwrap_or(default),
         Some(Value::Bool(x)) => i64::from(*x),
-        _ => 0,
+        _ => default,
     }
 }
 fn interface(v: &Value) -> Value {
@@ -1062,12 +1068,20 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
                 .find(|s| !uci_get(&uci_sets, &format!("wireless.{s}.ssid")).is_empty())
         });
     let (cpu_sys, zones, runtime_zones) = thermal_zones();
-    let cpu_temp = ["cpuss_temp", "cpu_temp", "temperature", "temp"]
-        .into_iter()
-        .map(|k| integer(&thermal, k))
-        .find(|v| *v > 0)
-        .map(|v| if v >= 1000 { (v + 500) / 1000 } else { v })
-        .unwrap_or(cpu_sys);
+    // MU5250/MU5252 only trust ubus's `cpuss_temp` (matches the C template's
+    // TEMP_SOURCE_U60_UBUS_ONLY) — no other-key or sysfs-average fallback,
+    // since that silently substitutes a plausible-looking but wrong value.
+    let cpu_temp = if matches!(template, "MU5250" | "MU5252") {
+        let v = integer_or(&thermal, "cpuss_temp", -1);
+        if v < 0 { 0 } else if v >= 1000 { (v + 500) / 1000 } else { v }
+    } else {
+        ["cpuss_temp", "cpu_temp", "temperature", "temp"]
+            .into_iter()
+            .map(|k| integer(&thermal, k))
+            .find(|v| *v > 0)
+            .map(|v| if v >= 1000 { (v + 500) / 1000 } else { v })
+            .unwrap_or(cpu_sys)
+    };
     let (mt, ma, mp) = memory_fields(&info);
     let release = board.get("release").unwrap_or(&Value::Null);
     let sw = {
@@ -1093,7 +1107,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
             .as_object()
             .is_some_and(|v| v.keys().any(|k| k.starts_with("battery_")))
     {
-        fields.insert("battery".into(),json!({"percent":integer(&battery,"battery_capacity"),"temp":integer(&battery,"battery_temperature"),"online":integer(&battery,"battery_online"),"health":integer(&battery,"battery_health"),"time_to_full":integer(&battery,"battery_time_to_full"),"charging":integer(&charger,"charge_status"),"charger_connect":integer(&charger,"charger_connect"),"charger_type":integer(&charger,"charger_type"),"chg_uv":read_i64("/sys/class/power_supply/usb/voltage_now"),"chg_ua":read_i64("/sys/class/power_supply/usb/current_now"),"bat_uv":read_i64("/sys/class/power_supply/battery/voltage_now"),"bat_ua":read_i64("/sys/class/power_supply/battery/current_now")}));
+        fields.insert("battery".into(),json!({"percent":integer_or(&battery,"battery_capacity",-1),"temp":integer(&battery,"battery_temperature"),"online":integer(&battery,"battery_online"),"health":integer(&battery,"battery_health"),"time_to_full":integer_or(&battery,"battery_time_to_full",-1),"charging":integer(&charger,"charge_status"),"charger_connect":integer(&charger,"charger_connect"),"charger_type":integer(&charger,"charger_type"),"chg_uv":read_i64("/sys/class/power_supply/usb/voltage_now"),"chg_ua":read_i64("/sys/class/power_supply/usb/current_now"),"bat_uv":read_i64("/sys/class/power_supply/battery/voltage_now"),"bat_ua":read_i64("/sys/class/power_supply/battery/current_now")}));
     }
     if let Some(mode) = charger
         .get("direct_power_supply_mode")
@@ -1581,6 +1595,12 @@ mod tests {
     fn profile() {
         assert_eq!(normalize_profile("MC7523 HW1.0"), "mc7523_hw1_0");
         assert_eq!(normalize_profile("MU5250"), "mu5250")
+    }
+    #[test]
+    fn integer_or_default() {
+        assert_eq!(integer_or(&json!({}), "missing", -1), -1);
+        assert_eq!(integer_or(&json!({"x": 5}), "x", -1), 5);
+        assert_eq!(integer(&json!({}), "missing"), 0);
     }
     #[test]
     fn iface() {
