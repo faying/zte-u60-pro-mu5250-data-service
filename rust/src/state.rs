@@ -432,6 +432,28 @@ fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
         "factory_curve":factory,"custom_curve":custom,"curve":curve
     })
 }
+/// Which `wireless.*` section feeds the `wlan` block. MU5250 always reads
+/// `main_2g` (C: WIFI_SOURCE_U60_MAIN_2G), even while it is disabled, and shows
+/// the block when any of ssid/key/encryption is set. Every other template picks
+/// the first enabled section with an SSID, else the first with an SSID.
+fn wifi_section(template: &str, sets: &[BTreeMap<String, String>]) -> Option<&'static str> {
+    let get = |s: &str, k: &str| uci_get(sets, &format!("wireless.{s}.{k}"));
+    if template == "MU5250" {
+        return ["ssid", "key", "encryption"]
+            .into_iter()
+            .any(|k| !get("main_2g", k).is_empty())
+            .then_some("main_2g");
+    }
+    ["main_2g", "main_5g"]
+        .into_iter()
+        .find(|s| !get(s, "ssid").is_empty() && get(s, "disabled") != "1")
+        .or_else(|| {
+            ["main_2g", "main_5g"]
+                .into_iter()
+                .find(|s| !get(s, "ssid").is_empty())
+        })
+}
+
 fn topflow_net_fallback(raw: &mut Value, sets: &[BTreeMap<String, String>]) {
     if raw.get("network_type").is_some_and(|v| !v.is_null()) {
         return;
@@ -981,7 +1003,10 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "mc8532b" => "MC8532B",
         _ => "legacy_compat",
     };
-    if matches!(template, "MU5250" | "MU5252" | "MC7523" | "MC8532B") {
+    // Only templates the C side marks NETWORK_SOURCE_NWINFO_UBUS_WITH_UCI_FALLBACK
+    // may fill network fields from the zte_nwinfo UCI cache. MU5250/MC7523 are
+    // ubus-only: a failed nwinfo call must read as "no data", not stale UCI.
+    if matches!(template, "MU5252" | "MC8532B") {
         topflow_net_fallback(&mut raw_net, &uci_sets);
     }
     let mut net = Map::new();
@@ -1056,24 +1081,20 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     }
     tout.insert("limit".into(), limit);
     tout.insert("clear_day".into(), clear_day);
-    let wifi = ["main_2g", "main_5g"]
-        .into_iter()
-        .find(|s| {
-            !uci_get(&uci_sets, &format!("wireless.{s}.ssid")).is_empty()
-                && uci_get(&uci_sets, &format!("wireless.{s}.disabled")) != "1"
-        })
-        .or_else(|| {
-            ["main_2g", "main_5g"]
-                .into_iter()
-                .find(|s| !uci_get(&uci_sets, &format!("wireless.{s}.ssid")).is_empty())
-        });
+    let wifi = wifi_section(template, &uci_sets);
     let (cpu_sys, zones, runtime_zones) = thermal_zones();
     // MU5250/MU5252 only trust ubus's `cpuss_temp` (matches the C template's
     // TEMP_SOURCE_U60_UBUS_ONLY) — no other-key or sysfs-average fallback,
     // since that silently substitutes a plausible-looking but wrong value.
     let cpu_temp = if matches!(template, "MU5250" | "MU5252") {
         let v = integer_or(&thermal, "cpuss_temp", -1);
-        if v < 0 { 0 } else if v >= 1000 { (v + 500) / 1000 } else { v }
+        if v < 0 {
+            0
+        } else if v >= 1000 {
+            (v + 500) / 1000
+        } else {
+            v
+        }
     } else {
         ["cpuss_temp", "cpu_temp", "temperature", "temp"]
             .into_iter()
@@ -1601,6 +1622,34 @@ mod tests {
         assert_eq!(integer_or(&json!({}), "missing", -1), -1);
         assert_eq!(integer_or(&json!({"x": 5}), "x", -1), 5);
         assert_eq!(integer(&json!({}), "missing"), 0);
+    }
+    fn wireless(pairs: &[(&str, &str)]) -> Vec<BTreeMap<String, String>> {
+        vec![
+            pairs
+                .iter()
+                .map(|(k, v)| (format!("wireless.{k}"), v.to_string()))
+                .collect(),
+        ]
+    }
+    #[test]
+    fn wifi_section_mu5250_sticks_to_main_2g() {
+        // 2G disabled, 5G up: the C U60 path still reports main_2g.
+        let sets = wireless(&[
+            ("main_2g.ssid", "home"),
+            ("main_2g.disabled", "1"),
+            ("main_5g.ssid", "home-5g"),
+        ]);
+        assert_eq!(wifi_section("MU5250", &sets), Some("main_2g"));
+        assert_eq!(wifi_section("MU5252", &sets), Some("main_5g"));
+    }
+    #[test]
+    fn wifi_section_mu5250_hidden_without_main_2g_data() {
+        let sets = wireless(&[("main_5g.ssid", "only-5g")]);
+        assert_eq!(wifi_section("MU5250", &sets), None);
+        assert_eq!(wifi_section("legacy_compat", &sets), Some("main_5g"));
+        let key_only = wireless(&[("main_2g.key", "secret")]);
+        assert_eq!(wifi_section("MU5250", &key_only), Some("main_2g"));
+        assert_eq!(wifi_section("MU5252", &key_only), None);
     }
     #[test]
     fn iface() {
