@@ -14,8 +14,10 @@ use std::{
 };
 use tokio::process::Command;
 
-const NETDISK: &str = "https://pan.ericsfj.com/sd/wN2PJUK8";
-const GITHUB: &str = "https://github.com/33333s/zwrt-datad/releases/latest/download";
+// No built-in update servers. Upstream shipped two (a personal netdisk share
+// and the upstream GitHub releases); this fork has none, so the daemon never
+// reaches outside the device unless the owner configures a server of their
+// own. Updates are deployed by hand, side by side, like every other binary.
 const PUBLIC_KEY: &str = include_str!("../../cloud/ota_public.pem");
 const IDLE_FOR: Duration = Duration::from_secs(120);
 
@@ -28,10 +30,12 @@ pub struct Config {
     pub sources: Vec<String>,
 }
 
+// The default is also what an unreadable or invalid ota.json falls back to
+// (see `Ota::load`), so it must be the safe state: off, nowhere to fetch from.
 impl Default for Config {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             servers: Vec::new(),
             sources: default_sources(),
         }
@@ -39,10 +43,7 @@ impl Default for Config {
 }
 
 fn default_sources() -> Vec<String> {
-    ["custom", "netdisk", "github"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
+    ["custom"].into_iter().map(str::to_owned).collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -152,7 +153,7 @@ impl Ota {
     }
 
     pub fn config_json(&self) -> Value {
-        json!({"success":true,"config":self.config,"default_servers":["网盘","GitHub"]})
+        json!({"success":true,"config":self.config,"default_servers":[]})
     }
 
     pub fn status_json(&self) -> Value {
@@ -190,12 +191,6 @@ impl Ota {
         let mut ordered = Vec::new();
         if enabled.contains("custom") {
             ordered.extend(self.config.servers.iter().map(String::as_str));
-        }
-        if enabled.contains("netdisk") {
-            ordered.push(NETDISK);
-        }
-        if enabled.contains("github") {
-            ordered.push(GITHUB);
         }
         ordered
             .into_iter()
@@ -521,7 +516,7 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
     }
     let mut sources = HashSet::new();
     for source in &config.sources {
-        if !matches!(source.as_str(), "custom" | "netdisk" | "github") {
+        if source != "custom" {
             return Err("更新来源无效".into());
         }
         if !sources.insert(source) {
@@ -594,8 +589,6 @@ pub fn source_name(source: &str) -> &'static str {
         "网盘" => "网盘",
         "GitHub" => "GitHub",
         "自定义服务器" => "自定义服务器",
-        NETDISK => "网盘",
-        GITHUB => "GitHub",
         _ => "自定义服务器",
     }
 }
@@ -685,15 +678,34 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
+    fn defaults_never_reach_outside() {
+        // Default = what a broken ota.json falls back to: off, and no server.
+        let config = Config::default();
+        assert!(!config.enabled);
+        assert!(config.servers.is_empty());
+        let ota = Ota::load(Path::new("/nonexistent-ota-dir")).unwrap();
+        assert!(ota.servers().is_empty());
+        // An upstream-style config naming the removed sources is invalid, so
+        // loading it lands on the safe default too.
+        let legacy = Config {
+            enabled: true,
+            servers: Vec::new(),
+            sources: vec!["custom".into(), "netdisk".into(), "github".into()],
+        };
+        assert!(validate_config(&legacy).is_err());
+    }
+
+    #[test]
     fn public_key_and_defaults_are_valid() {
         parse_public_key(PUBLIC_KEY).unwrap();
         validate_config(&Config::default()).unwrap();
+        let base = "https://updates.example/datad";
         assert_eq!(
-            source_url(NETDISK, "update.json"),
-            format!("{NETDISK}/update.json")
+            source_url(base, "update.json"),
+            format!("{base}/update.json")
         );
         assert_eq!(Config::default().sources, default_sources());
-        assert_eq!(source_name(NETDISK), "网盘");
+        assert_eq!(source_name(base), "自定义服务器");
         assert!(newer("9.1.0", "9.0.99"));
     }
 
