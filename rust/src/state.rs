@@ -1,13 +1,90 @@
 use crate::{command, model::Snapshot};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     ffi::CString,
     fs,
     path::Path,
     sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+// ── Per-call cache (MU5250 power) ──────────────────────────────────────────
+//
+// Every round used to run ~26 `ubus call`s and 12 `uci show`s, serially, each
+// a fork+exec — and many vendor handlers fork helpers of their own, so on a
+// U60 Pro (MU5250) stopping datad dropped the device-wide fork rate from ~180–
+// 300/s to ~57/s. Most of that data barely moves (IMEI, board, config
+// packages, data limits), so each call gets a time-to-live and is reused until
+// it expires. Anything the user changes through /control clears the whole
+// cache (`invalidate_cache`), so the screen still reacts at once.
+// ZWRT_DATAD_CACHE=0 turns all of it off.
+
+struct Cached<T> {
+    at: Instant,
+    ttl: Duration,
+    value: T,
+}
+
+static UBUS_CACHE: Mutex<Option<HashMap<String, Cached<Result<Value, String>>>>> = Mutex::new(None);
+static UCI_CACHE: Mutex<Option<HashMap<String, Cached<BTreeMap<String, String>>>>> = Mutex::new(None);
+
+fn cache_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ZWRT_DATAD_CACHE").as_deref() != Ok("0"))
+}
+
+/// Drop every cached result. Called after each /control action.
+pub fn invalidate_cache() {
+    if let Ok(mut c) = UBUS_CACHE.lock() {
+        *c = None;
+    }
+    if let Ok(mut c) = UCI_CACHE.lock() {
+        *c = None;
+    }
+    crate::qos::invalidate();
+}
+
+fn cache_get<T: Clone>(cache: &Mutex<Option<HashMap<String, Cached<T>>>>, key: &str) -> Option<T> {
+    let c = cache.lock().ok()?;
+    let e = c.as_ref()?.get(key)?;
+    (e.at.elapsed() < e.ttl).then(|| e.value.clone())
+}
+
+fn cache_put<T>(cache: &Mutex<Option<HashMap<String, Cached<T>>>>, key: String, ttl: Duration, value: T) {
+    if let Ok(mut c) = cache.lock() {
+        c.get_or_insert_with(HashMap::new).insert(key, Cached { at: Instant::now(), ttl, value });
+    }
+}
+
+/// `ubus` with a time-to-live. Failures are kept for at most 5 s: a call that
+/// does not exist on this model should not fork every second, but a transient
+/// error must not stick.
+async fn ubus_ttl(ttl_s: u64, service: &str, method: &str, args: Value) -> Result<Value, String> {
+    if ttl_s == 0 || !cache_enabled() {
+        return ubus(service, method, args).await;
+    }
+    let key = format!("{service}\u{0}{method}\u{0}{args}");
+    if let Some(v) = cache_get(&UBUS_CACHE, &key) {
+        return v;
+    }
+    let v = ubus(service, method, args).await;
+    let ttl = if v.is_ok() { ttl_s } else { ttl_s.min(5) };
+    cache_put(&UBUS_CACHE, key, Duration::from_secs(ttl), v.clone());
+    v
+}
+
+async fn uci_show_ttl(ttl_s: u64, package: &str) -> BTreeMap<String, String> {
+    if ttl_s == 0 || !cache_enabled() {
+        return uci_show(package).await;
+    }
+    if let Some(v) = cache_get(&UCI_CACHE, package) {
+        return v;
+    }
+    let v = uci_show(package).await;
+    cache_put(&UCI_CACHE, package.to_string(), Duration::from_secs(ttl_s), v.clone());
+    v
+}
 
 fn ubus_bin() -> String {
     std::env::var("ZWRT_DATAD_UBUS_BIN").unwrap_or_else(|_| "/bin/ubus".into())
@@ -865,73 +942,82 @@ fn runtime(runtime_zones: Value) -> (i64, Value) {
 pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     // Vendor ubus implementations on these devices lose replies under a large
     // burst of concurrent clients, so state collection is deliberately serial.
-    let common = ubus("zwrt_zte_mdm.api", "get_zwrt_common_info", json!({})).await;
-    let board = ubus("system", "board", json!({})).await;
-    let info = ubus("system", "info", json!({})).await;
-    let net = ubus("zte_nwinfo_api", "nwinfo_get_netinfo", json!({})).await;
-    let traffic = ubus(
+    let common = ubus_ttl(60, "zwrt_zte_mdm.api", "get_zwrt_common_info", json!({})).await;
+    let board = ubus_ttl(300, "system", "board", json!({})).await;
+    let info = ubus_ttl(0, "system", "info", json!({})).await;
+    let net = ubus_ttl(0, "zte_nwinfo_api", "nwinfo_get_netinfo", json!({})).await;
+    let traffic = ubus_ttl(
+        0,
         "zwrt_data",
         "get_wwandst",
         json!({"source_module":"deviceui","cid":1,"type":1}),
     )
     .await;
-    let accounting = ubus(
+    let accounting = ubus_ttl(
+        10,
         "zwrt_data",
         "get_wwandst",
         json!({"source_module":"web","cid":1,"type":4}),
     )
     .await;
-    let limit = ubus(
+    let limit = ubus_ttl(
+        60,
         "zwrt_data",
         "get_wwandst_monthlimit",
         json!({"source_module":"web","cid":1}),
     )
     .await;
-    let clear_day = ubus(
+    let clear_day = ubus_ttl(
+        60,
         "zwrt_data",
         "get_wwandst_clearday",
         json!({"source_module":"web","cid":1}),
     )
     .await;
-    let sim = ubus("zwrt_zte_mdm.api", "get_sim_info", json!({})).await;
-    let imei = ubus("zwrt_zte_mdm.api", "get_imei", json!({})).await;
-    let lan_clients = ubus(
+    let sim = ubus_ttl(30, "zwrt_zte_mdm.api", "get_sim_info", json!({})).await;
+    let imei = ubus_ttl(300, "zwrt_zte_mdm.api", "get_imei", json!({})).await;
+    let lan_clients = ubus_ttl(
+        10,
         "zwrt_router.api",
         "router_lan_access_list",
         json!({"start_id":1,"end_id":64}),
     )
     .await;
-    let wifi_clients = ubus(
+    let wifi_clients = ubus_ttl(
+        10,
         "zwrt_router.api",
         "router_wireless_access_list",
         json!({"start_id":1,"end_id":64}),
     )
     .await;
-    let router_status = ubus("zwrt_router.api", "router_get_status_no_auth", json!({})).await;
-    let thermal = ubus("zwrt_bsp.thermal", "get_cpu_temp", json!({})).await;
-    let usb = ubus("zwrt_bsp.usb", "list", json!({})).await;
-    let battery = ubus("zwrt_bsp.battery", "list", json!({})).await;
-    let charger = ubus("zwrt_bsp.charger", "list", json!({})).await;
-    let nfc = ubus("zwrt_nfc", "zwrt_nfc_wifi_get", json!({})).await;
+    let router_status = ubus_ttl(5, "zwrt_router.api", "router_get_status_no_auth", json!({})).await;
+    let thermal = ubus_ttl(5, "zwrt_bsp.thermal", "get_cpu_temp", json!({})).await;
+    let usb = ubus_ttl(30, "zwrt_bsp.usb", "list", json!({})).await;
+    let battery = ubus_ttl(5, "zwrt_bsp.battery", "list", json!({})).await;
+    let charger = ubus_ttl(5, "zwrt_bsp.charger", "list", json!({})).await;
+    let nfc = ubus_ttl(60, "zwrt_nfc", "zwrt_nfc_wifi_get", json!({})).await;
     let _ = crate::sms::prepare().await;
-    let sms_capacity = ubus("zwrt_wms", "zwrt_wms_get_wms_capacity", json!({})).await;
-    let sms_nv = ubus(
+    let sms_capacity = ubus_ttl(30, "zwrt_wms", "zwrt_wms_get_wms_capacity", json!({})).await;
+    let sms_nv = ubus_ttl(
+        10,
         "zwrt_wms",
         "zte_libwms_get_sms_data",
         json!({"page":0,"data_per_page":8,"mem_store":1,"tags":10,"order_by":"order by id desc"}),
     )
     .await;
-    let sms_sim = ubus(
+    let sms_sim = ubus_ttl(
+        10,
         "zwrt_wms",
         "zte_libwms_get_sms_data",
         json!({"page":0,"data_per_page":8,"mem_store":0,"tags":10,"order_by":"order by id desc"}),
     )
     .await;
-    let lan_if = ubus("network.interface.lan", "status", json!({})).await;
-    let wan4_if = ubus("network.interface.zte_wan", "status", json!({})).await;
-    let wan6_if = ubus("network.interface.zte_wan6", "status", json!({})).await;
-    let lan_config = ubus("zwrt_router.api", "router_get_lan_info", json!({})).await;
-    let cellular = ubus(
+    let lan_if = ubus_ttl(5, "network.interface.lan", "status", json!({})).await;
+    let wan4_if = ubus_ttl(5, "network.interface.zte_wan", "status", json!({})).await;
+    let wan6_if = ubus_ttl(5, "network.interface.zte_wan6", "status", json!({})).await;
+    let lan_config = ubus_ttl(60, "zwrt_router.api", "router_get_lan_info", json!({})).await;
+    let cellular = ubus_ttl(
+        5,
         "zwrt_data",
         "get_wwaniface",
         json!({"source_module":"web","cid":1,"connect_status":""}),
@@ -981,8 +1067,10 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "mwan3",
     ];
     let mut uci_sets = Vec::new();
+    // Configuration packages change only when someone saves settings, and
+    // every save through /control clears the cache.
     for p in packages {
-        uci_sets.push(uci_show(p).await)
+        uci_sets.push(uci_show_ttl(30, p).await)
     }
     let model_name = string(&common, "model_name");
     let hardware_version = string(&common, "hardware_version");
@@ -1611,6 +1699,19 @@ fn validate_name(v: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slow_state_cache_expires_and_is_cleared_by_control() {
+        let key = "test\u{0}cache".to_string();
+        cache_put(&UBUS_CACHE, key.clone(), Duration::from_millis(80), Ok(json!({"v":1})));
+        assert_eq!(cache_get(&UBUS_CACHE, &key), Some(Ok(json!({"v":1}))));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(cache_get(&UBUS_CACHE, &key), None, "expired entries are not served");
+        cache_put(&UCI_CACHE, "wireless".into(), Duration::from_secs(60), BTreeMap::new());
+        assert!(cache_get(&UCI_CACHE, "wireless").is_some());
+        invalidate_cache();
+        assert!(cache_get(&UCI_CACHE, "wireless").is_none(), "a /control action clears the cache");
+    }
+
     use super::*;
     #[test]
     fn profile() {

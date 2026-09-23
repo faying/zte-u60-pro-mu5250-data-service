@@ -636,6 +636,10 @@ async fn control(
         )
             .into_response();
     }
+    // Whatever this action changes, the cached slow-moving state may now be
+    // stale (state.rs `invalidate_cache`); the post-action refreshes below
+    // clear it again once the change has been made.
+    crate::state::invalidate_cache();
     if action == "neighbor.status" {
         return (StatusCode::OK,Json(json!({"ok":true,"action":action,"result":app.inner.neighbor.lock().await.status()}))).into_response();
     }
@@ -883,7 +887,10 @@ async fn control(
     match crate::control::execute(action, body.get("params").unwrap_or(&json!({}))).await {
         crate::control::Outcome::Ok(value) => {
             let refresh = app.clone();
-            tokio::spawn(async move { refresh.refresh_snapshot().await });
+            tokio::spawn(async move {
+            crate::state::invalidate_cache();
+            refresh.refresh_snapshot().await
+        });
             return control_ok(action, value);
         }
         crate::control::Outcome::Invalid(error) => return invalid_parameter(action, &error),
@@ -892,7 +899,10 @@ async fn control(
     }
     if action == "state.refresh" {
         let refresh = app.clone();
-        tokio::spawn(async move { refresh.refresh_snapshot().await });
+        tokio::spawn(async move {
+            crate::state::invalidate_cache();
+            refresh.refresh_snapshot().await
+        });
         return control_ok(action, json!({"queued":true}));
     }
     if action == "state.set_interval" {
@@ -905,12 +915,18 @@ async fn control(
         };
         app.inner.interval_ms.store(milliseconds, Ordering::Relaxed);
         let refresh = app.clone();
-        tokio::spawn(async move { refresh.refresh_snapshot().await });
+        tokio::spawn(async move {
+            crate::state::invalidate_cache();
+            refresh.refresh_snapshot().await
+        });
         return control_ok(action, json!({"sample_interval_ms":milliseconds}));
     }
     if action == "qos.reload" {
         let refresh = app.clone();
-        tokio::spawn(async move { refresh.refresh_snapshot().await });
+        tokio::spawn(async move {
+            crate::state::invalidate_cache();
+            refresh.refresh_snapshot().await
+        });
         return control_ok(action, json!({"queued":true}));
     }
     (

@@ -26,7 +26,38 @@ struct Candidate {
     ul: Option<f64>,
 }
 
+// Reading the tails of key.log and key.log.0 means scanning up to 4 MiB of
+// text; on a U60 Pro (MU5250) that ran every second. QCI/AMBR only change on
+// a bearer event, so reuse the last answer for 30 s (and the same PLMN).
+// ZWRT_DATAD_CACHE=0 turns this off, as for the state cache.
+const REUSE_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+static LAST: std::sync::Mutex<Option<(std::time::Instant, i64, i64, Values)>> = std::sync::Mutex::new(None);
+
+pub fn invalidate() {
+    if let Ok(mut l) = LAST.lock() {
+        *l = None;
+    }
+}
+
 pub fn read_for_plmn(mcc: i64, mnc: i64) -> Values {
+    let caching = std::env::var("ZWRT_DATAD_CACHE").as_deref() != Ok("0");
+    if caching
+        && let Ok(l) = LAST.lock()
+        && let Some((at, m, n, v)) = l.as_ref()
+        && *m == mcc
+        && *n == mnc
+        && at.elapsed() < REUSE_FOR
+    {
+        return v.clone();
+    }
+    let v = read_for_plmn_uncached(mcc, mnc);
+    if caching && let Ok(mut l) = LAST.lock() {
+        *l = Some((std::time::Instant::now(), mcc, mnc, v.clone()));
+    }
+    v
+}
+
+fn read_for_plmn_uncached(mcc: i64, mnc: i64) -> Values {
     let current =
         std::env::var("ZWRT_DATAD_KEY_LOG").unwrap_or_else(|_| "/data/logfs/key.log".into());
     let rotated = std::env::var("ZWRT_DATAD_KEY_LOG_ROTATED")
