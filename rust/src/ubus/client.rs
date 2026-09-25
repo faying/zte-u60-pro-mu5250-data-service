@@ -18,7 +18,8 @@
 //! - seq 跨重连单调递增（不从头开始），旧连接上迟到的回复即使被转到新连接也对不上。
 //! - 对象 ID 会变（原厂服务重启后重新注册）：INVOKE 回 NOT_FOUND 时作废缓存、重新 LOOKUP、再调一次；
 //!   回 METHOD_NOT_FOUND 时只作废缓存（下次调用重新 LOOKUP），不在本次重试。
-//! - 只在请求**确定没送到** ubusd 时自动重试（旧连接写失败，比如 ubusd 重启过）；
+//! - 只在请求**确定没送到** ubusd 时自动重试（旧连接写失败，比如 ubusd 重启过；这时整个 ID 缓存作废，
+//!   因为重启后 ID 全换、旧 ID 可能被别的对象用上）；读写错误断线同样清空 ID 缓存；
 //!   写出去之后超时或断开都不重试，避免 `/control` 的写操作执行两次。
 
 use super::blob::{self, Frame, MsgHdr, ReadError, attr, msg_type, status};
@@ -168,6 +169,8 @@ pub struct UbusClient {
     seq: u16,
     ids: HashMap<String, u32>,
     stats: ClientStats,
+    /// 本次 request 在旧连接上写失败（请求没送到）。
+    stale_write: bool,
 }
 
 impl UbusClient {
@@ -183,6 +186,7 @@ impl UbusClient {
             seq: 0,
             ids: HashMap::new(),
             stats: ClientStats::default(),
+            stale_write: false,
         }
     }
 
@@ -251,13 +255,31 @@ impl UbusClient {
             return Err(UbusError::InvalidArgument("ubus args too large".into()));
         }
         let deadline = Instant::now() + self.timeout;
+        // 旧连接写失败：请求没送到，ID 缓存已清空（ubusd 重启后 ID 全换了），重新 LOOKUP 重发一次。
+        let mut resent = false;
+        loop {
+            self.stale_write = false;
+            match self.call_once(object, method, &data, deadline).await {
+                Err(_) if self.stale_write && !resent => resent = true,
+                r => return r,
+            }
+        }
+    }
+
+    async fn call_once(
+        &mut self,
+        object: &str,
+        method: &str,
+        data: &[u8],
+        deadline: Instant,
+    ) -> Result<Option<Value>, UbusError> {
         let mut retried = false;
         loop {
             let id = match self.ids.get(object) {
                 Some(&id) => id,
                 None => self.lookup(object, deadline).await?,
             };
-            match self.invoke(object, id, method, &data, deadline).await {
+            match self.invoke(object, id, method, data, deadline).await {
                 Err(UbusError::Status { code, .. }) if code == status::NOT_FOUND && !retried => {
                     // 对象重新注册换了 ID：重新 LOOKUP 再调一次。
                     self.ids.remove(object);
@@ -351,6 +373,13 @@ impl UbusClient {
         UbusError::Protocol(msg)
     }
 
+    /// 连接因读写错误断掉（不是我们自己超时关的）：ubusd 可能重启过，重启后所有对象的 ID 都换了，
+    /// 旧 ID 甚至可能被别的对象用上，所以整个 ID 缓存作废。
+    fn lost_connection(&mut self) {
+        self.conn = None;
+        self.ids.clear();
+    }
+
     fn next_seq(&mut self) -> u16 {
         self.seq = self.seq.wrapping_add(1);
         if self.seq == 0 {
@@ -414,23 +443,20 @@ impl UbusClient {
     ) -> Result<Reply, UbusError> {
         let seq = self.next_seq();
         let frame = blob::encode_frame(MsgHdr::new(ty, seq, peer), body);
-        // 旧连接写失败（ubusd 重启过）说明请求没送到，换新连接重发一次；新连接写失败就报错。
-        loop {
-            let fresh = self.conn.is_none();
-            if fresh {
-                self.connect(object, deadline).await?;
+        let fresh = self.conn.is_none();
+        if fresh {
+            self.connect(object, deadline).await?;
+        }
+        let conn = self.conn.as_mut().expect("connected");
+        match timeout_at(deadline, conn.stream.write_all(&frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // 旧连接写失败多半是 ubusd 重启过：请求没送到，让 call 清掉 ID 后重发一次。
+                self.stale_write = !fresh;
+                self.lost_connection();
+                return Err(UbusError::Io(format!("ubus write: {e}")));
             }
-            let conn = self.conn.as_mut().expect("connected");
-            match timeout_at(deadline, conn.stream.write_all(&frame)).await {
-                Ok(Ok(())) => break,
-                Ok(Err(e)) => {
-                    self.conn = None;
-                    if fresh {
-                        return Err(UbusError::Io(format!("ubus write: {e}")));
-                    }
-                }
-                Err(_) => return Err(self.timed_out(object)),
-            }
+            Err(_) => return Err(self.timed_out(object)),
         }
         let mut data = Vec::new();
         loop {
@@ -438,7 +464,7 @@ impl UbusClient {
             let f: Frame = match timeout_at(deadline, blob::read_frame(&mut conn.stream)).await {
                 Err(_) => return Err(self.timed_out(object)),
                 Ok(Err(ReadError::Io(e))) => {
-                    self.conn = None;
+                    self.lost_connection();
                     return Err(UbusError::Io(format!("ubus read: {e}")));
                 }
                 Ok(Err(ReadError::Protocol(e))) => return Err(self.protocol(e.0)),

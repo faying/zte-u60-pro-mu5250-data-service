@@ -375,6 +375,11 @@ async fn ubus_ubusd_restart_reconnects() {
     assert_eq!(m.connections(), 2);
     assert_eq!(c.stats().connects, 2);
     assert_eq!(c.cached_id("system"), Some(2));
+    assert_eq!(
+        m.invokes("?"),
+        0,
+        "no invoke is sent with an ID from before the restart"
+    );
 
     // ubusd 不在：报 Io，不挂住；回来后下一次调用成功。
     m.stop().await;
