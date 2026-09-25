@@ -31,7 +31,8 @@ struct Candidate {
 // a bearer event, so reuse the last answer for 30 s (and the same PLMN).
 // ZWRT_DATAD_CACHE=0 turns this off, as for the state cache.
 const REUSE_FOR: std::time::Duration = std::time::Duration::from_secs(30);
-static LAST: std::sync::Mutex<Option<(std::time::Instant, i64, i64, Values)>> = std::sync::Mutex::new(None);
+static LAST: std::sync::Mutex<Option<(std::time::Instant, i64, i64, Values)>> =
+    std::sync::Mutex::new(None);
 
 pub fn invalidate() {
     if let Ok(mut l) = LAST.lock() {

@@ -26,8 +26,11 @@ struct Cached<T> {
     value: T,
 }
 
-static UBUS_CACHE: Mutex<Option<HashMap<String, Cached<Result<Value, String>>>>> = Mutex::new(None);
-static UCI_CACHE: Mutex<Option<HashMap<String, Cached<BTreeMap<String, String>>>>> = Mutex::new(None);
+/// A lazily created, process-wide TTL cache keyed by string.
+type Cache<T> = Mutex<Option<HashMap<String, Cached<T>>>>;
+
+static UBUS_CACHE: Cache<Result<Value, String>> = Mutex::new(None);
+static UCI_CACHE: Cache<BTreeMap<String, String>> = Mutex::new(None);
 
 fn cache_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -45,15 +48,22 @@ pub fn invalidate_cache() {
     crate::qos::invalidate();
 }
 
-fn cache_get<T: Clone>(cache: &Mutex<Option<HashMap<String, Cached<T>>>>, key: &str) -> Option<T> {
+fn cache_get<T: Clone>(cache: &Cache<T>, key: &str) -> Option<T> {
     let c = cache.lock().ok()?;
     let e = c.as_ref()?.get(key)?;
     (e.at.elapsed() < e.ttl).then(|| e.value.clone())
 }
 
-fn cache_put<T>(cache: &Mutex<Option<HashMap<String, Cached<T>>>>, key: String, ttl: Duration, value: T) {
+fn cache_put<T>(cache: &Cache<T>, key: String, ttl: Duration, value: T) {
     if let Ok(mut c) = cache.lock() {
-        c.get_or_insert_with(HashMap::new).insert(key, Cached { at: Instant::now(), ttl, value });
+        c.get_or_insert_with(HashMap::new).insert(
+            key,
+            Cached {
+                at: Instant::now(),
+                ttl,
+                value,
+            },
+        );
     }
 }
 
@@ -82,7 +92,12 @@ async fn uci_show_ttl(ttl_s: u64, package: &str) -> BTreeMap<String, String> {
         return v;
     }
     let v = uci_show(package).await;
-    cache_put(&UCI_CACHE, package.to_string(), Duration::from_secs(ttl_s), v.clone());
+    cache_put(
+        &UCI_CACHE,
+        package.to_string(),
+        Duration::from_secs(ttl_s),
+        v.clone(),
+    );
     v
 }
 
@@ -888,7 +903,10 @@ fn throughput(now: u64) -> Value {
 
 fn runtime(runtime_zones: Value) -> (i64, Value) {
     let mut current = BTreeMap::new();
-    for line in fs::read_to_string(host_path("/proc/stat")).unwrap_or_default().lines() {
+    for line in fs::read_to_string(host_path("/proc/stat"))
+        .unwrap_or_default()
+        .lines()
+    {
         let mut parts = line.split_whitespace();
         let Some(label) = parts.next() else { continue };
         if label != "cpu"
@@ -1004,7 +1022,8 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         json!({"start_id":1,"end_id":64}),
     )
     .await;
-    let router_status = ubus_ttl(5, "zwrt_router.api", "router_get_status_no_auth", json!({})).await;
+    let router_status =
+        ubus_ttl(5, "zwrt_router.api", "router_get_status_no_auth", json!({})).await;
     let thermal = ubus_ttl(5, "zwrt_bsp.thermal", "get_cpu_temp", json!({})).await;
     let usb = ubus_ttl(30, "zwrt_bsp.usb", "list", json!({})).await;
     let battery = ubus_ttl(5, "zwrt_bsp.battery", "list", json!({})).await;
@@ -1705,14 +1724,31 @@ mod tests {
     #[test]
     fn slow_state_cache_expires_and_is_cleared_by_control() {
         let key = "test\u{0}cache".to_string();
-        cache_put(&UBUS_CACHE, key.clone(), Duration::from_millis(80), Ok(json!({"v":1})));
+        cache_put(
+            &UBUS_CACHE,
+            key.clone(),
+            Duration::from_millis(80),
+            Ok(json!({"v":1})),
+        );
         assert_eq!(cache_get(&UBUS_CACHE, &key), Some(Ok(json!({"v":1}))));
         std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(cache_get(&UBUS_CACHE, &key), None, "expired entries are not served");
-        cache_put(&UCI_CACHE, "wireless".into(), Duration::from_secs(60), BTreeMap::new());
+        assert_eq!(
+            cache_get(&UBUS_CACHE, &key),
+            None,
+            "expired entries are not served"
+        );
+        cache_put(
+            &UCI_CACHE,
+            "wireless".into(),
+            Duration::from_secs(60),
+            BTreeMap::new(),
+        );
         assert!(cache_get(&UCI_CACHE, "wireless").is_some());
         invalidate_cache();
-        assert!(cache_get(&UCI_CACHE, "wireless").is_none(), "a /control action clears the cache");
+        assert!(
+            cache_get(&UCI_CACHE, "wireless").is_none(),
+            "a /control action clears the cache"
+        );
     }
 
     use super::*;

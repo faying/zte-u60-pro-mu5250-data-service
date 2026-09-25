@@ -679,9 +679,9 @@ async fn control(
         crate::control::Outcome::Ok(value) => {
             let refresh = app.clone();
             tokio::spawn(async move {
-            crate::state::invalidate_cache();
-            refresh.refresh_snapshot().await
-        });
+                crate::state::invalidate_cache();
+                refresh.refresh_snapshot().await
+            });
             return control_ok(action, value);
         }
         crate::control::Outcome::Invalid(error) => return invalid_parameter(action, &error),
