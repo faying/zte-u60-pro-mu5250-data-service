@@ -11,13 +11,15 @@
 //! - 子进程退出（或起不来）就退避重启：1 秒起、每次翻倍、最多 30 秒；连续跑满 60 秒算正常，退避回到 1 秒。
 //!   日志只在第一次失败和退避到顶时各写一行，不刷屏。
 //! - `ZWRT_DATAD_SMS_LISTEN=0` 关闭（默认开）。
+//! - 子进程不能比 datad 活得久：spawn 时设 `PR_SET_PDEATHSIG=SIGKILL`（datad 被 SIGKILL 也跟着死），
+//!   datad 收到 SIGTERM/SIGINT 时先 [`shutdown`]（kill + wait 子进程）再退出。
 
 use super::backend::cli_bin;
 use std::{process::Stdio, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
-    sync::mpsc,
+    sync::{mpsc, watch},
     time::{Instant, sleep},
 };
 
@@ -31,6 +33,22 @@ pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// 子进程连续跑满这么久，退避回到最小值。
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
+
+/// 停止信号：`shutdown()` 置 true，监听任务 kill + wait 子进程后返回。
+fn stop_tx() -> &'static watch::Sender<bool> {
+    static STOP: std::sync::OnceLock<watch::Sender<bool>> = std::sync::OnceLock::new();
+    STOP.get_or_init(|| watch::channel(false).0)
+}
+static TASK: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> = std::sync::Mutex::new(None);
+
+/// datad 退出前调：让监听子进程退出并收尸，最多等 `limit`。
+pub async fn shutdown(limit: Duration) {
+    stop_tx().send_replace(true);
+    let task = TASK.lock().ok().and_then(|mut t| t.take());
+    if let Some(task) = task {
+        let _ = tokio::time::timeout(limit, task).await;
+    }
+}
 
 /// `ZWRT_DATAD_SMS_LISTEN` 的值：只有 `0` 关闭。
 pub fn enabled_from(value: Option<&str>) -> bool {
@@ -66,19 +84,26 @@ impl Options {
     }
 }
 
-/// 按环境变量起监听；关闭时返回 `None`、不起子进程。`fire` 在去抖后调用。
+/// 按环境变量起监听；关闭时返回 `false`、不起子进程。`fire` 在去抖后调用。
 pub fn spawn_if_enabled(
     value: Option<&str>,
     opts: Options,
     fire: Arc<dyn Fn() + Send + Sync>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> bool {
     if !enabled_from(value) {
         eprintln!("zwrt-datad: {ENV_ENABLE}=0，不监听 {EVENT}");
-        return None;
+        return false;
     }
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(debounce(rx, opts.debounce, opts.min_interval, fire));
-    Some(tokio::spawn(supervise(opts, tx)))
+    let task = tokio::spawn(supervise(opts, tx));
+    // 登记给 shutdown() 收尾；进程里只起一份，已有就换成新的（旧的 abort 后子进程靠 kill_on_drop 收掉）。
+    if let Ok(mut slot) = TASK.lock()
+        && let Some(old) = slot.replace(task)
+    {
+        old.abort();
+    }
+    true
 }
 
 /// 去抖：收到第一个事件后等 `window`，期间再来的都并进这一次，然后调一次 `fire`；
@@ -108,7 +133,7 @@ pub async fn supervise(opts: Options, tx: mpsc::Sender<()>) {
     loop {
         let started = Instant::now();
         let outcome = run_once(&opts.program, &tx).await;
-        if tx.is_closed() {
+        if tx.is_closed() || *stop_tx().borrow() {
             return;
         }
         if started.elapsed() >= HEALTHY_RUN {
@@ -132,7 +157,11 @@ pub async fn supervise(opts: Options, tx: mpsc::Sender<()>) {
 
 /// 跑一次子进程直到它退出；返回退出原因（写日志用）。
 async fn run_once(program: &str, tx: &mpsc::Sender<()>) -> String {
-    let child = Command::new(program)
+    let mut stop = stop_tx().subscribe();
+    if *stop.borrow_and_update() {
+        return "datad 退出".into();
+    }
+    let child = crate::command::die_with_parent(&mut Command::new(program))
         .args(["listen", EVENT])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -148,7 +177,14 @@ async fn run_once(program: &str, tx: &mpsc::Sender<()>) -> String {
     };
     let mut lines = BufReader::new(stdout).lines();
     loop {
-        match lines.next_line().await {
+        let next = tokio::select! {
+            r = lines.next_line() => r,
+            _ = stop.changed() => {
+                let _ = child.kill().await; // kill + wait，不留僵尸
+                return "datad 退出".into();
+            }
+        };
+        match next {
             Ok(Some(line)) => {
                 if is_event(&line) && tx.send(()).await.is_err() {
                     return "datad 退出".into();
@@ -255,7 +291,7 @@ mod tests {
             program: "/nonexistent/ubus".into(),
             ..Options::from_env()
         };
-        assert!(spawn_if_enabled(Some("0"), opts, fire).is_none());
+        assert!(!spawn_if_enabled(Some("0"), opts, fire));
     }
 
     fn mock_script() -> String {

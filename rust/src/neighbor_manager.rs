@@ -173,7 +173,8 @@ impl Manager {
             .open(run.join("diag.log"))
             .map_err(|e| e.to_string())?;
         let err = log.try_clone().map_err(|e| e.to_string())?;
-        let child = Command::new(&self.diag)
+        // 抓包进程长期运行：datad 被 SIGKILL 时也要跟着退出，不能变孤儿。
+        let child = crate::command::die_with_parent(&mut Command::new(&self.diag))
             .args([
                 "-f",
                 mask.to_string_lossy().as_ref(),

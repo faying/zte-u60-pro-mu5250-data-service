@@ -856,6 +856,8 @@ async fn shutdown() {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
+    // 收到 SIGTERM/SIGINT：先收掉 ubus listen 子进程，再等连接收尾。
+    crate::ubus::listen::shutdown(std::time::Duration::from_secs(2)).await;
 }
 
 #[cfg(test)]

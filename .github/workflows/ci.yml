@@ -28,6 +28,7 @@ jobs:
       - run: python3 ../tests/direct_supply_test.py target/debug/zwrt-datad
       - run: python3 ../tests/rust_sse_limit_test.py target/debug/zwrt-datad
       - run: ../tests/rust_control_integration.sh
+      - run: sh ../tests/listen_orphan_test.sh target/debug/zwrt-datad
       - run: sh ../tests/golden/golden.sh check target/debug/zwrt-datad
       - run: sh ../tests/state_v2_doc_check.sh && sh ../tests/state_v2_doc_check.sh --self-test
       - run: cargo clippy --locked --all-targets -- -D warnings
