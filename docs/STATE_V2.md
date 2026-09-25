@@ -229,10 +229,10 @@ stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 测试（T10）：`sms_block_summary_fields`、`sms_list_after_pages_desc_only`、`sms_list_after_merges_stores_dedup`、`sms_list_after_limit_has_more`、`sms_list_after_one_store_fails_whole`、`sms_list_after_page_ignored_fails_whole`、`sms_list_after_returns_plain_fields`；测试（T10，manager）：`sms_burst_600_paged_forwarded_once`、`sms_interrupted_on_page_3_resumes`、`sms_datad_outage_120_backfilled`、`sms_list_after_busy_retried_over_http`
 
 **V2-31** 短信事件：datad 自己起一个长期运行的 `ubus listen zwrt_wms_status_event` 子进程，逐行读它的输出（一行 JSON，顶层键是事件名）。
-收到事件后等 300 ms（这期间再来的事件并成一次），然后把短信容量、短信列表的慢数据缓存清掉，`sms` 块标成「立即读」，
+收到事件后等 300 ms（这期间再来的事件并成一次）；离上次触发不到 2 秒就等到满 2 秒（期间的事件也并进这一次），短信密集时不会每 300 ms 整轮重采。然后把短信容量、短信列表的慢数据缓存清掉，`sms` 块标成「立即读」，
 并唤醒执行者：下一轮不等采样间隔立即开始；正在跑一轮时，这一轮跑完马上再跑一轮。轮本身照旧在执行者里串行跑，轮里照旧控制优先（V2-24），不另起并发的采集。
 监听是独立的订阅连接，只收事件、不发请求，所以不算执行者之外的 ubus 调用，也不违反「同一时间最多一个在途」（V2-28）：短信本身仍由执行者读。
 子进程退出或起不来就退避重启：1 秒起、每次翻倍、最多 30 秒，连续跑满 60 秒后退避回到 1 秒；日志只在第一次退出和退避到顶时各写一行。
 只用子进程方式（`ZWRT_DATAD_UBUS=socket` 时也是），直连 ubusd 的订阅等 socket 后端上机（Gate 0）后再做。`ZWRT_DATAD_SMS_LISTEN=0` 关闭，默认开。
 例：新短信到达 → 事件 → 300 ms 后开一轮 → 约 1 秒内 `sms` 块的 `max_id` 变化发到 `/v2`（原来最多等 10 秒列表缓存）。
-测试（T10）：`sms_event_updates_block_within_one_round`、`sms_events_coalesced`、`sms_listener_restarts_after_exit`、`sms_listen_disabled_by_env`、`sms_event_invalidates_only_sms_cache`
+测试（T10）：`sms_event_updates_block_within_one_round`、`sms_events_coalesced`、`sms_event_kicks_at_least_2s_apart`、`sms_listener_restarts_after_exit`、`sms_listen_disabled_by_env`、`sms_event_invalidates_only_sms_cache`

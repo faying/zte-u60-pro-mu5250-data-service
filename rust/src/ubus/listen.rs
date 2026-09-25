@@ -2,6 +2,7 @@
 //!
 //! datad 起一个长期运行的 `ubus listen zwrt_wms_status_event` 子进程，逐行读它的输出；
 //! 看到这个事件就（300 ms 去抖后）让短信读取「立即读」、唤醒执行者尽快开始一轮。
+//! 两次触发之间至少隔 2 秒（`KICK_MIN_INTERVAL`）：短信密集时不会每 300 ms 整轮重采。
 //!
 //! - 这是**订阅**，不发任何请求（没有 `ubus call`、不经执行者后端），所以不违反「执行者单一在途」（V2-24/V2-28）：
 //!   短信本身仍由执行者在它的采集轮里读。
@@ -24,6 +25,8 @@ pub const EVENT: &str = "zwrt_wms_status_event";
 pub const ENV_ENABLE: &str = "ZWRT_DATAD_SMS_LISTEN";
 /// 短时间多次事件合并成一次。
 pub const DEBOUNCE: Duration = Duration::from_millis(300);
+/// 两次触发（踢执行者）之间的最小间隔，期间来的事件并进下一次。
+pub const KICK_MIN_INTERVAL: Duration = Duration::from_secs(2);
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// 子进程连续跑满这么久，退避回到最小值。
@@ -48,6 +51,7 @@ pub struct Options {
     pub backoff_min: Duration,
     pub backoff_max: Duration,
     pub debounce: Duration,
+    pub min_interval: Duration,
 }
 
 impl Options {
@@ -57,6 +61,7 @@ impl Options {
             backoff_min: BACKOFF_MIN,
             backoff_max: BACKOFF_MAX,
             debounce: DEBOUNCE,
+            min_interval: KICK_MIN_INTERVAL,
         }
     }
 }
@@ -72,20 +77,27 @@ pub fn spawn_if_enabled(
         return None;
     }
     let (tx, rx) = mpsc::channel(64);
-    tokio::spawn(debounce(rx, opts.debounce, fire));
+    tokio::spawn(debounce(rx, opts.debounce, opts.min_interval, fire));
     Some(tokio::spawn(supervise(opts, tx)))
 }
 
-/// 去抖：收到第一个事件后等 `window`，期间再来的都并进这一次，然后调一次 `fire`。
+/// 去抖：收到第一个事件后等 `window`，期间再来的都并进这一次，然后调一次 `fire`；
+/// 离上次 `fire` 不到 `min_interval` 就等到满为止（期间的事件同样并进这一次）。
 pub async fn debounce(
     mut rx: mpsc::Receiver<()>,
     window: Duration,
+    min_interval: Duration,
     fire: Arc<dyn Fn() + Send + Sync>,
 ) {
+    let mut last: Option<Instant> = None;
     while rx.recv().await.is_some() {
         sleep(window).await;
+        if let Some(t) = last {
+            tokio::time::sleep_until(t + min_interval).await;
+        }
         while rx.try_recv().is_ok() {}
         fire();
+        last = Some(Instant::now());
     }
 }
 
@@ -187,16 +199,49 @@ mod tests {
     async fn sms_events_coalesced() {
         let (n, fire) = counter();
         let (tx, rx) = mpsc::channel(64);
-        tokio::spawn(debounce(rx, DEBOUNCE, fire));
+        tokio::spawn(debounce(rx, DEBOUNCE, KICK_MIN_INTERVAL, fire));
         for _ in 0..5 {
             tx.send(()).await.unwrap();
             sleep(Duration::from_millis(50)).await;
         }
         sleep(Duration::from_millis(400)).await;
         assert_eq!(n.load(Ordering::SeqCst), 1, "300 ms 内 5 个事件合并成 1 次");
+        sleep(Duration::from_secs(3)).await;
         tx.send(()).await.unwrap();
         sleep(Duration::from_millis(400)).await;
-        assert_eq!(n.load(Ordering::SeqCst), 2, "窗口过后的新事件再触发一次");
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            2,
+            "隔够 2 秒后的新事件 300 ms 后再触发一次"
+        );
+    }
+
+    /// V2-31：短信事件密集时，两次触发至少隔 2 秒（去抖 300 ms 保留），不会每 300 ms 整轮重采。
+    #[tokio::test(start_paused = true)]
+    async fn sms_event_kicks_at_least_2s_apart() {
+        let times = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let t = times.clone();
+        let fire: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || t.lock().unwrap().push(Instant::now()));
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(debounce(rx, DEBOUNCE, KICK_MIN_INTERVAL, fire));
+        let t0 = Instant::now();
+        // 10 秒里每 100 ms 一个事件。
+        for _ in 0..100 {
+            tx.send(()).await.unwrap();
+            sleep(Duration::from_millis(100)).await;
+        }
+        sleep(Duration::from_secs(3)).await;
+        let times = times.lock().unwrap().clone();
+        assert_eq!(times[0] - t0, DEBOUNCE, "第一次仍是 300 ms 去抖后就触发");
+        for w in times.windows(2) {
+            assert!(w[1] - w[0] >= KICK_MIN_INTERVAL, "{:?}", w[1] - w[0]);
+        }
+        assert!(times.len() <= 7, "10 秒里最多约 6 次：{}", times.len());
+        assert!(
+            *times.last().unwrap() >= t0 + Duration::from_secs(10),
+            "最后一批事件也触发了"
+        );
     }
 
     /// V2-31：`ZWRT_DATAD_SMS_LISTEN=0` 不起监听。
@@ -246,6 +291,7 @@ mod tests {
             backoff_min: Duration::from_millis(50),
             backoff_max: Duration::from_millis(200),
             debounce: DEBOUNCE,
+            min_interval: KICK_MIN_INTERVAL,
         };
         let h = tokio::spawn(supervise(opts, tx));
         let mut got = 0;
