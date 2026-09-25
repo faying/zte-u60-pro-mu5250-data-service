@@ -348,6 +348,20 @@ fn normalize_profile(v: &str) -> String {
 fn valid_imsi(value: &str) -> bool {
     (5..=20).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
+/// SIM service provider name (EF_SPN) as the vendor stores it: UCS-2 big-endian
+/// hex, e.g. "0043004D004C0069006E006B" = "CMLink". Anything else → "".
+fn spn_from_ucs2_hex(value: &str) -> String {
+    let v = value.trim();
+    if v.is_empty() || v.len() % 4 != 0 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return String::new();
+    }
+    let units: Vec<u16> = (0..v.len())
+        .step_by(4)
+        .filter_map(|i| u16::from_str_radix(&v[i..i + 4], 16).ok())
+        .filter(|&u| u != 0 && u != 0xffff)
+        .collect();
+    String::from_utf16(&units).map(|s| s.trim().to_string()).unwrap_or_default()
+}
 fn valid_msisdn(value: &str) -> bool {
     let digits = value.strip_prefix('+').unwrap_or(value);
     (3..=32).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
@@ -1535,7 +1549,7 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
             msisdn.clear();
         }
     }
-    fields.insert("sim".into(),json!({"iccid":string(&sim,"sim_iccid"),"imsi":imsi.clone(),"msisdn":msisdn.clone(),"state":string(&sim,"sim_states"),"modem_state":string(&sim,"modem_main_state"),"pin_status":string(&sim,"pin_status"),"current_slot":integer(&sim,"current_sim_slot"),"dual_sim":integer(&sim,"support_dual_sim"),"sim1_provision":integer(&sim,"sim1_provision_state"),"sim2_provision":integer(&sim,"sim2_provision_state")}));
+    fields.insert("sim".into(),json!({"iccid":string(&sim,"sim_iccid"),"imsi":imsi.clone(),"msisdn":msisdn.clone(),"spn":spn_from_ucs2_hex(&string(&sim,"spn_name_data")),"state":string(&sim,"sim_states"),"modem_state":string(&sim,"modem_main_state"),"pin_status":string(&sim,"pin_status"),"current_slot":integer(&sim,"current_sim_slot"),"dual_sim":integer(&sim,"support_dual_sim"),"sim1_provision":integer(&sim,"sim1_provision_state"),"sim2_provision":integer(&sim,"sim2_provision_state")}));
     if template == "MU5252" {
         let active_subid = integer(&sim, "current_sim_slot").clamp(1, 6);
         let x75_traffic = object(
@@ -1835,6 +1849,14 @@ pub async fn ubus(service: &str, method: &str, args: Value) -> Result<Value, Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spn_decodes_vendor_ucs2_hex() {
+        assert_eq!(super::spn_from_ucs2_hex("0043004D004C0069006E006B"), "CMLink");
+        assert_eq!(super::spn_from_ucs2_hex(""), "");
+        assert_eq!(super::spn_from_ucs2_hex("zz"), "");
+        assert_eq!(super::spn_from_ucs2_hex("4E2D56FD79FB52A8FFFF"), "中国移动");
+    }
+
     /// V2-31：短信事件只清短信容量和列表的缓存，别的慢数据缓存不动。
     #[test]
     fn sms_event_invalidates_only_sms_cache() {
