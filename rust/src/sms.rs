@@ -722,7 +722,10 @@ mod tests {
         })
         .await;
         let e = r.unwrap_err();
-        assert!(e.contains("mem_store 1") && e.contains("ignored page"), "{e}");
+        assert!(
+            e.contains("mem_store 1") && e.contains("ignored page"),
+            "{e}"
+        );
         assert_eq!(calls.get(), 2);
         // 短页重复不算（第 0 页就是短页，直接停）。
         let r = list_after_with(0, 50, |_, _| async {

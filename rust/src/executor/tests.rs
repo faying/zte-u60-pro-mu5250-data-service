@@ -895,8 +895,14 @@ async fn sms_event_updates_block_within_one_round() {
 async fn rounds_and_heartbeats_continue_under_control_flood() {
     // 持续灌控制任务和内部任务：每个安全点只做进入时已在排队的，采集轮和心跳照常发生。
     let (exec, mock, sink) = setup(vec![spec("a", 0), spec("b", 0)], Config::default(), 1000);
-    mock.default_step("ctl.set", Step::Reply(json!({}), Duration::from_millis(200)));
-    mock.default_step("int.get", Step::Reply(json!({}), Duration::from_millis(100)));
+    mock.default_step(
+        "ctl.set",
+        Step::Reply(json!({}), Duration::from_millis(200)),
+    );
+    mock.default_step(
+        "int.get",
+        Step::Reply(json!({}), Duration::from_millis(100)),
+    );
     let t0 = Instant::now();
     exec.start_rounds(Arc::new(NoLegacy));
     let stop = Arc::new(AtomicBool::new(false));
