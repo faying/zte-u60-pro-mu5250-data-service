@@ -51,3 +51,4 @@ scripts/_*.sh
 /include/datad_version_generated.h
 
 /rust/target/
+/rust/target-zig/
