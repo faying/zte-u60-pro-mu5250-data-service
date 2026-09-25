@@ -16,7 +16,8 @@
 //!   超时就关连接（下次调用重新连、重新收 HELLO），作废该对象的 ID 缓存，返回 `UbusError::Timeout`；
 //!   其他对象的 LOOKUP 缓存保留。本轮跳过该对象用 `RoundSkips` + `call_in_round`。
 //! - seq 跨重连单调递增（不从头开始），旧连接上迟到的回复即使被转到新连接也对不上。
-//! - 对象 ID 会变（原厂服务重启后重新注册）：INVOKE 回 NOT_FOUND 时作废缓存、重新 LOOKUP、再调一次；
+//! - 对象 ID 会变（原厂服务重启后重新注册）：INVOKE 回 NOT_FOUND 时作废缓存、重新 LOOKUP，
+//!   新 ID 和原来不同才再调一次；相同（服务自己用 NOT_FOUND 表示条目不存在）就原样返回，不重发；
 //!   回 METHOD_NOT_FOUND 时只作废缓存（下次调用重新 LOOKUP），不在本次重试。
 //! - 只在请求**确定没送到** ubusd 时自动重试（旧连接写失败，比如 ubusd 重启过；这时整个 ID 缓存作废，
 //!   因为重启后 ID 全换、旧 ID 可能被别的对象用上）；读写错误断线同样清空 ID 缓存；
@@ -280,9 +281,16 @@ impl UbusClient {
                 None => self.lookup(object, deadline).await?,
             };
             match self.invoke(object, id, method, data, deadline).await {
-                Err(UbusError::Status { code, .. }) if code == status::NOT_FOUND && !retried => {
-                    // 对象重新注册换了 ID：重新 LOOKUP 再调一次。
+                Err(e @ UbusError::Status { code, .. })
+                    if code == status::NOT_FOUND && !retried =>
+                {
+                    // 可能是对象重新注册换了 ID：重新 LOOKUP，ID 真变了才再调一次。
+                    // ID 没变说明是服务自己用 NOT_FOUND 表示「条目不存在」，请求已经执行过，
+                    // 不重发（写操作不能做两次），原样返回。
                     self.ids.remove(object);
+                    if self.lookup(object, deadline).await? == id {
+                        return Err(e);
+                    }
                     retried = true;
                 }
                 Err(e) => {

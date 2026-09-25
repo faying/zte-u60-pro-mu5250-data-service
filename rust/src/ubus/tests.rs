@@ -440,6 +440,36 @@ async fn ubus_status_errors_and_no_data() {
 }
 
 #[tokio::test]
+async fn ubus_service_not_found_same_id_not_resent() {
+    // 服务自己用 NOT_FOUND 表示「条目不存在」：重新 LOOKUP 得到同一个 ID，不重发（写操作只执行一次）。
+    let m = MockUbusd::start_new().await;
+    m.add_method("svc", 5, "del", json!({}));
+    let mut c = client(&m);
+    assert_eq!(
+        c.call("svc", "del", &json!({})).await.unwrap(),
+        Some(json!({}))
+    );
+    assert_eq!(m.invokes("svc"), 1);
+    let lookups = m.lookups();
+    m.script("svc", "del", Action::Status(status::NOT_FOUND));
+    let e = c.call("svc", "del", &json!({"k":1})).await.unwrap_err();
+    assert!(
+        matches!(e, UbusError::Status { code, .. } if code == status::NOT_FOUND),
+        "{e:?}"
+    );
+    assert_eq!(m.invokes("svc"), 2, "INVOKE 只发了一次");
+    assert_eq!(m.lookups(), lookups + 1, "重新 LOOKUP 过一次");
+    assert_eq!(c.cached_id("svc"), Some(5));
+    // 真换了 ID 的仍然重发一次（同 ubus_object_id_change_relookups）。
+    m.change_id("svc", 9);
+    assert_eq!(
+        c.call("svc", "del", &json!({})).await.unwrap(),
+        Some(json!({}))
+    );
+    assert_eq!(c.cached_id("svc"), Some(9));
+}
+
+#[tokio::test]
 async fn ubus_invalid_arguments_send_nothing() {
     let m = MockUbusd::start_new().await;
     let mut c = client(&m);
