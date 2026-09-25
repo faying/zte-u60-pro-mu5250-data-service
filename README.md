@@ -1,103 +1,72 @@
-# zwrt-datad
+# ZTE U60 Pro（MU5250）数据服务：zwrt-datad
 
-面向中兴 ARM64 5G 路由设备的统一数据与控制服务。
+`zwrt-datad` 跑在设备本机，把 `ubus`、`uci`、`sysfs` 和必要的设备日志整理成稳定的 JSON 状态，通过 HTTP 和 SSE 提供给触屏界面、脚本和其他本机服务。
+本仓库是 [33333s/zwrt-datad](https://github.com/33333s/zwrt-datad) 的 fork，在 `main` 分支上加了 MU5250 的对齐修复和慢数据缓存，**并去掉了所有内置的外部更新源，自动更新默认关闭**。
 
-[English](README_EN.md) · [最新版本](https://github.com/33333s/zwrt-datad/releases/latest) · [API 文档](docs/API.md)
+[English](README_EN.md) · [API 文档](docs/API.md)
 
-## 项目介绍
+## 三个仓库一起用
 
-`zwrt-datad` 运行在设备本机，统一读取 `ubus`、`uci`、`sysfs` 和必要的设备日志，把不同机型的底层接口整理成稳定的 JSON 状态，并通过 HTTP 与 SSE 提供给 UFI、WebUI、脚本或其他本机服务。
+| 仓库 | 设备上的角色 |
+|---|---|
+| [manager](https://github.com/faying/zte-u60-pro-mu5250-manager) | `zte-agent`（:9090）+ 管理网页 + 装机包 |
+| [touch-ui](https://github.com/faying/zte-u60-pro-mu5250-touch-ui) | 前面板触屏界面、屏幕守护进程、进程监督与 Wi-Fi 兜底脚本 |
+| **[data-service](https://github.com/faying/zte-u60-pro-mu5250-data-service)**（本仓库） | `zwrt-datad`：本机数据服务（`127.0.0.1:9460` 的 `/state` + SSE） |
 
-项目使用 Rust 实现，并通过机型模板隔离固件差异。上层应用不需要为每台设备重复轮询厂商接口，也不需要自行解析日志。datad 只负责设备数据、设备控制和自身更新，不包含前端页面、插件系统或 UFI 业务。旧 C/Go 实现保留在 `c` 分支，不再用于新版本发布。
-
-## 主要功能
-
-- 聚合设备、系统、CPU、内存、存储、温度、电池和运行状态
-- 聚合 SIM、移动网络、信号、频段、流量、QoS、Wi-Fi、客户端和短信数据
-- `GET /state` 提供完整 JSON 快照，`GET /events` 通过 SSE 推送变化
-- 按机型模板规范化字段，并通过 `/capabilities` 暴露当前能力
-- 通过 `POST /control` 执行经过约束的蜂窝、Wi-Fi、APN、短信、电源和设备控制
-- 提供设备当前注册的 ubus 查询与调用接口，供受信任的管理应用使用
-- 可选邻小区采集，具有独立 worker、容量限制、过期处理和进程隔离
-- 可选 NMS 云端连接与远程服务入口
-- 内置 datad 自更新，使用 Ed25519 签名和 SHA-256 校验更新清单与二进制
-- 单进程 Rust、静态 ARM64 发布，默认每秒生成一次状态快照
-
-## 当前已适配设备
-
-| 设备型号 | 产品名称 |
-| --- | --- |
-| `MU5250` | U60 Pro |
-| `MC8532B` | G5 Pro |
-| `MU5252` | TopFlow |
-| `MC7523` | G5 Max WiFi |
-
-运行时只有 `device.api_template_supported = 1` 才代表识别到正式模板。不同设备只输出实际支持的状态块；调用方应通过字段是否存在判断能力，不要为缺失功能补 `0`、`-1` 或空对象。
-
-各机型的数据来源和差异见 [`docs/models/`](docs/models/)。其他机型可能进入兼容模板，但不代表已经完成适配。
-
-## 一键安装或升级
-
-要求设备为 ARM64/aarch64、使用 root 执行，并可写入 `/data`：
-
-```sh
-curl -4fL --retry 3 \
-  'https://github.com/33333s/zwrt-datad/releases/latest/download/install-datad.sh' \
-  -o /tmp/install-datad.sh && \
-sh /tmp/install-datad.sh
+```
+zwrt-datad :9460 ──▶ 触屏界面 ──(eSIM 页)──▶ zte-agent :9090 ──▶ lpac ──▶ eUICC 卡
+浏览器 ──▶ zte-agent :9090（API + 管理网页）
 ```
 
-重复执行同一命令即可升级到最新版。安装器会：
+## 功能
 
-1. 下载发布二进制并校验固定的 SHA-256。
-2. 在临时端口启动候选版本，检查 `/healthz` 和 `/state`。
-3. 备份已有安装，原子写入 `/data/zwrt-datad`。
-4. 清理旧版重复启动项，并在 `/etc/rc.local` 写入唯一启动命令。
-5. 启动正式服务，检查 9460/9461 健康状态和单进程状态。
-6. 任一步骤失败时恢复原文件和原服务。
+- 聚合设备、CPU、内存、温度、电池，SIM、移动网络、信号、频段、流量、Wi-Fi、客户端、短信等数据
+- `GET /state` 返回完整 JSON 快照，`GET /events` 用 SSE 推送变化，默认每秒一次
+- 按机型模板规范化字段，`/capabilities` 报告当前能力（已适配 MU5250 / U60 Pro 等，见 [docs/models/](docs/models/)）
+- `POST /control` 执行受约束的蜂窝、Wi-Fi、APN、短信、电源等控制
+- 单个静态 ARM64 Rust 程序
 
-datad 不安装自己的 `/etc/init.d` 脚本。安装器需要设备提供 `curl`、`sha256sum`、`awk`、`cmp`、`stat`、`flock`、`mktemp`、`readlink` 和 `od`。
+## 快速开始
 
-## 服务管理
-
-```sh
-sh /data/zwrt-datad/service.sh status
-sh /data/zwrt-datad/service.sh start
-sh /data/zwrt-datad/service.sh restart
-sh /data/zwrt-datad/service.sh stop
-```
-
-默认路径：
-
-- 程序：`/data/zwrt-datad/zwrt-datad`
-- 日志：`/data/zwrt-datad/zwrt-datad.log`
-- PID：`/data/zwrt-datad/zwrt-datad.pid`
-- 本机 API：`http://127.0.0.1:9460`
-- 内网 API：`http://<设备 IP>:9461`
-
-## 快速检查
+在 U60 Pro 上**不要单独装**：用 manager 仓库的装机包一起装，见 **[快速上手](https://github.com/faying/zte-u60-pro-mu5250-manager/blob/main/docs/GETTING-STARTED.md)**。
+装机包把它放在 `/data/plugins/zwrt-datad/zwrt-datad`，由 procd 监督：
 
 ```sh
-curl -fsS http://127.0.0.1:9460/healthz
-curl -fsS http://127.0.0.1:9460/version
+/etc/init.d/zwrt-datad restart            # 重启
+cat /tmp/zwrt-datad.log                   # 日志
+curl -fsS http://127.0.0.1:9460/healthz   # 在设备上检查
 curl -fsS http://127.0.0.1:9460/state
-curl -N http://127.0.0.1:9460/events
+curl -N  http://127.0.0.1:9460/events
 ```
 
-9460 是设备本机接口。9461 是内网接口，读取数据前需要通过 `/auth/login` 或 `/auth/exchange` 获取 Bearer Token；详细鉴权方式见 [`docs/API.md`](docs/API.md)。
+装机包的启动方式带 `ZWRT_DATAD_OTA_DISABLE_AUTO=1`；程序里也没有写死的更新地址。要更新就自己编译，再用装机包 `./install.sh devui` 装上。
 
-> **安全提示：** `POST /ubus/call` 可以访问运行时注册的 ubus 方法，其中可能包含修改网络、断开连接或重启设备的写操作。只应向受信任的管理程序开放，并由调用方限制入口和进行必要确认。
+> **安全提示**：`POST /ubus/call` 能调用任意已注册的 ubus 方法，包括改网络、断连、重启。只对受信任的本机程序开放。
+
+## 构建
+
+在 x86_64 Linux 上，需要 Bootlin aarch64 musl 工具链（默认 `~/aarch64--musl--stable-2025.08-1/bin`，可用 `DATAD_MUSL_TOOLCHAIN_DIR` 指定）和 rustup（脚本会装 Rust 1.89.0）：
+
+```sh
+bash scripts/build.sh     # → zwrt-datad-aarch64（静态、已 strip）
+```
+
+打装机包时用 `DATAD_BIN=…/zwrt-datad-aarch64` 指定。慢变数据的缓存可用环境变量 `ZWRT_DATAD_CACHE=0` 关闭。
 
 ## 文档
 
-- [`docs/API.md`](docs/API.md)：HTTP、SSE、鉴权与命令行参数
-- [`docs/STATE_SCHEMA.md`](docs/STATE_SCHEMA.md)：状态字段契约
-- [`docs/CONTROL_API.md`](docs/CONTROL_API.md)：设备控制动作与安全边界
-- [`docs/models/`](docs/models/)：已适配设备模板
-- [`docs/RUNTIME.md`](docs/RUNTIME.md)：运行、日志与服务管理
-- [`docs/NEIGHBOR.md`](docs/NEIGHBOR.md)：可选邻区采集
-- [`docs/CLOUD.md`](docs/CLOUD.md)：可选 NMS 云端连接
+- [docs/API.md](docs/API.md)：HTTP、SSE、鉴权与命令行参数
+- [docs/STATE_SCHEMA.md](docs/STATE_SCHEMA.md)：状态字段约定
+- [docs/CONTROL_API.md](docs/CONTROL_API.md)：控制动作与安全边界
+- [docs/models/](docs/models/)：各机型模板
+- [docs/RUNTIME.md](docs/RUNTIME.md)、[docs/NEIGHBOR.md](docs/NEIGHBOR.md)、[docs/CLOUD.md](docs/CLOUD.md)：上游的运行说明和可选功能（U60 Pro 装机包不使用上游安装器）
 
-## 许可与贡献者
+## 致谢
 
-项目使用 [MIT License](LICENSE)，项目署名见 [`CONTRIBUTORS.md`](CONTRIBUTORS.md)。
+- [33333s](https://github.com/33333s)：`zwrt-datad` 原作者，感谢这个参考仓库（以及 [u60pro-devui](https://github.com/33333s/u60pro-devui)）。
+- 上游贡献者见 [CONTRIBUTORS.md](CONTRIBUTORS.md)。
+- [Jesther Silvestre](https://github.com/jesther-ai)（open-u60-pro）、Wei REN（本 fork 的 MU5250 修复和三件套整合）。
+
+## 许可证与免责声明
+
+[MIT](LICENSE)。社区项目，和中兴通讯没有关系，风险自负。
