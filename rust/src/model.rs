@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
 use std::{collections::BTreeMap, fs};
 
@@ -23,18 +23,6 @@ pub struct Snapshot {
     pub datad: DatadVersion,
     #[serde(flatten)]
     pub fields: Map<String, Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UbusCall {
-    pub service: String,
-    pub method: String,
-    #[serde(default = "empty_object")]
-    pub args: Value,
-}
-
-fn empty_object() -> Value {
-    Value::Object(Map::new())
 }
 
 fn shape(value: &Value, path: &str, out: &mut BTreeMap<String, &'static str>) {

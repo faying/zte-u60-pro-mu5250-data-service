@@ -1,5 +1,4 @@
 mod auth;
-mod cloud;
 mod command;
 mod control;
 mod cooling;
@@ -7,12 +6,10 @@ mod extra_wifi;
 mod model;
 mod neighbor;
 mod neighbor_manager;
-mod ota;
 mod qos;
 mod server;
 mod sms;
 mod state;
-mod webshell;
 mod wifi;
 
 use anyhow::Result;
@@ -36,7 +33,8 @@ struct Args {
     once: bool,
     #[arg(long)]
     neighbor: bool,
-    #[arg(long)]
+    /// 已删除的 WebShell 的旧开关，只为兼容旧启动脚本（scripts/service.sh 带着它），不起作用。
+    #[arg(long, hide = true)]
     webshell: bool,
     #[arg(long)]
     auth_token_file: Option<PathBuf>,
@@ -56,7 +54,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    cloud::init_crypto();
+    // reqwest（短信 HTTP 发送）用 rustls，进程里装一次 ring 作为默认加密实现。
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let raw: Vec<String> = std::env::args().collect();
     if raw.get(1).map(String::as_str) == Some("--neighbor-parse") {
         std::process::exit(neighbor::parse_cli(&raw[2..]));
@@ -77,6 +76,7 @@ async fn main() -> Result<()> {
     let interval = Duration::from_millis(args.interval.clamp(500, 5000));
     let _ = (
         &args.neighbor,
+        &args.webshell,
         &args.auth_token_file,
         &args.lan_bind,
         args.lan_port,
@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
         None => None,
     };
     let local_requires_auth = args.lan_bind.is_none() && token.is_some();
-    let app = App::new(args.data_dir, interval, token, args.neighbor, args.webshell).await?;
+    let app = App::new(args.data_dir, interval, token, args.neighbor).await?;
     if args.once {
         println!("{}", serde_json::to_string(&app.snapshot().await)?);
         return Ok(());

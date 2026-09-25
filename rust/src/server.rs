@@ -1,25 +1,19 @@
 use crate::{
     auth::{self, Sessions},
-    cloud::{Cloud, Update as CloudUpdate},
-    model::{DatadVersion, Snapshot, UbusCall},
+    model::{DatadVersion, Snapshot},
     neighbor_manager::Manager as NeighborManager,
-    ota::{self, Config as OtaConfig, Ota},
     state,
-    webshell::WebShell,
 };
 use anyhow::Result;
 use axum::{
     Json, Router,
     extract::rejection::JsonRejection,
-    extract::{ConnectInfo, Extension, Request, WebSocketUpgrade},
-    extract::{Query, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::{
     convert::Infallible,
@@ -51,15 +45,7 @@ struct Inner {
     sessions: Mutex<Sessions>,
     device_session: Mutex<Option<DeviceSession>>,
     sse_slots: Arc<Semaphore>,
-    cloud: RwLock<Cloud>,
-    ota: Mutex<Ota>,
     neighbor: Mutex<NeighborManager>,
-    webshell: WebShell,
-}
-
-#[derive(Clone, Copy)]
-struct ListenerPolicy {
-    lan_only: bool,
 }
 
 struct DeviceSession {
@@ -73,7 +59,6 @@ impl App {
         interval: Duration,
         token: Option<String>,
         neighbor_enabled: bool,
-        webshell_enabled: bool,
     ) -> Result<Self> {
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
@@ -89,20 +74,15 @@ impl App {
                 snapshot: RwLock::new(initial),
                 tx,
                 interval_ms: AtomicU64::new(interval.as_millis() as u64),
-                cloud: RwLock::new(Cloud::load(&data_dir)),
-                ota: Mutex::new(Ota::load(&data_dir).map_err(anyhow::Error::msg)?),
                 neighbor: Mutex::new(neighbor),
                 _data_dir: data_dir,
                 token,
                 sessions: Mutex::new(Sessions::default()),
                 device_session: Mutex::new(None),
                 sse_slots: Arc::new(Semaphore::new(16)),
-                webshell: WebShell::new(webshell_enabled),
             }),
         };
-        app.inner.cloud.read().await.start(app.inner.tx.subscribe());
         app.spawn_sampler();
-        app.spawn_ota();
         Ok(app)
     }
     pub async fn snapshot(&self) -> Snapshot {
@@ -117,37 +97,6 @@ impl App {
                 ))
                 .await;
                 app.refresh_snapshot().await;
-            }
-        });
-    }
-    fn spawn_ota(&self) {
-        if std::env::var("ZWRT_DATAD_OTA_DISABLE_AUTO").as_deref() == Ok("1") {
-            return;
-        }
-        let app = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(90)).await;
-            loop {
-                let snapshot = serde_json::to_value(app.snapshot().await).unwrap_or(Value::Null);
-                let mut manager = app.inner.ota.lock().await;
-                manager.reconcile_install_result();
-                if manager.should_auto_check() && manager.begin_update().is_ok() {
-                    manager.mark_auto_check();
-                    let _ = manager.check().await;
-                    manager.finish_update();
-                }
-                if let Some(candidate) = manager.auto_candidate()
-                    && manager.begin_update().is_ok()
-                {
-                    if let Err(error) = manager.install(&candidate, &snapshot, false).await
-                        && !error.starts_with("等待安装条件:")
-                    {
-                        manager.fail(Some(&candidate), error);
-                    }
-                    manager.finish_update();
-                }
-                drop(manager);
-                tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
     }
@@ -184,26 +133,7 @@ impl App {
             .route("/state", get(snapshot))
             .route("/events", get(events))
             .route("/capabilities", get(capabilities))
-            .route("/ubus", get(ubus_list))
-            .route("/ubus/list", get(ubus_list))
-            .route("/ubus/call", post(ubus_call))
             .route("/control", post(control));
-        router = router
-            .route("/webshell/status", get(webshell_status))
-            .route("/webshell", get(webshell_upgrade));
-        if !require_auth {
-            router = router
-                .route(
-                    "/cloud/config",
-                    get(cloud_config_get).post(cloud_config_post),
-                )
-                .route("/cloud/status", get(cloud_status));
-            router = router
-                .route("/ota/config", get(ota_config_get).post(ota_config_post))
-                .route("/ota/status", get(ota_status))
-                .route("/ota/check", post(ota_check))
-                .route("/ota/update", post(ota_update));
-        }
         if open_auth_routes {
             router = router
                 .route("/auth/login", post(auth_login))
@@ -214,9 +144,6 @@ impl App {
         }
         let router = router
             .layer(RequestBodyLimitLayer::new(1024 * 1024))
-            .layer(Extension(ListenerPolicy {
-                lan_only: open_auth_routes,
-            }))
             .with_state(self.clone());
         let listener = TcpListener::bind(addr).await?;
         let result = axum::serve(
@@ -229,117 +156,6 @@ impl App {
         result?;
         Ok(())
     }
-}
-
-async fn webshell_auth(app: &App, headers: &HeaderMap) -> bool {
-    let bearer = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    let legacy = headers
-        .get("x-auth-token")
-        .and_then(|value| value.to_str().ok());
-    let Some(presented) = bearer.or(legacy) else {
-        return false;
-    };
-    static_token_valid(app.inner.token.as_deref(), Some(presented))
-        || app.inner.sessions.lock().await.validate(presented)
-}
-
-fn webshell_error(status: StatusCode, code: &str, message: &str) -> Response {
-    (
-        status,
-        Json(json!({"ok":false,"error":{"code":code,"message":message}})),
-    )
-        .into_response()
-}
-
-async fn webshell_status(
-    State(app): State<App>,
-    Extension(policy): Extension<ListenerPolicy>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Response {
-    if policy.lan_only || !peer.ip().is_loopback() {
-        return webshell_error(
-            StatusCode::FORBIDDEN,
-            "loopback_only",
-            "WebShell is loopback only",
-        );
-    }
-    if !webshell_auth(&app, &headers).await {
-        return webshell_error(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "authentication required",
-        );
-    }
-    if !app.inner.webshell.enabled() {
-        return webshell_error(StatusCode::NOT_FOUND, "disabled", "WebShell is disabled");
-    }
-    Json(app.inner.webshell.status()).into_response()
-}
-
-async fn webshell_upgrade(
-    State(app): State<App>,
-    Extension(policy): Extension<ListenerPolicy>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    if policy.lan_only || !peer.ip().is_loopback() {
-        return webshell_error(
-            StatusCode::FORBIDDEN,
-            "loopback_only",
-            "WebShell is loopback only",
-        );
-    }
-    if !webshell_auth(&app, &headers).await {
-        return webshell_error(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "authentication required",
-        );
-    }
-    if !app.inner.webshell.enabled() {
-        return webshell_error(StatusCode::NOT_FOUND, "disabled", "WebShell is disabled");
-    }
-    if !valid_websocket_key(&headers) {
-        return webshell_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_websocket_key",
-            "Sec-WebSocket-Key must be canonical base64 for 16 bytes",
-        );
-    }
-    let Some(permit) = app.inner.webshell.try_acquire() else {
-        return webshell_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "session_limit",
-            "too many WebShell sessions",
-        );
-    };
-    let shell = app.inner.webshell.clone();
-    ws.read_buffer_size(crate::webshell::MAX_MESSAGE_SIZE)
-        .write_buffer_size(8 * 1024)
-        .max_write_buffer_size(64 * 1024)
-        .max_message_size(crate::webshell::MAX_MESSAGE_SIZE)
-        .max_frame_size(crate::webshell::MAX_MESSAGE_SIZE)
-        .accept_unmasked_frames(false)
-        .on_upgrade(move |socket| shell.serve(socket, permit))
-        .into_response()
-}
-
-fn valid_websocket_key(headers: &HeaderMap) -> bool {
-    let Some(value) = headers
-        .get("sec-websocket-key")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    BASE64
-        .decode(value)
-        .ok()
-        .is_some_and(|decoded| decoded.len() == 16 && BASE64.encode(decoded) == value)
 }
 
 async fn authenticate(State(app): State<App>, request: Request, next: Next) -> Response {
@@ -554,8 +370,6 @@ async fn capabilities() -> Json<Value> {
         "schema_version":1,
         "protocol":1,
         "events":["state"],
-        "discovery":["ubus.list","ubus.list_verbose"],
-        "passthrough":["ubus.call"],
         "transport":["http","sse"],
         "control":controls,
         "controls":controls,
@@ -578,29 +392,6 @@ async fn events(State(app): State<App>) -> Response {
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::new())
         .into_response()
-}
-#[derive(Deserialize)]
-struct ListQuery {
-    verbose: Option<u8>,
-}
-async fn ubus_list(Query(q): Query<ListQuery>) -> Response {
-    result(state::ubus_list(q.verbose == Some(1)).await)
-}
-async fn ubus_call(Json(req): Json<UbusCall>) -> Response {
-    let service = req.service.clone();
-    let method = req.method.clone();
-    match state::ubus(&req.service, &req.method, req.args).await {
-        Ok(value) => (
-            StatusCode::OK,
-            Json(json!({"ok":true,"service":service,"method":method,"result":value})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"ok":false,"error":{"code":"device_call_failed","message":e}})),
-        )
-            .into_response(),
-    }
 }
 async fn control(
     State(app): State<App>,
@@ -964,103 +755,6 @@ async fn readonly_ubus(action: &str, service: &str, method: &str, args: Value) -
     match state::ubus(service, method, args).await {
         Ok(value) => control_ok(action, value),
         Err(error) => control_failed(action, error),
-    }
-}
-async fn cloud_config_get(State(app): State<App>) -> Json<Value> {
-    Json(app.inner.cloud.read().await.public_config())
-}
-async fn cloud_status(State(app): State<App>) -> Json<Value> {
-    Json(app.inner.cloud.read().await.status())
-}
-async fn cloud_config_post(State(app): State<App>, Json(update): Json<CloudUpdate>) -> Response {
-    match app.inner.cloud.write().await.update(update) {
-        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response(),
-    }
-}
-async fn ota_config_get(State(app): State<App>) -> Json<Value> {
-    Json(app.inner.ota.lock().await.config_json())
-}
-async fn ota_status(State(app): State<App>) -> Json<Value> {
-    Json(app.inner.ota.lock().await.status_json())
-}
-async fn ota_config_post(
-    State(app): State<App>,
-    payload: Result<Json<OtaConfig>, JsonRejection>,
-) -> Response {
-    let Json(config) = match payload {
-        Ok(value) => value,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"success":false,"error":"配置格式无效"})),
-            )
-                .into_response();
-        }
-    };
-    match app.inner.ota.lock().await.update_config(config) {
-        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"success":false,"error":error})),
-        )
-            .into_response(),
-    }
-}
-async fn ota_check(State(app): State<App>) -> Response {
-    let mut manager = app.inner.ota.lock().await;
-    match manager.check().await {
-        Ok(candidate) => (
-            StatusCode::OK,
-            Json(json!({"success":true,"has_update":ota::has_update(&candidate),"manifest":candidate.manifest,"source":ota::source_name(&candidate.base_url)})),
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"success":false,"error":error})),
-        )
-            .into_response(),
-    }
-}
-async fn ota_update(State(app): State<App>) -> Response {
-    {
-        let mut manager = app.inner.ota.lock().await;
-        if let Err(error) = manager.begin_update() {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"success":false,"error":error})),
-            )
-                .into_response();
-        }
-    }
-    let task = app.clone();
-    tokio::spawn(async move {
-        let snapshot = serde_json::to_value(task.snapshot().await).unwrap_or(Value::Null);
-        let mut manager = task.inner.ota.lock().await;
-        match manager.check().await {
-            Ok(candidate) if !ota::has_update(&candidate) => {
-                manager.fail(Some(&candidate), "当前已是最新版本".into());
-            }
-            Ok(candidate) => match manager.install(&candidate, &snapshot, true).await {
-                Ok(()) => {}
-                Err(error) => {
-                    manager.fail(Some(&candidate), error);
-                }
-            },
-            Err(error) => manager.fail(None, error),
-        }
-        manager.finish_update();
-    });
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({"success":true,"status":"started"})),
-    )
-        .into_response()
-}
-fn result(value: Result<Value, String>) -> Response {
-    match value {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"ok":false,"error":e}))).into_response(),
     }
 }
 async fn shutdown() {

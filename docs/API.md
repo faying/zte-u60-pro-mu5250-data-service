@@ -24,30 +24,9 @@ X-Auth-Token: <token>
 
 原生 `EventSource` 无法设置请求头时，也可以使用 `?access_token=<token>`。
 
-`/webshell` 是例外：它只接受 `Authorization: Bearer` 或 `X-Auth-Token`
-请求头，不接受 URL 查询参数中的 Token。
-
 ## Routes
 
-### `GET /webshell/status`
-
-返回 WebShell 是否启用、当前会话数、会话上限和协议版本。该接口和
-`/webshell` 均只允许从 `127.0.0.1:9460` 访问，即使回环访问也必须携带
-有效 Token；LAN 监听 `9461` 固定返回 `403`。
-
-```json
-{"enabled":true,"active_sessions":0,"max_sessions":4,"protocol":"websocket-binary-v1"}
-```
-
-### `GET /webshell`
-
-升级为 WebSocket 后创建独立 PTY，并启动固定的系统交互 Shell。服务端不接受
-可执行文件、命令行或环境变量参数。客户端二进制帧写入 PTY，服务端二进制帧
-返回 PTY 输出；文本帧只接受 `{"type":"resize","cols":120,"rows":40}`。
-最多 4 个并发会话，聚合消息最多 16384 字节，空闲 15 分钟自动断开。
-
-浏览器原生 `WebSocket` 不能自行设置 Authorization 请求头，因此 UFI 应由后端
-在设备内连接该回环接口并代理已认证会话，不得把 datad Token 放进 URL。
+WebShell（`/webshell`、`/webshell/status`）、云端（`/cloud/*`）和 datad 自更新（`/ota/*`）已删除，访问返回 404。
 
 ### `POST /auth/login`
 
@@ -114,45 +93,7 @@ data: {"ts":1782396733,...}
 
 返回内部协议版本、支持的控制动作和事件类型。
 
-### `GET /ubus`
-
-返回设备当前注册的完整 ubus 对象清单。传入 `?verbose=1` 时等价于设备侧 `ubus -v list`，同时返回所有方法及参数签名：
-
-```sh
-curl http://127.0.0.1:9460/ubus
-curl 'http://127.0.0.1:9460/ubus?verbose=1'
-```
-
-该接口本身只做只读发现，不接受对象名、方法名或参数；实际调用使用下面独立的 `/ubus/call`。LAN 端口访问时仍需要 Bearer Token。
-
-### `POST /ubus/call`
-
-所有设备模板默认提供完整 ubus 调用能力，设备当前注册的对象和方法均可调用：
-
-```json
-{
-  "service": "system",
-  "method": "info",
-  "args": {}
-}
-```
-
-成功响应保留设备原始 JSON：
-
-```json
-{
-  "ok": true,
-  "service": "system",
-  "method": "info",
-  "result": { "uptime": 123 }
-}
-```
-
-- `args` 可省略；提供时必须是完整 JSON 对象。
-- 服务名、方法名和参数通过 `fork/exec` 参数数组传递，不经过 Shell。
-- 完整 ubus 能力由设备模板的 `full_ubus` 位控制，现有正式模板和兼容模板默认均开启。
-- 回环来源可使用本机免鉴权口；非回环来源必须走现有鉴权监听口。
-- 该入口不会区分 getter 和 setter。`reboot`、`sysupgrade`、网络重载、服务管理及厂商写接口都可能造成中断或数据丢失，调用方对目标和参数负责。
+`/ubus`、`/ubus/list`、`/ubus/call` 透传已删除（返回 404），`/capabilities` 也不再有 `discovery`、`passthrough`。设备操作只走下面的 `/control` 白名单。
 
 ### `POST /control`
 
@@ -229,7 +170,7 @@ curl 'http://127.0.0.1:9460/ubus?verbose=1'
 
 ## Integration Boundary
 
-上层 UFI 继续提供原有 `/api/*`、`/api/goform/*` 和 `/goform/*`，负责用户鉴权、UUID、UFI 自身 OTA、插件、数据库和业务逻辑。datad 自身更新由本机 `/ota/*` 接口完成，UFI 只提供鉴权代理和设置界面。UFI 将旧接口翻译为 datad 的内部控制动作，浏览器不应直接连接 datad。
+上层 UFI 继续提供原有 `/api/*`、`/api/goform/*` 和 `/goform/*`，负责用户鉴权、UUID、UFI 自身 OTA、插件、数据库和业务逻辑。datad 不再自带更新接口，更新靠自己编译后部署。UFI 将旧接口翻译为 datad 的内部控制动作，浏览器不应直接连接 datad。
 
 内网读取与 SSE 示例：
 

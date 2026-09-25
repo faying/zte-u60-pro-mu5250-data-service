@@ -214,7 +214,25 @@ status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: applica
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["error"]["code"]=="invalid_parameter"' "$TMP/bad.json"
 
 curl -fsS "http://127.0.0.1:$PORT/capabilities" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==79; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert d["discovery"]==["ubus.list","ubus.list_verbose"]; assert d["passthrough"]==["ubus.call"]; assert d["transport"]==["http","sse"]'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==79; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert "discovery" not in d; assert "passthrough" not in d; assert d["transport"]==["http","sse"]'
+# R10：ubus 透传已删除，三个路由都必须 404
+route_status() {
+    curl -sS -o /dev/null -w '%{http_code}' "$@"
+}
+expect_404() {
+    name=$1; shift
+    code=$(route_status "$@")
+    [ "$code" = 404 ] || { echo "$name: expected 404, got $code" >&2; exit 1; }
+    echo "$name: PASS"
+}
+expect_404 ubus_route_removed_404 "http://127.0.0.1:$PORT/ubus"
+expect_404 ubus_list_route_removed_404 "http://127.0.0.1:$PORT/ubus/list?verbose=1"
+expect_404 ubus_call_route_removed_404 -H 'content-type: application/json' \
+    --data-binary '{"service":"system","method":"board","args":{}}' "http://127.0.0.1:$PORT/ubus/call"
+# 云端、OTA、WebShell 也已删除
+for route in /cloud/status /cloud/config /ota/status /ota/config /webshell/status /webshell; do
+    expect_404 "removed_route$route" "http://127.0.0.1:$PORT$route"
+done
 sleep 1.2
 curl -fsS "http://127.0.0.1:$PORT/state" |
     python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["runtime"]["thermal_zones"]==[{"type":"cpuss-0","temp_milli":42000}]; assert len(d["runtime"]["link_rates"])==1; assert d["runtime"]["link_rates"][0]["interface"]=="rmnet_data0"; assert d["thermal"]["zones"]==[{"name":"cpuss-0","celsius":42.0}]; assert d["sms"]["list"][0]["text"]=="测试"; assert d["sms"]["list"][0]["unread"]==1; assert d["clients"]=={"total":2,"wifi":1,"lan":1,"list":[{"name":"wifi-live","ip":"192.168.0.2","mac":"00:11:22:33:44:55"},{"name":"lan-live","ip":"192.168.0.3","mac":"00:11:22:33:44:66"}]}'

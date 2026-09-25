@@ -1688,17 +1688,6 @@ pub async fn ubus(service: &str, method: &str, args: Value) -> Result<Value, Str
     .map_err(|e| e.to_string())?;
     serde_json::from_slice(&raw).map_err(|e| format!("invalid ubus JSON: {e}"))
 }
-pub async fn ubus_list(verbose: bool) -> Result<Value, String> {
-    let args: Vec<&str> = if verbose {
-        vec!["-v", "list"]
-    } else {
-        vec!["list"]
-    };
-    let raw = command::run(&ubus_bin(), args, Duration::from_secs(8))
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(json!({"ok":true,"verbose":verbose,"output":String::from_utf8_lossy(&raw)}))
-}
 fn validate_name(v: &str) -> Result<(), String> {
     if v.is_empty()
         || v.len() > 128
