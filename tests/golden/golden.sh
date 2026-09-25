@@ -7,6 +7,9 @@
 # 每个情形（正常 + 每个 ubus 对象读失败）起一次 datad（tests/mock_ubus.sh 做设备），
 # 抓 /state 响应体和 /events 第一个事件块的原始字节，把时间字段的值换成占位符后存/比。
 # 归一化在原始文本上按字段名替换，不重新序列化 JSON。时间字段清单见 normalize.py。
+# check 把全部情形跑两遍（T11/R19）：一遍 ZWRT_DATAD_UCI_PARSE=0，uci 全走 mock `uci show`/`uci get`；
+# 一遍把 mock 的内容写成 /etc/config 文件（uci_from_mock.py），datad 自己解析，两遍都必须和同一份 golden 一致，
+# 并检查解析那一遍对有配置文件的包没有 fork `uci show`（dhcp 故意放一个非空 delta，必须退回 `uci show`）。
 # 依赖：sh、curl、python3（和 tests/rust_control_integration.sh 一样）。
 # SPDX-License-Identifier: MIT
 set -eu
@@ -20,7 +23,7 @@ TMP=$(mktemp -d)
 PID=
 cleanup() {
     [ -z "$PID" ] || { kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; }
-    [ -z "${GOLDEN_KEEP_OUT:-}" ] || { rm -rf "$GOLDEN_KEEP_OUT"; cp -r "$TMP/out" "$GOLDEN_KEEP_OUT"; }
+    [ -z "${GOLDEN_KEEP_OUT:-}" ] || { rm -rf "$GOLDEN_KEEP_OUT"; mkdir -p "$GOLDEN_KEEP_OUT"; cp -r "$TMP/show" "$TMP/parse" "$GOLDEN_KEEP_OUT"; }
     rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
@@ -94,15 +97,29 @@ setup_fixture() {
     export ZWRT_DATAD_LIQUID_DRIVE_PATH="$F/liquid-drive"
     export ZWRT_DATAD_COOLING_ZONE_PATH="$F/zone"
     export ZWRT_DATAD_BOOT_ID_PATH="$F/boot-id"
+    if [ "$UCI_MODE" = parse ]; then
+        # R19：/etc/config 由 mock 内容生成；savedir 里 wireless 是 0 字节（= 没有未保存改动，照样解析），
+        # dhcp 非空（= 有未保存改动，退回 uci show）。
+        mkdir -p "$F/etc-config" "$F/uci-save"
+        unset ZWRT_DATAD_UCI_PARSE
+        export ZWRT_DATAD_UCI_CONFIG_DIR="$F/etc-config" ZWRT_DATAD_UCI_SAVEDIR="$F/uci-save"
+        python3 "$HERE/uci_from_mock.py" "$ROOT/tests/mock_uci.sh" "$F/etc-config" >"$F/parsed-packages"
+        : >"$F/uci-save/wireless"
+        printf "dhcp.lan.leasetime='1h'\n" >"$F/uci-save/dhcp"
+    else
+        export ZWRT_DATAD_UCI_PARSE=0
+        unset ZWRT_DATAD_UCI_CONFIG_DIR ZWRT_DATAD_UCI_SAVEDIR
+    fi
 }
 
-# capture 情形名 [失败对象]：写 $TMP/out/<情形>.state.json、<情形>.events.txt
+# capture 情形名 [失败对象]：写 $TMP/<show|parse>/<情形>.state.json、<情形>.events.txt
 capture() {
     name=$1
     export GOLDEN_FAIL_OBJECT=${2:-}
     export GOLDEN_UBUS_LOG="$TMP/objects.$name.log"
     : >"$GOLDEN_UBUS_LOG"
     setup_fixture "$TMP/fx"
+    OUT=$TMP/$UCI_MODE
     # -i 5000：抓取期间不会有第二次采样，/state 和 /events 首条都是启动时那份快照。
     "$BIN" -i 5000 --bind 127.0.0.1 --port "$PORT" --data-dir "$TMP/fx/data" >"$TMP/server.$name.log" 2>&1 &
     PID=$!
@@ -112,23 +129,40 @@ capture() {
         [ "$i" -lt 600 ] || { tail -n 20 "$TMP/server.$name.log" >&2; echo "golden: $name 起不来" >&2; exit 1; }
         sleep 0.05
     done
-    curl -fsS "http://127.0.0.1:$PORT/state" >"$TMP/out/$name.state.json"
-    curl -sN --max-time 1 "http://127.0.0.1:$PORT/events" >"$TMP/out/$name.events.raw" || true
+    curl -fsS "http://127.0.0.1:$PORT/state" >"$OUT/$name.state.json"
+    curl -sN --max-time 1 "http://127.0.0.1:$PORT/events" >"$OUT/$name.events.raw" || true
     kill "$PID" 2>/dev/null || true
     wait "$PID" 2>/dev/null || true
     PID=
-    python3 "$HERE/normalize.py" first-event <"$TMP/out/$name.events.raw" >"$TMP/out/$name.events.txt"
-    rm -f "$TMP/out/$name.events.raw"
-    python3 "$HERE/normalize.py" text <"$TMP/out/$name.state.json" >"$TMP/out/$name.state.norm" &&
-        mv "$TMP/out/$name.state.norm" "$TMP/out/$name.state.json"
+    python3 "$HERE/normalize.py" first-event <"$OUT/$name.events.raw" >"$OUT/$name.events.txt"
+    rm -f "$OUT/$name.events.raw"
+    python3 "$HERE/normalize.py" text <"$OUT/$name.state.json" >"$OUT/$name.state.norm" &&
+        mv "$OUT/$name.state.norm" "$OUT/$name.state.json"
     # /events 首条必须是完整快照：事件名 state，data 与 /state 相同（归一化后）
-    python3 "$HERE/normalize.py" same-as-state "$TMP/out/$name.state.json" <"$TMP/out/$name.events.txt" ||
+    python3 "$HERE/normalize.py" same-as-state "$OUT/$name.state.json" <"$OUT/$name.events.txt" ||
         { echo "golden: $name 的 /events 首条不是完整快照 state 事件" >&2; exit 1; }
+    [ "$UCI_MODE" = parse ] && check_parse_path "$name"
+    return 0
 }
 
-mkdir -p "$TMP/out"
+# 解析那一遍：有配置文件、delta 为空的包不许 fork uci；dhcp（非空 delta）必须 fork。
+check_parse_path() {
+    log=$TMP/fx/calls.log
+    grep -q . "$TMP/fx/parsed-packages" || { echo "golden: $1 没生成任何配置文件" >&2; exit 1; }
+    while IFS= read -r pkg; do
+        [ "$pkg" = dhcp ] && continue
+        if grep -q -e "^uci	-q show $pkg\$" -e "^uci	-q get $pkg\." "$log" 2>/dev/null; then
+            echo "golden: $1 解析路径没生效：$pkg 仍 fork 了 uci" >&2; exit 1
+        fi
+    done <"$TMP/fx/parsed-packages"
+    grep -q "^uci	-q show dhcp\$" "$log" || { echo "golden: $1 dhcp 有未保存改动却没退回 uci show" >&2; exit 1; }
+}
+
+mkdir -p "$TMP/show" "$TMP/parse"
 [ -x "$BIN" ] || { echo "golden: 找不到 $BIN" >&2; exit 1; }
 
+run_all() {
+UCI_MODE=$1
 case "$MODE" in
     record)
         capture normal
@@ -147,27 +181,33 @@ while IFS= read -r obj; do
     [ -n "$obj" ] || continue
     capture "fail-$obj" "$obj"
 done <"$HERE/objects.txt"
+}
+
+run_all show
+[ "$MODE" = record ] || run_all parse
 
 if [ "$MODE" = record ]; then
     rm -f "$HERE"/*.state.json "$HERE"/*.events.txt
-    cp "$TMP/out/"* "$HERE/"
-    echo "golden: 已录 $(ls "$TMP/out" | grep -c '\.state\.json$') 个情形 → $HERE"
+    cp "$TMP/show/"* "$HERE/"
+    echo "golden: 已录 $(ls "$TMP/show" | grep -c '\.state\.json$') 个情形 → $HERE"
     exit 0
 fi
 
 fail=0
+for mode in show parse; do
 for f in "$HERE"/*.state.json "$HERE"/*.events.txt; do
     b=$(basename "$f")
-    if [ ! -f "$TMP/out/$b" ]; then
-        echo "golden: 缺少 $b" >&2; fail=1
-    elif ! cmp -s "$f" "$TMP/out/$b"; then
-        echo "golden: $b 不一致（时间字段之外有差异）" >&2
-        diff "$f" "$TMP/out/$b" | head -n 20 | cut -c1-400 >&2 || true
+    if [ ! -f "$TMP/$mode/$b" ]; then
+        echo "golden($mode): 缺少 $b" >&2; fail=1
+    elif ! cmp -s "$f" "$TMP/$mode/$b"; then
+        echo "golden($mode): $b 不一致（时间字段之外有差异）" >&2
+        diff "$f" "$TMP/$mode/$b" | head -n 20 | cut -c1-400 >&2 || true
         fail=1
     fi
 done
-for f in "$TMP/out/"*; do
-    [ -f "$HERE/$(basename "$f")" ] || { echo "golden: 多出情形 $(basename "$f")（ubus 对象清单变了？）" >&2; fail=1; }
+for f in "$TMP/$mode/"*; do
+    [ -f "$HERE/$(basename "$f")" ] || { echo "golden($mode): 多出情形 $(basename "$f")（ubus 对象清单变了？）" >&2; fail=1; }
+done
 done
 [ "$fail" = 0 ] || exit 1
-echo "golden: $(ls "$TMP/out" | grep -c '\.state\.json$') 个情形与 golden 一致"
+echo "golden: $(ls "$TMP/show" | grep -c '\.state\.json$') 个情形与 golden 一致（uci show 路径和解析路径各一遍）"
