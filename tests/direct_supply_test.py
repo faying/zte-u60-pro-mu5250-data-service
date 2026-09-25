@@ -2,12 +2,7 @@
 """Exercise the actual HTTP/control/state path with a stateful charger fixture."""
 import json, os, pathlib, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
 BIN=pathlib.Path(sys.argv[1]).resolve()
-# Two documented behaviours are missing from the Rust version (see CONTROL_API.md
-# "Charger direct supply"). Adding them would change what /control returns today
-# for those inputs, so they are reported as KNOWN GAP instead of being asserted.
-# DIRECT_SUPPLY_STRICT=1 runs them against the documented contract.
-STRICT=os.environ.get('DIRECT_SUPPLY_STRICT')=='1'
-def gap(what): print('KNOWN GAP (skipped): '+what)
+# Contract: docs/CONTROL_API.md "Charger direct supply".
 with tempfile.TemporaryDirectory(prefix='datad-power-test-') as name:
     base=pathlib.Path(name); fixture=base/'charger.json'; calls=base/'writes.log'
     token=base/'auth.token'; token.write_text('fixture-power-token')
@@ -27,6 +22,10 @@ if args[:2]==['call','zwrt_bsp.charger']:
         wanted=json.loads(args[3])['direct_power_supply_mode']
         with open(os.environ['POWER_WRITES'],'a') as f: f.write(wanted+'\\n')
         if data.get('reject'): print('{"result":1}'); sys.exit(0)
+        if data.get('error_reply'):
+            if not data.get('ignore'):
+                data['mode']=wanted; temp=p.with_suffix('.tmp'); temp.write_text(json.dumps(data)); temp.replace(p)
+            print('{"error":"denied"}'); sys.exit(0)
         if not data.get('ignore'):
             data['mode']=wanted; temp=p.with_suffix('.tmp'); temp.write_text(json.dumps(data)); temp.replace(p)
         if data.get('empty_reply'): sys.exit(0)
@@ -67,9 +66,9 @@ print('{}')
         assert action('status')[1]['result']=={'supported':True,'enabled':False,'mode':'disable'}
         code,data=action('set',{'enabled':True}); assert code==200 and data['result']['verified'] and data['result']['changed'] and data['result']['enabled']
         before=count(); assert action('set',{'enabled':True})[1]['result']['changed'] is False; assert count()==before
-        if STRICT:
-            before=count(); assert action('set',{'enabled':1})[1]['result']['changed'] is False; assert count()==before
-        else: gap('params.enabled 0/1 (docs: "boolean or 0/1"); Rust accepts only JSON booleans and returns 400')
+        before=count(); assert action('set',{'enabled':1})[1]['result']['changed'] is False; assert count()==before
+        code,data=action('set',{'enabled':0}); assert code==200 and data['result']['changed'] and data['result']['mode']=='disable'
+        code,data=action('set',{'enabled':1}); assert code==200 and data['result']['changed'] and data['result']['enabled'] is True
         assert action('set',{'enabled':False})[1]['result']['mode']=='disable'
         for value in (None,2,'enable','true; touch /tmp/not-allowed',[],{}):
             before=count(); code,_=action('set',{} if value is None else {'enabled':value}); assert code==400,(value,code); assert count()==before
@@ -79,13 +78,13 @@ print('{}')
         before=count(); assert action('set',{'enabled':True})[0]==502; assert count()==before
         for key in ('read_fail','malformed'):
             setup(**{key:True}); assert action('status')[0]==502; assert action('set',{'enabled':True})[0]==502
-        if STRICT:
-            for reply in ('empty_reply','whitespace_reply'):
-                setup(mode='disable',**{reply:True}); assert action('set',{'enabled':True})[1]['result']['verified']
-        else: gap('empty/whitespace set reply with confirmed readback (docs: accepted); Rust returns 502 "invalid ubus JSON"')
+        for reply in ('empty_reply','whitespace_reply'):
+            setup(mode='disable',**{reply:True}); code,data=action('set',{'enabled':True}); assert code==200 and data['result']['verified'],(reply,code,data)
+        # Nonempty reply carrying an error fails even though readback would confirm.
+        setup(mode='disable',error_reply=True); assert action('set',{'enabled':True})[0]==502
         setup(mode='disable',bad_reply=True); assert action('set',{'enabled':True})[0]==502
         setup(mode='disable',reject=True); assert action('set',{'enabled':True})[0]==502
-        setup(mode='disable',ignore=True,**({'empty_reply':True} if STRICT else {})); code,data=action('set',{'enabled':True}); assert code==502 and 'readback' in data['error']['message']
+        setup(mode='disable',ignore=True,empty_reply=True); code,data=action('set',{'enabled':True}); assert code==502 and 'readback' in data['error']['message']
         setup(mode='disable'); assert action('set',{'enabled':True})[0]==200
         for i in range(30):
             state=req('/state')[1]

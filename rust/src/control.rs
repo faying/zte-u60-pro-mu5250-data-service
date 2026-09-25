@@ -546,8 +546,37 @@ async fn wifi_dual_band(params: &Value) -> Outcome {
     )
     .await
 }
+/// `power.direct_supply.set` 的 `enabled`：JSON 布尔、0/1，以及旧 C 版也认的
+/// 字符串 "0"/"1"/"true"/"false"（C 版 `required_bool_param`）。其余输入的错误文字不变。
+fn direct_supply_enabled(params: &Value) -> Result<bool, String> {
+    match object(params).get("enabled") {
+        Some(Value::Bool(v)) => Ok(*v),
+        Some(Value::Number(n)) if n.as_i64() == Some(0) => Ok(false),
+        Some(Value::Number(n)) if n.as_i64() == Some(1) => Ok(true),
+        Some(Value::String(v)) if v == "1" || v == "true" => Ok(true),
+        Some(Value::String(v)) if v == "0" || v == "false" => Ok(false),
+        _ => Err("enabled must be boolean".into()),
+    }
+}
+/// 写入回复是否算失败（C 版逻辑）：没有数据（空或全空白，B20 成功时就这样）不算失败，
+/// 靠后面的回读确认；有数据时必须是对象、没有 `error`、`result`（缺省 0）为 0。
+fn direct_supply_write_failed(reply: &Result<Value, crate::ubus::client::UbusError>) -> bool {
+    match reply {
+        Err(crate::ubus::client::UbusError::NoData { .. }) => false,
+        Err(_) => true,
+        Ok(Value::Object(body)) => {
+            let result = body.get("result").map_or(0, |v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                    .unwrap_or(0)
+            });
+            body.contains_key("error") || result != 0
+        }
+        Ok(_) => true,
+    }
+}
 async fn direct_supply(params: &Value) -> Outcome {
-    let wanted = match boolean(params, "enabled") {
+    let wanted = match direct_supply_enabled(params) {
         Ok(v) => v,
         Err(e) => return Outcome::Invalid(e),
     };
@@ -563,14 +592,17 @@ async fn direct_supply(params: &Value) -> Outcome {
     };
     let changed = (mode == "enable") != wanted;
     if changed {
-        if let Err(e) = state::ubus(
+        let reply = crate::executor::call(
             "zwrt_bsp.charger",
             "set",
-            json!({"direct_power_supply_mode":if wanted{"enable"}else{"disable"}}),
+            &json!({"direct_power_supply_mode":if wanted{"enable"}else{"disable"}}),
         )
-        .await
-        {
-            return Outcome::Failed(e);
+        .await;
+        if direct_supply_write_failed(&reply) {
+            return Outcome::Failed(match reply {
+                Err(e) => e.to_string(),
+                Ok(_) => "direct supply write failed".into(),
+            });
         }
         let expected = if wanted { "enable" } else { "disable" };
         let mut verified = false;
@@ -1901,6 +1933,53 @@ mod tests {
     fn rejects_non_hex_mac() {
         assert!(!valid_mac("00:11:22:33:44:zz"));
         assert!(valid_mac("00:11:22:33:44:aa"));
+    }
+    #[test]
+    fn direct_supply_enabled_accepts_bool_01_and_c_strings() {
+        for (v, want) in [
+            (json!(true), true),
+            (json!(false), false),
+            (json!(1), true),
+            (json!(0), false),
+            (json!("1"), true),
+            (json!("true"), true),
+            (json!("0"), false),
+            (json!("false"), false),
+        ] {
+            assert_eq!(direct_supply_enabled(&json!({"enabled": v})), Ok(want));
+        }
+        for v in [
+            json!(2),
+            json!(1.5),
+            json!("enable"),
+            json!(""),
+            json!([]),
+            json!({}),
+        ] {
+            assert_eq!(
+                direct_supply_enabled(&json!({"enabled": v})),
+                Err("enabled must be boolean".into())
+            );
+        }
+        assert!(direct_supply_enabled(&json!({})).is_err());
+    }
+    #[test]
+    fn direct_supply_write_reply_empty_ok_errors_fail() {
+        use crate::ubus::client::UbusError;
+        let no_data = Err(UbusError::NoData {
+            object: "zwrt_bsp.charger".into(),
+            detail: "invalid ubus JSON".into(),
+        });
+        assert!(!direct_supply_write_failed(&no_data));
+        assert!(!direct_supply_write_failed(&Ok(json!({}))));
+        assert!(!direct_supply_write_failed(&Ok(json!({"result": 0}))));
+        assert!(direct_supply_write_failed(&Ok(json!({"result": 1}))));
+        assert!(direct_supply_write_failed(&Ok(json!({"result": "-1"}))));
+        assert!(direct_supply_write_failed(&Ok(json!({"error": "denied"}))));
+        assert!(direct_supply_write_failed(&Ok(json!([1]))));
+        assert!(direct_supply_write_failed(&Err(UbusError::Io(
+            "invalid ubus JSON: x".into()
+        ))));
     }
     #[test]
     fn band_validation() {
