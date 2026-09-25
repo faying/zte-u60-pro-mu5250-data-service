@@ -481,6 +481,8 @@ impl Hub {
                 b.last_failed = false;
                 b.last_success = Some(now);
                 b.observed_at = wall_secs();
+                // 原始回复没变，依赖它的块不用重算（电池的 sysfs 电压电流每次读都变，别多发一条）。
+                let raw_changed = b.raw.as_ref() != Some(&v);
                 b.raw = Some(v);
                 b.data = Some(shaped);
                 let was_stale = b.stale;
@@ -493,7 +495,9 @@ impl Hub {
                 };
                 let decision = b.spec.policy.on_read(&input);
                 Self::publish(&mut g.seq, b, &*self.sink, decision, was_stale, now);
-                Self::reshape_dependents(g, i, &*self.sink, now);
+                if raw_changed {
+                    Self::reshape_dependents(g, i, &*self.sink, now);
+                }
             }
             _ => {
                 b.last_failed = true;

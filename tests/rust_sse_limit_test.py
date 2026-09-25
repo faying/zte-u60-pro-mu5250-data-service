@@ -41,22 +41,28 @@ def check(port):
             response.read()
             rejected.close()
 
-        clients.pop(0)[0].close()
-        deadline = time.monotonic() + 8
-        while True:
-            replacement, response = connect(port, "/v2/events")
-            if response.status == 200:
-                replacement.close()
-                break
-            response.read()
-            replacement.close()
-            assert response.status == 503, response.status
-            if time.monotonic() >= deadline:
-                raise AssertionError("SSE slot was not released after disconnect")
-            time.sleep(0.2)
+        # 关一个 /events、再关一个 /v2/events：两种连接都要把名额还回来。
+        # 新连接一直占着名额，所以第二次必须是刚关掉的那个 /v2 连接腾出来的。
+        for closing in (clients.pop(0), clients.pop()):
+            closing[0].close()
+            clients.append(wait_slot(port))
     finally:
         for connection, _ in clients:
             connection.close()
+
+
+def wait_slot(port):
+    deadline = time.monotonic() + 8
+    while True:
+        connection, response = connect(port, "/v2/events")
+        if response.status == 200:
+            return connection, response
+        response.read()
+        connection.close()
+        assert response.status == 503, response.status
+        if time.monotonic() >= deadline:
+            raise AssertionError("SSE slot was not released after disconnect")
+        time.sleep(0.2)
 
 
 def wait_ready(port, proc):

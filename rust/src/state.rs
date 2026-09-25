@@ -1865,6 +1865,9 @@ mod tests {
         assert_eq!(hub.view("battery").unwrap().data["charging"], 0);
         // 电池自己读成功 1 次、跟着充电器变 2 次。
         assert_eq!(hub.view("battery").unwrap().revision, 3);
+        // 充电器回复没变：电池不重算、不发。
+        hub.record_read(1, Ok(json!({"charge_status":0})), now);
+        assert_eq!(hub.view("battery").unwrap().revision, 3);
         // 旧接口拿到的仍是原始回复。
         assert_eq!(hub.legacy("charger"), Ok(json!({"charge_status":0})));
     }
