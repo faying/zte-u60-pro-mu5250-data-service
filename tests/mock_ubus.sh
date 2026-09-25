@@ -177,6 +177,23 @@ case "$service:$method" in
     zwrt_bsp.thermal:get_cpu_temp)
         printf '%s\n' '{"cpuss_temp":42}'
         ;;
+    # netifd 标准形状（OpenWrt network.interface.* status）。取值贴近 MU5250：LAN 是 br-lan
+    # 192.168.0.1/24；蜂窝 WAN 在 rmnet_data0 上，IPv4 是 /30、默认路由 proto static。
+    # 地址用文档保留段（RFC 5737 / 2001:db8::/32）。
+    network.interface.lan:status)
+        printf '%s\n' '{"up":true,"pending":false,"available":true,"autostart":true,"dynamic":false,"uptime":3600,"l3_device":"br-lan","proto":"static","device":"br-lan","metric":0,"dns_metric":0,"delegation":true,"ipv4-address":[{"address":"192.168.0.1","mask":24}],"ipv6-address":[],"ipv6-prefix":[],"ipv6-prefix-assignment":[],"route":[],"dns-server":[],"dns-search":[],"neighbors":[],"inactive":{"ipv4-address":[],"ipv6-address":[],"route":[],"dns-server":[],"dns-search":[],"neighbors":[]},"data":{}}'
+        ;;
+    network.interface.zte_wan:status)
+        printf '%s\n' '{"up":true,"pending":false,"available":true,"autostart":true,"dynamic":false,"uptime":3500,"l3_device":"rmnet_data0","proto":"static","device":"rmnet_data0","metric":0,"dns_metric":0,"delegation":true,"ipv4-address":[{"address":"198.51.100.21","mask":30}],"ipv6-address":[],"ipv6-prefix":[],"ipv6-prefix-assignment":[],"route":[{"target":"0.0.0.0","mask":0,"nexthop":"198.51.100.22","source":"0.0.0.0/0"}],"dns-server":["192.0.2.53","192.0.2.54"],"dns-search":[],"neighbors":[],"inactive":{"ipv4-address":[],"ipv6-address":[],"route":[],"dns-server":[],"dns-search":[],"neighbors":[]},"data":{}}'
+        ;;
+    network.interface.zte_wan6:status)
+        printf '%s\n' '{"up":true,"pending":false,"available":true,"autostart":true,"dynamic":false,"uptime":3500,"l3_device":"rmnet_data0","proto":"static","device":"rmnet_data0","metric":0,"dns_metric":0,"delegation":true,"ipv4-address":[],"ipv6-address":[{"address":"2001:db8:4f2a:1c07::1","mask":64}],"ipv6-prefix":[],"ipv6-prefix-assignment":[],"route":[{"target":"::","mask":0,"nexthop":"fe80::1","source":"2001:db8:4f2a:1c07::/64"}],"dns-server":["2001:db8:100::53"],"dns-search":[],"neighbors":[],"inactive":{"ipv4-address":[],"ipv6-address":[],"route":[],"dns-server":[],"dns-search":[],"neighbors":[]},"data":{}}'
+        ;;
+    # zwrt_bsp.usb list：datad 只读 mode（debug = ADB 开，user = 关，见 docs/STATE_SCHEMA.md）；
+    # 其余字段按 manager 管理网页的 UsbStatus 形状。
+    zwrt_bsp.usb:list)
+        printf '%s\n' '{"connect":0,"mode":"user","typec_cc":"no_cc","usb2rj45":0}'
+        ;;
     network.interface.zte_mwan2:status|network.interface.zte_mwan2_6:status|network.interface.zte_mwan3:status|network.interface.zte_mwan3_6:status|network.interface.zte_mwan4:status|network.interface.zte_mwan4_6:status)
         printf '%s\n' '{"up":true,"pending":false,"available":true,"proto":"dhcp","l3_device":"fixture0","ipv4-address":[],"ipv6-address":[],"dns-server":[]}'
         ;;
