@@ -3,7 +3,8 @@
 //! - `Cli`：默认，每次起一个 `ubus call`（和原来的 `state::ubus` 一样：同样的名字校验、8 秒超时、
 //!   同样的错误文字，`ZWRT_DATAD_UBUS_BIN` 指定程序）。
 //! - `Socket`：直连 ubusd（`client::UbusClient`），`ZWRT_DATAD_UBUS_SOCK` 指定 socket，
-//!   `ZWRT_DATAD_UBUS_TIMEOUT_MS` 指定单请求超时（默认 2000）。
+//!   `ZWRT_DATAD_UBUS_TIMEOUT_MS` 指定采集轮里的单请求超时（默认 2000）；采集轮之外（控制任务、
+//!   内部任务）的请求用 `CONTROL_TIMEOUT`（8 秒，写操作可能要等较久；环境变量更大时取更大的）。
 //!
 //! 执行者（`executor.rs`）持有一个 `Backend`；`state::ubus` 经执行者调到这里（T4）。
 
@@ -23,6 +24,8 @@ pub fn cli_bin() -> String {
 
 /// `state::ubus` 给 `ubus call` 的超时。
 pub const CLI_TIMEOUT: Duration = Duration::from_secs(8);
+/// socket 后端在采集轮之外（控制任务、内部任务）的单请求超时（V2-19）。
+pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
@@ -64,6 +67,8 @@ pub trait UbusBackend: Send {
         method: &str,
         args: &Value,
     ) -> impl Future<Output = Result<Value, UbusError>> + Send;
+    /// 接下来的调用是否在采集轮里（执行者每次调用前设置）。socket 后端据此选超时，其他后端不管。
+    fn set_round(&mut self, _round: bool) {}
 }
 
 /// 现状：每次调用起一个 `ubus call`。
@@ -129,11 +134,20 @@ impl UbusBackend for CliBackend {
 /// 直连 ubusd。
 pub struct SocketBackend {
     client: UbusClient,
+    /// 采集轮里的超时（构造时 client 的超时）。
+    round_timeout: Duration,
+    /// 采集轮之外的超时。
+    control_timeout: Duration,
 }
 
 impl SocketBackend {
     pub fn new(client: UbusClient) -> Self {
-        Self { client }
+        let round_timeout = client.timeout();
+        Self {
+            client,
+            round_timeout,
+            control_timeout: CONTROL_TIMEOUT.max(round_timeout),
+        }
     }
 
     pub fn from_env() -> Self {
@@ -162,6 +176,14 @@ fn empty_output_error() -> String {
 impl UbusBackend for SocketBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Socket
+    }
+
+    fn set_round(&mut self, round: bool) {
+        self.client.set_timeout(if round {
+            self.round_timeout
+        } else {
+            self.control_timeout
+        });
     }
 
     async fn call(&mut self, object: &str, method: &str, args: &Value) -> Result<Value, UbusError> {
@@ -203,6 +225,13 @@ impl UbusBackend for Backend {
         match self {
             Self::Cli(b) => b.call(object, method, args).await,
             Self::Socket(b) => b.call(object, method, args).await,
+        }
+    }
+
+    fn set_round(&mut self, round: bool) {
+        match self {
+            Self::Cli(b) => b.set_round(round),
+            Self::Socket(b) => b.set_round(round),
         }
     }
 }

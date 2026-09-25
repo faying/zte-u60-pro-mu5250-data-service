@@ -152,8 +152,10 @@ stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 所以一轮最长是 3 秒 + 一次超时 = 5 秒。
 单个请求的超时按后端分：`socket` 是 2 秒；`cli`（`ubus call`，默认）保留原来的 8 秒（fork 开销大），
 这时一轮最长是 3 + 8 = 11 秒。
+2 秒只用于采集轮里的读取；`socket` 后端在采集轮之外（控制任务、内部任务）的请求用 8 秒，
+因为写操作（比如切换设置）可能要等较久，2 秒就判超时会把已送达的写操作报成失败。控制任务不计每轮预算（见 V2-23）。
 例：同一轮有 3 个对象都不回复。第 1 个 0～2 秒超时，第 2 个 2～4 秒超时，第 3 个没开始。这一轮约 4 秒，心跳照发，下一轮先读第 3 个。
-测试（T4）：`round_three_timeouts_within_budget_plus_one_timeout`
+测试（T4）：`round_three_timeouts_within_budget_plus_one_timeout`、`control_calls_use_control_timeout_rounds_use_round_timeout`、`socket_control_timeout_longer_than_round`
 
 **V2-20** 轮转：本轮因为预算没轮到的块，下一轮从停下的地方开始、先读它们，保证慢对象不会一直把后面的块挤掉。
 测试（T4）：`round_rotation_reads_skipped_blocks_first`

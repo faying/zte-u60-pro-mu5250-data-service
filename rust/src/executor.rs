@@ -74,6 +74,7 @@ trait DynBackend: Send {
         method: &'a str,
         args: &'a Value,
     ) -> BoxFuture<'a, Result<Value, UbusError>>;
+    fn set_round(&mut self, round: bool);
 }
 
 impl<B: UbusBackend> DynBackend for B {
@@ -84,6 +85,9 @@ impl<B: UbusBackend> DynBackend for B {
         args: &'a Value,
     ) -> BoxFuture<'a, Result<Value, UbusError>> {
         Box::pin(UbusBackend::call(self, object, method, args))
+    }
+    fn set_round(&mut self, round: bool) {
+        UbusBackend::set_round(self, round);
     }
 }
 
@@ -201,7 +205,12 @@ impl Shared {
         }
         self.stats.calls.fetch_add(1, Ordering::Relaxed);
         let start = Instant::now();
-        let r = self.backend.lock().await.call(object, method, args).await;
+        // 采集轮里用短超时（socket 2 秒），控制任务和内部任务用长超时（8 秒，V2-19）。
+        let r = {
+            let mut b = self.backend.lock().await;
+            b.set_round(round);
+            b.call(object, method, args).await
+        };
         if round {
             let mut rs = lock(&self.round);
             rs.used += start.elapsed();

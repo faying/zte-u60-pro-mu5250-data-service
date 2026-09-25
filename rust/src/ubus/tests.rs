@@ -586,6 +586,32 @@ async fn cli_backend_matches_state_ubus() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn socket_control_timeout_longer_than_round() {
+    // 采集轮里用构造时的短超时，采集轮之外（控制任务）用 8 秒：慢写操作不会被 2 秒截断。
+    let m = MockUbusd::start_new().await;
+    m.add_method("svc", 3, "set", json!({"ok":1}));
+    let mut s = SocketBackend::new(client(&m));
+    s.set_round(true);
+    assert_eq!(s.client().timeout(), T);
+    m.script("svc", "set", Action::Delay(T * 2));
+    let e = s.call("svc", "set", &json!({})).await.unwrap_err();
+    assert!(e.is_timeout(), "{e:?}");
+    s.set_round(false);
+    assert_eq!(s.client().timeout(), super::backend::CONTROL_TIMEOUT);
+    m.script("svc", "set", Action::Delay(T * 2));
+    assert_eq!(
+        s.call("svc", "set", &json!({})).await.unwrap(),
+        json!({"ok":1})
+    );
+    // 默认 2 秒的后端：轮里 2 秒，轮外 8 秒。
+    let mut d = SocketBackend::new(UbusClient::new("/nonexistent"));
+    d.set_round(true);
+    assert_eq!(d.client().timeout(), Duration::from_secs(2));
+    d.set_round(false);
+    assert_eq!(d.client().timeout(), Duration::from_secs(8));
+}
+
 /// 执行者（T4）要把后端放进 `tokio::spawn` 的任务里：future 必须是 Send。
 #[test]
 fn backend_futures_are_send() {

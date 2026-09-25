@@ -29,6 +29,9 @@ struct MockInner {
     in_flight: usize,
     max_in_flight: usize,
     off_executor: usize,
+    /// 执行者最近一次 `set_round` 的值，以及每次调用时的值 (键, 在采集轮里)。
+    round: bool,
+    round_log: Vec<(String, bool)>,
 }
 
 #[derive(Clone, Default)]
@@ -64,11 +67,16 @@ impl UbusBackend for Mock {
     fn kind(&self) -> BackendKind {
         BackendKind::Socket
     }
+    fn set_round(&mut self, round: bool) {
+        lock(&self.0).round = round;
+    }
     async fn call(&mut self, object: &str, method: &str, args: &Value) -> Result<Value, UbusError> {
         let key = format!("{object}.{method}");
         let step = {
             let mut m = lock(&self.0);
             m.log.push((Instant::now(), key.clone()));
+            let round = m.round;
+            m.round_log.push((key.clone(), round));
             m.in_flight += 1;
             m.max_in_flight = m.max_in_flight.max(m.in_flight);
             if !super::on_executor() {
@@ -941,4 +949,27 @@ async fn rounds_and_heartbeats_continue_under_control_flood() {
     for f in floods {
         f.await.unwrap();
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn control_calls_use_control_timeout_rounds_use_round_timeout() {
+    // 执行者每次调用前告诉后端在不在采集轮里：块读取是轮里（socket 2 秒），控制任务和内部任务不是（8 秒）。
+    let (exec, mock, _) = setup(vec![spec("a", 0), spec("b", 0)], Config::default(), 1000);
+    mock.default_step("a.list", Step::Reply(json!({}), Duration::from_secs(1)));
+    let job: BoxFuture<'static, ()> = Box::pin(async {
+        call("ctl", "set", &json!({})).await.unwrap();
+    });
+    during_first_block(&exec, vec![job]).await;
+    exec.call("int", "get", &json!({})).await.unwrap();
+    let log = lock(&mock.0).round_log.clone();
+    let want: Vec<(String, bool)> = [
+        ("a.list", true),
+        ("ctl.set", false),
+        ("b.list", true),
+        ("int.get", false),
+    ]
+    .iter()
+    .map(|(k, r)| (k.to_string(), *r))
+    .collect();
+    assert_eq!(log, want);
 }
