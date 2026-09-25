@@ -28,7 +28,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -128,6 +128,8 @@ struct Shared {
     /// 轮转：下一轮从这块开始（V2-20）。
     cursor: Mutex<usize>,
     driver: Mutex<Option<Arc<dyn RoundDriver>>>,
+    /// 下一轮不等采样间隔、立即开始（短信事件，V2-31）。
+    kick: AtomicBool,
     stats: Stats,
 }
 
@@ -318,8 +320,10 @@ impl Shared {
             let deadline = driver
                 .as_ref()
                 .map(|_| last_round_end + self.sample_interval());
+            // V2-31：被踢过就不等间隔。轮本身仍在这个循环里串行跑，轮里照样先做排队的控制任务。
+            let kicked = deadline.is_some() && self.kick.swap(false, Ordering::AcqRel);
             match deadline {
-                Some(d) if Instant::now() >= d => {
+                Some(d) if kicked || Instant::now() >= d => {
                     let legacy = driver.map(|d| d.legacy());
                     self.round(legacy).await;
                     last_round_end = Instant::now();
@@ -360,6 +364,7 @@ impl Executor {
             interval_ms: AtomicU64::new(sample_interval.as_millis() as u64),
             cursor: Mutex::new(0),
             driver: Mutex::new(None),
+            kick: AtomicBool::new(false),
             stats: Stats::default(),
         });
         tokio::spawn(shared.clone().run());
@@ -456,6 +461,14 @@ impl Executor {
             .submit(false, fut)
             .expect("internal tasks are unbounded");
         rx.await.expect("executor dropped a task")
+    }
+
+    /// 短信事件（V2-31）：`names` 的块标成立即读，并让下一轮不等采样间隔立即开始。
+    /// 正在跑一轮时，这一轮跑完马上再跑一轮；多次调用在开始前只算一次。不另起并发的采集。
+    pub fn kick(&self, names: &[&str]) {
+        self.shared.hub.mark_immediate(Some(names));
+        self.shared.kick.store(true, Ordering::Release);
+        self.shared.wake.notify_one();
     }
 
     /// `/control` 成功后：相关块下一轮立即读，`None` = 全部块（R12）。不另起一轮（V2-27）。

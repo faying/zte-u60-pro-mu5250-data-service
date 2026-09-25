@@ -101,6 +101,18 @@ impl App {
             }),
         };
         app.inner.exec.start_rounds(Arc::new(app.clone()));
+        // V2-31：监听短信事件，收到后短信读取立即重读、执行者立即开一轮（只订阅，不发请求）。
+        let exec = app.inner.exec.clone();
+        crate::ubus::listen::spawn_if_enabled(
+            std::env::var(crate::ubus::listen::ENV_ENABLE)
+                .ok()
+                .as_deref(),
+            crate::ubus::listen::Options::from_env(),
+            Arc::new(move || {
+                state::invalidate_sms_cache();
+                exec.kick(&["sms"]);
+            }),
+        );
         Ok(app)
     }
     pub async fn snapshot(&self) -> Snapshot {

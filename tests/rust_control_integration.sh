@@ -38,6 +38,9 @@ export MOCK_IWINFO_DELAY_CALLS=3
 export MOCK_UCI_STATE_DIR="$TMP/uci-state"
 export MOCK_SIM_SLOT_FILE="$TMP/sim-slot"
 export MOCK_SMS_COUNT_FILE="$TMP/sms-count"
+export MOCK_LISTEN_EVENTS_FILE="$TMP/listen-events"
+export MOCK_LISTEN_LOG="$TMP/listen.log"
+: >"$MOCK_LISTEN_EVENTS_FILE"
 export ZWRT_DATAD_WIFI_CONFIG="$TMP/datad_wifi"
 export ZWRT_DATAD_COOLING_CONFIG="$TMP/cooling.conf"
 export ZWRT_DATAD_FAN_PWM_PATH="$TMP/pwm1"
@@ -337,6 +340,17 @@ for _ in $(seq 1 40); do
     sleep 0.5
 done
 python3 -c 'import json,sys; b=json.load(open(sys.argv[1]))["blocks"]["sms"]; assert b["data"]=={"unread":1,"max_id":600,"count":0}, b' "$TMP/v2.json"
+# V2-31：datad 自己监听 zwrt_wms_status_event；新短信 + 事件后，sms 块在 3 秒内更新（不等 10 秒列表缓存）。
+grep -Fx 'listen zwrt_wms_status_event' "$MOCK_LISTEN_LOG" >/dev/null
+printf '601\n' >"$MOCK_SMS_COUNT_FILE"
+printf '%s\n' '{ "zwrt_wms_status_event": { "sms_new": 1 } }' >>"$MOCK_LISTEN_EVENTS_FILE"
+ok=0
+for _ in $(seq 1 30); do
+    curl -fsS "http://127.0.0.1:$PORT/v2/state" >"$TMP/v2.json"
+    python3 -c 'import json,sys; b=json.load(open(sys.argv[1]))["blocks"]["sms"]; sys.exit(0 if b["data"]["max_id"]==601 else 1)' "$TMP/v2.json" && { ok=1; break; }
+    sleep 0.1
+done
+[ "$ok" = 1 ] || { echo 'sms block not refreshed after zwrt_wms_status_event'; exit 1; }
 : >"$MOCK_SMS_COUNT_FILE"
 
 echo 'rust control HTTP fixture: PASS'

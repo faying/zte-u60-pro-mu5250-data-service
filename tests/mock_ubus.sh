@@ -13,6 +13,28 @@ set -eu
     printf '%s\n' system zte_nwinfo_api zwrt_data zwrt_zte_mdm.api
     exit 0
 }
+# `ubus listen <事件>`（datad 的短信事件监听，V2-31）。默认：不出任何事件，datad 退出就跟着退出。
+# MOCK_LISTEN_LOG：每次启动追加一行；MOCK_LISTEN_EVENTS_FILE：把这个文件新追加的行原样输出（当作事件）；
+# MOCK_LISTEN_EXIT_AFTER：输出完已有的行后过这么多秒就退出（模拟监听挂掉）。
+[ "$1" = "listen" ] && {
+    [ -n "${MOCK_LISTEN_LOG:-}" ] && printf 'listen %s\n' "${2:-}" >>"$MOCK_LISTEN_LOG"
+    parent=$PPID seen=0 ticks=0
+    while kill -0 "$parent" 2>/dev/null; do
+        if [ -n "${MOCK_LISTEN_EVENTS_FILE:-}" ] && [ -f "$MOCK_LISTEN_EVENTS_FILE" ]; then
+            total=$(wc -l <"$MOCK_LISTEN_EVENTS_FILE")
+            if [ "$total" -gt "$seen" ]; then
+                sed -n "$((seen + 1)),${total}p" "$MOCK_LISTEN_EVENTS_FILE"
+                seen=$total
+            fi
+        fi
+        if [ -n "${MOCK_LISTEN_EXIT_AFTER:-}" ] && [ "$ticks" -ge $((MOCK_LISTEN_EXIT_AFTER * 10)) ]; then
+            exit 1
+        fi
+        ticks=$((ticks + 1))
+        sleep 0.1
+    done
+    exit 0
+}
 [ "$1" = "-t" ] && shift 2
 [ "$1" = "call" ] && shift
 service="${1:-}"

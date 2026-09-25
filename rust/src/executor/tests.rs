@@ -263,6 +263,10 @@ async fn executor_is_only_ubus_caller() {
             "{name}：后端只在 server.rs 建一次，交给执行者"
         );
     }
+    // V2-31：短信事件监听只订阅（`ubus listen`），不发请求。
+    let listen = include_str!("../ubus/listen.rs");
+    assert!(listen.contains(".args([\"listen\", EVENT])"));
+    assert!(!listen.contains("\"call\""), "listen.rs 不能发 ubus call");
     let state = include_str!("../state.rs");
     assert!(
         state.contains("crate::executor::call("),
@@ -822,4 +826,67 @@ async fn live_block_cadence_follows_round_length() {
         live.iter().map(|l| l.1.revision).collect::<Vec<_>>(),
         [1, 2, 3, 4, 5, 6, 7]
     );
+}
+
+/// 旧采集里的短信读取：和 `state::ubus_ttl` 一样按 10 秒缓存，读到就记进 `sms` 块；
+/// `invalidate` 相当于 `state::invalidate_sms_cache`。
+struct SmsLegacy {
+    hub: Arc<Hub>,
+    last: Arc<Mutex<Option<Instant>>>,
+}
+impl RoundDriver for SmsLegacy {
+    fn legacy(&self) -> BoxFuture<'static, ()> {
+        let (hub, last) = (self.hub.clone(), self.last.clone());
+        Box::pin(async move {
+            preempt().await;
+            let fresh = lock(&last).is_some_and(|t| t.elapsed() < Duration::from_secs(10));
+            if fresh {
+                return;
+            }
+            let r = call("zwrt_wms", "list", &json!({})).await;
+            *lock(&last) = Some(Instant::now());
+            hub.record("sms", r.map_err(|e| e.to_string()), Instant::now());
+        })
+    }
+}
+
+/// V2-31：短信事件到达后，不等采样间隔、不等 10 秒列表缓存，下一轮（立即开始）就把新短信读进 sms 块；
+/// 一轮开始前的多次事件只多出一轮。
+#[tokio::test(start_paused = true)]
+async fn sms_event_updates_block_within_one_round() {
+    let (exec, mock, _) = setup(
+        vec![BlockSpec::derived("sms", Box::new(crate::block::OnChange))],
+        Config::default(),
+        5000,
+    );
+    mock.default_step(
+        "zwrt_wms.list",
+        Step::Reply(json!({"max_id":1}), Duration::from_millis(20)),
+    );
+    let last = Arc::new(Mutex::new(None));
+    exec.start_rounds(Arc::new(SmsLegacy {
+        hub: exec.hub().clone(),
+        last: last.clone(),
+    }));
+    tokio::time::sleep(Duration::from_millis(5500)).await; // 第 1 轮在 5 秒
+    assert_eq!(exec.hub().view("sms").unwrap().data, json!({"max_id":1}));
+    let rounds = exec.stats().rounds.load(Ordering::Relaxed);
+    // 新短信到了；事件去抖后：清短信缓存 + 踢执行者。连踢 3 次只算一次。
+    mock.default_step(
+        "zwrt_wms.list",
+        Step::Reply(json!({"max_id":2}), Duration::from_millis(20)),
+    );
+    let t0 = Instant::now();
+    for _ in 0..3 {
+        *lock(&last) = None;
+        exec.kick(&["sms"]);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(exec.hub().view("sms").unwrap().data, json!({"max_id":2}));
+    assert_eq!(exec.stats().rounds.load(Ordering::Relaxed), rounds + 1);
+    assert!(Instant::now() - t0 < Duration::from_secs(1));
+    assert_eq!(mock.names(), ["zwrt_wms.list", "zwrt_wms.list"]);
+    // 之后照常按采样间隔（下一轮在踢的那一轮结束后 5 秒），不再多跑。
+    tokio::time::sleep(Duration::from_millis(4000)).await;
+    assert_eq!(exec.stats().rounds.load(Ordering::Relaxed), rounds + 1);
 }

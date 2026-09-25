@@ -98,6 +98,20 @@ pub fn invalidate_cache() {
     crate::qos::invalidate();
 }
 
+/// 短信事件（V2-31）：只丢掉短信容量和短信列表的缓存，下一次旧采集立即重读它们。
+pub fn invalidate_sms_cache() {
+    if let Ok(mut c) = UBUS_CACHE.lock()
+        && let Some(map) = c.as_mut()
+    {
+        map.retain(|k, _| !is_sms_key(k));
+    }
+}
+
+fn is_sms_key(key: &str) -> bool {
+    key.starts_with("zwrt_wms\u{0}zwrt_wms_get_wms_capacity\u{0}")
+        || key.starts_with("zwrt_wms\u{0}zte_libwms_get_sms_data\u{0}")
+}
+
 fn cache_get<T: Clone>(cache: &Cache<T>, key: &str) -> Option<T> {
     let c = cache.lock().ok()?;
     let e = c.as_ref()?.get(key)?;
@@ -1821,6 +1835,32 @@ pub async fn ubus(service: &str, method: &str, args: Value) -> Result<Value, Str
 
 #[cfg(test)]
 mod tests {
+    /// V2-31：短信事件只清短信容量和列表的缓存，别的慢数据缓存不动。
+    #[test]
+    fn sms_event_invalidates_only_sms_cache() {
+        let keys = [
+            format!("zwrt_wms\u{0}zwrt_wms_get_wms_capacity\u{0}{}", json!({})),
+            format!(
+                "zwrt_wms\u{0}zte_libwms_get_sms_data\u{0}{}",
+                json!({"mem_store":1})
+            ),
+            format!("zwrt_bsp.usb\u{0}list\u{0}{}", json!({})),
+        ];
+        for k in &keys {
+            cache_put(
+                &UBUS_CACHE,
+                k.clone(),
+                Duration::from_secs(60),
+                Ok(json!({})),
+            );
+        }
+        invalidate_sms_cache();
+        assert!(cache_get(&UBUS_CACHE, &keys[0]).is_none());
+        assert!(cache_get(&UBUS_CACHE, &keys[1]).is_none());
+        // 缓存是全局的，别的测试会整体清空，所以非短信键只看判定。
+        assert!(is_sms_key(&keys[0]) && is_sms_key(&keys[1]) && !is_sms_key(&keys[2]));
+    }
+
     #[test]
     fn slow_state_cache_expires_and_is_cleared_by_control() {
         let key = "test\u{0}cache".to_string();

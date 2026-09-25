@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod blob;
 pub mod client;
+pub mod listen;
 
 #[cfg(test)]
 #[path = "../../tests/support/mock_ubusd.rs"]

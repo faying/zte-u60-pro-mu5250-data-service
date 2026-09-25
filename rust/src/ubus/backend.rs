@@ -16,6 +16,11 @@ pub const ENV_BACKEND: &str = "ZWRT_DATAD_UBUS";
 pub const ENV_SOCKET: &str = "ZWRT_DATAD_UBUS_SOCK";
 pub const ENV_TIMEOUT_MS: &str = "ZWRT_DATAD_UBUS_TIMEOUT_MS";
 pub const ENV_CLI_BIN: &str = "ZWRT_DATAD_UBUS_BIN";
+/// cli 后端（和短信事件监听，`listen.rs`）用的 ubus 程序。
+pub fn cli_bin() -> String {
+    std::env::var(ENV_CLI_BIN).unwrap_or_else(|_| "/bin/ubus".into())
+}
+
 /// `state::ubus` 给 `ubus call` 的超时。
 pub const CLI_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -77,10 +82,7 @@ impl CliBackend {
     }
 
     pub fn from_env() -> Self {
-        Self::new(
-            std::env::var(ENV_CLI_BIN).unwrap_or_else(|_| "/bin/ubus".into()),
-            CLI_TIMEOUT,
-        )
+        Self::new(cli_bin(), CLI_TIMEOUT)
     }
 }
 
