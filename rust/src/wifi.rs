@@ -382,7 +382,7 @@ fn match_live(configured: &mut [Interface], live: &[Live]) {
             .iter()
             .copied()
             .find(|index| live[*index].name == item.configured)
-            .or_else(|| (matches.len() == 1).then_some(matches[0]));
+            .or_else(|| matches.first().copied().filter(|_| matches.len() == 1));
     }
     let mut seen = HashSet::new();
     let duplicates: HashSet<_> = configured
@@ -515,6 +515,42 @@ mod tests {
         match_live(&mut configured, &live);
         assert_eq!(configured[0].live, None);
         assert_eq!(configured[1].live, None);
+    }
+
+    #[test]
+    fn match_live_none_one_or_many_without_panic() {
+        let ap = |name: &str| Live {
+            name: name.into(),
+            ssid: "same".into(),
+            kind: "AP".into(),
+            frequency: 2412,
+            ..Default::default()
+        };
+        // No matching AP: must not panic (old code indexed matches[0]).
+        let mut configured = vec![configured_fixture()];
+        match_live(&mut configured, &[]);
+        assert_eq!(configured[0].live, None);
+        let other = Live {
+            ssid: "other".into(),
+            ..ap("wlan0")
+        };
+        match_live(&mut configured, &[other]);
+        assert_eq!(configured[0].live, None);
+        // Exactly one match: taken.
+        let mut configured = vec![configured_fixture()];
+        match_live(&mut configured, &[ap("wlan0")]);
+        assert_eq!(configured[0].live, Some(0));
+        // Several matches, none by name: ambiguous, left unset.
+        let mut configured = vec![configured_fixture()];
+        match_live(&mut configured, &[ap("wlan0"), ap("wlan1")]);
+        assert_eq!(configured[0].live, None);
+        // Several matches, one by configured name: that one.
+        let mut configured = vec![Interface {
+            configured: "wlan1".into(),
+            ..configured_fixture()
+        }];
+        match_live(&mut configured, &[ap("wlan0"), ap("wlan1")]);
+        assert_eq!(configured[0].live, Some(1));
     }
 
     #[test]
