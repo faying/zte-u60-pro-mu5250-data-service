@@ -406,11 +406,19 @@ impl Hub {
         hb
     }
 
-    /// 切点 `seq` 和全部块（V2-4；T5 在同一把锁里先订阅再调它）。
-    #[allow(dead_code)] // T5 的 /v2/state、snapshot 用
+    /// 切点 `seq` 和全部块（V2-4）。
+    #[allow(dead_code)] // T5 的 /v2/state 用
     pub fn snapshot(&self) -> (u64, Vec<BlockView>) {
+        self.snapshot_with(|| ()).1
+    }
+
+    /// V2-5：在分配 `seq` 的同一把锁里先执行 `subscribe`（订阅 broadcast），再拍快照。
+    /// 锁里不能再调 `Hub` 的其他方法。
+    #[allow(dead_code)] // T5 的 /v2/events 用
+    pub fn snapshot_with<R>(&self, subscribe: impl FnOnce() -> R) -> (R, (u64, Vec<BlockView>)) {
         let g = self.lock();
-        (g.seq, g.blocks.iter().map(Block::view).collect())
+        let r = subscribe();
+        (r, (g.seq, g.blocks.iter().map(Block::view).collect()))
     }
 
     #[allow(dead_code)] // T5 用；测试用

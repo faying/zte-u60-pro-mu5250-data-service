@@ -716,6 +716,35 @@ async fn legacy_calls_are_preempted_by_control_and_not_budget_cut() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn round_skips_timed_out_object_for_rest_of_round() {
+    // R2：块 x 超时后，本轮旧采集里再调 x 直接跳过（算失败、不发请求）；控制任务不受影响；下一轮恢复。
+    let (exec, mock, _) = setup(vec![spec("x", 0)], Config::default(), 1000);
+    mock.push("x.list", Step::Timeout(Duration::from_secs(2)));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s = seen.clone();
+    let e = exec.clone();
+    let round = tokio::spawn(async move {
+        e.round_now(async move {
+            let r = call("x", "status", &json!({})).await;
+            lock(&s).push(r.map_err(|e| e.is_timeout()));
+            preempt().await; // 这里插进来的控制任务照常调 x
+            let r = call("x", "status", &json!({})).await;
+            lock(&s).push(r.map_err(|e| e.is_timeout()));
+        })
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    exec.control(async { call("x", "set", &json!({})).await.unwrap() })
+        .await
+        .unwrap();
+    round.await.unwrap();
+    assert_eq!(*lock(&seen), [Err(true), Err(true)]);
+    assert_eq!(mock.names(), ["x.list", "x.set"]);
+    exec.round_now(async {}).await;
+    assert_eq!(mock.names(), ["x.list", "x.set", "x.list"]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn set_interval_changes_sleep() {
     let (exec, mock, _) = setup(vec![spec("a", 0)], Config::default(), 5000);
     exec.start_rounds(Arc::new(NoLegacy));
