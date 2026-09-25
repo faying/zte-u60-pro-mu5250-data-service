@@ -220,10 +220,11 @@ stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 要短信本身用 `/control` 的 `sms.list_after {after_id, limit}`（`limit` 1～50，默认 50）：返回编号 > `after_id` 的前 `limit` 条（升序）和 `has_more`。
 固件的 `order_by` 只接受 `"order by id desc"`，所以 datad 两库各自降序翻页（每页 50 条），读到编号 ≤ `after_id`、短页或没有新编号就停，
 合并去重后升序取前 `limit` 条；每库最多翻 20 页，超过或任一库任一页读失败，整次失败（`502`），不返回半截。
+某库一个满页的编号集合和上一页完全相同（固件没理 `page`），也整次失败，不当成翻完（否则会漏更早的新短信、`has_more` 误报 false）。
 每次调用的 ubus 次数 = 每库 ⌈(该库编号 > `after_id` 的条数 + 1) / 50⌉。它是一个控制任务（V2-24、V2-26），只读：不清慢数据缓存、不标块。
 条目字段和 `zte_libwms_get_sms_data` 相同（`id`、`number`、`content`、`date`、`tag`），号码和正文是解开厂商信封后的 UCS-2 hex。
 订阅方在 `max_id`、`count` 变化或来源切换时按 `after_id` 翻页到 `has_more=false`。
-测试（T10）：`sms_block_summary_fields`、`sms_list_after_pages_desc_only`、`sms_list_after_merges_stores_dedup`、`sms_list_after_limit_has_more`、`sms_list_after_one_store_fails_whole`、`sms_list_after_returns_plain_fields`；测试（T10，manager）：`sms_burst_600_paged_forwarded_once`、`sms_interrupted_on_page_3_resumes`、`sms_datad_outage_120_backfilled`、`sms_list_after_busy_retried_over_http`
+测试（T10）：`sms_block_summary_fields`、`sms_list_after_pages_desc_only`、`sms_list_after_merges_stores_dedup`、`sms_list_after_limit_has_more`、`sms_list_after_one_store_fails_whole`、`sms_list_after_page_ignored_fails_whole`、`sms_list_after_returns_plain_fields`；测试（T10，manager）：`sms_burst_600_paged_forwarded_once`、`sms_interrupted_on_page_3_resumes`、`sms_datad_outage_120_backfilled`、`sms_list_after_busy_retried_over_http`
 
 **V2-31** 短信事件：datad 自己起一个长期运行的 `ubus listen zwrt_wms_status_event` 子进程，逐行读它的输出（一行 JSON，顶层键是事件名）。
 收到事件后等 300 ms（这期间再来的事件并成一次），然后把短信容量、短信列表的慢数据缓存清掉，`sms` 块标成「立即读」，

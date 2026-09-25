@@ -247,6 +247,7 @@ pub fn list_page_args(mem_store: u64, page: u64) -> Value {
 ///
 /// 两个库（NV = 1，SIM = 0，编号共用一个计数）各自从第 0 页往下翻，读到 id ≤ `after_id`、
 /// 短页（不满 `LIST_PAGE`）或者一页里没有新 id 就停；合并去重、升序，取前 `limit` 条。
+/// 满页的 id 集合和同库上一页完全相同，说明固件没理 `page`（翻不下去），整次失败，不当成翻完。
 /// 因为每个库都翻到了 `after_id`，`has_more`（还有更多 > `after_id` 的）是确定的。
 /// 任一库任一页读失败 → 整次失败，不返回半截（和 T6「两库都成功才可信」一致）。
 /// 每次调用的 ubus 次数：每个库 ⌈(该库 > after_id 的条数 + 1) / 50⌉，最多 `LIST_MAX_PAGES`。
@@ -262,6 +263,7 @@ where
     let mut found: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
     for store in [1_u64, 0] {
         let mut page = 0;
+        let mut prev: Option<std::collections::BTreeSet<u64>> = None;
         loop {
             if page >= LIST_MAX_PAGES {
                 return Err(format!(
@@ -273,6 +275,13 @@ where
                 .await
                 .map_err(|error| format!("mem_store {store}: {error}"))?;
             let items = page_items(&reply);
+            let ids: std::collections::BTreeSet<u64> = items.iter().filter_map(item_id).collect();
+            if items.len() as u64 >= LIST_PAGE && prev.as_ref() == Some(&ids) {
+                return Err(format!(
+                    "mem_store {store}: page {page} repeats page {} (firmware ignored page)",
+                    page - 1
+                ));
+            }
             let mut reached = false;
             let mut fresh = false;
             for item in &items {
@@ -289,6 +298,7 @@ where
             if reached || !fresh || (items.len() as u64) < LIST_PAGE {
                 break;
             }
+            prev = Some(ids);
             page += 1;
         }
     }
@@ -701,23 +711,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sms_list_after_page_ignored_fails_whole() {
+        // 固件不理 page：第 1 页和第 0 页一模一样（满页）。不能当成翻完（会漏更早的新短信、has_more 假），整次失败。
+        let calls = std::cell::Cell::new(0);
+        let r = list_after_with(0, 50, |store, _| {
+            calls.set(calls.get() + 1);
+            let base = if store == 1 { 100 } else { 0 };
+            let rows: Vec<Value> = (1..=50).rev().map(|i| json!({"id": base + i})).collect();
+            async move { Ok(json!({"messages":rows})) }
+        })
+        .await;
+        let e = r.unwrap_err();
+        assert!(e.contains("mem_store 1") && e.contains("ignored page"), "{e}");
+        assert_eq!(calls.get(), 2);
+        // 短页重复不算（第 0 页就是短页，直接停）。
+        let r = list_after_with(0, 50, |_, _| async {
+            Ok(json!({"messages":[{"id":3},{"id":2}]}))
+        })
+        .await
+        .unwrap();
+        assert_eq!(r.0.len(), 2);
+    }
+
+    #[tokio::test]
     async fn sms_list_after_one_store_fails_whole() {
         let nv: Vec<u64> = (1..=10).collect();
         for store in [1, 0] {
             let (r, _) = run(&nv, &[20], 0, 50, Some(store)).await;
             assert!(r.unwrap_err().contains(&format!("mem_store {store}")));
         }
-        // 固件不理 page、每页都回同样内容：没有新 id 就停，不会死循环。
-        let same = std::cell::Cell::new(0);
-        let r = list_after_with(0, 50, |_, _| {
-            same.set(same.get() + 1);
-            let rows: Vec<Value> = (1..=50).map(|i| json!({"id":i})).collect();
-            async move { Ok(json!({"messages":rows})) }
-        })
-        .await
-        .unwrap();
-        assert_eq!(r.0.len(), 50);
-        assert_eq!(same.get(), 3);
     }
 
     #[test]
