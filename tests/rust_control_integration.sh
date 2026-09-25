@@ -130,6 +130,16 @@ post '{"action":"network.set_mode","params":{"mode":"Only_5G"}}' |
 post '{"action":"band.set_nr_sa","params":{"bands":"78,79"}}' >/dev/null
 post '{"action":"sim.set_slot","params":{"slot":2}}' >/dev/null
 post '{"action":"wifi.set_dual_band","params":{"enabled":true}}' >/dev/null
+# /control 布尔参数也接受 0/1；其余非法输入仍回 400 和原来的错误文字。
+post '{"action":"wifi.set_dual_band","params":{"enabled":0}}' |
+    python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+for bad in 2 '"1"'; do
+    code=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: application/json' \
+        --data-binary "{\"action\":\"wifi.set_dual_band\",\"params\":{\"enabled\":$bad}}" \
+        "http://127.0.0.1:$PORT/control")
+    [ "$code" = 400 ]
+    python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["error"]["message"]=="enabled must be boolean"' "$TMP/bad.json"
+done
 post '{"action":"dns.set","params":{"primary":"1.1.1.1","manual_ipv4":1}}' >/dev/null
 post '{"action":"apn.add","params":{"name":"fixture","apn":"internet","auth_mode":0}}' >/dev/null
 post '{"action":"traffic.set_limit","params":{"enabled":1,"value":"1024","type":2}}' >/dev/null

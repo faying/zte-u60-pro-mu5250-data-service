@@ -93,11 +93,15 @@ fn integer(params: &Value, name: &str, required: bool) -> Result<Option<i64>, St
         None => Ok(None),
     }
 }
+/// JSON 布尔或数字 0/1（上游 b8828c1 的放宽）。其余输入（缺失、2、1.5、字符串……）
+/// 的错误文字保持旧版不变：`{name} must be boolean`。
 fn boolean(params: &Value, name: &str) -> Result<bool, String> {
-    object(params)
-        .get(name)
-        .and_then(Value::as_bool)
-        .ok_or_else(|| format!("{name} must be boolean"))
+    match object(params).get(name) {
+        Some(Value::Bool(v)) => Ok(*v),
+        Some(Value::Number(n)) if n.as_u64() == Some(0) => Ok(false),
+        Some(Value::Number(n)) if n.as_u64() == Some(1) => Ok(true),
+        _ => Err(format!("{name} must be boolean")),
+    }
 }
 fn mapped(params: &Value, specs: &[(&str, &str, bool, bool)]) -> Result<Value, String> {
     let mut args = Map::new();
@@ -550,12 +554,9 @@ async fn wifi_dual_band(params: &Value) -> Outcome {
 /// 字符串 "0"/"1"/"true"/"false"（C 版 `required_bool_param`）。其余输入的错误文字不变。
 fn direct_supply_enabled(params: &Value) -> Result<bool, String> {
     match object(params).get("enabled") {
-        Some(Value::Bool(v)) => Ok(*v),
-        Some(Value::Number(n)) if n.as_i64() == Some(0) => Ok(false),
-        Some(Value::Number(n)) if n.as_i64() == Some(1) => Ok(true),
         Some(Value::String(v)) if v == "1" || v == "true" => Ok(true),
         Some(Value::String(v)) if v == "0" || v == "false" => Ok(false),
-        _ => Err("enabled must be boolean".into()),
+        _ => boolean(params, "enabled"),
     }
 }
 /// 写入回复是否算失败（C 版逻辑）：没有数据（空或全空白，B20 成功时就这样）不算失败，
@@ -1933,6 +1934,38 @@ mod tests {
     fn rejects_non_hex_mac() {
         assert!(!valid_mac("00:11:22:33:44:zz"));
         assert!(valid_mac("00:11:22:33:44:aa"));
+    }
+    #[test]
+    fn boolean_accepts_json_bool_and_01_keeps_old_error() {
+        for (v, want) in [
+            (json!(true), true),
+            (json!(false), false),
+            (json!(1), true),
+            (json!(0), false),
+        ] {
+            assert_eq!(boolean(&json!({"enabled": v}), "enabled"), Ok(want));
+        }
+        for v in [
+            json!(2),
+            json!(-1),
+            json!(1.0),
+            json!(0.5),
+            json!("1"),
+            json!("true"),
+            json!(null),
+            json!([]),
+            json!({}),
+        ] {
+            assert_eq!(
+                boolean(&json!({"enabled": v}), "enabled"),
+                Err("enabled must be boolean".into()),
+                "{v}"
+            );
+        }
+        assert_eq!(
+            boolean(&json!({}), "enabled"),
+            Err("enabled must be boolean".into())
+        );
     }
     #[test]
     fn direct_supply_enabled_accepts_bool_01_and_c_strings() {

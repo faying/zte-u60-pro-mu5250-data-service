@@ -53,7 +53,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `wifi.status` | 无，返回 `main_2g/main_5g` 配置 |
 | `wireless.config` | 无参数时返回两频段国家码、信道、带宽、设备国家列表和当前监管域合法信道；写入时传 `band`，并可传 `country/channel` |
 | `wifi.dual_band_status` | 无，返回双频合一能力和开关状态 |
-| `wifi.set_dual_band` | `enabled`，布尔值 |
+| `wifi.set_dual_band` | `enabled`，布尔值或 `0/1` |
 | `wifi.set_module` | `enabled`，`0/1` |
 | `wifi.set_chip` | `chip`, `guest_enabled?` |
 | `wifi.configure` | `section` 与 `ssid/encryption/key/pmf/maxassoc/hidden/isolate/enabled` 可选字段 |
@@ -138,7 +138,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
 | action | params | 说明 |
 |---|---|---|
-| `aggregation.set` | `enabled` | 开启时切到 `SMULTIWAN` 并停止 mwan3；关闭时停止 ICG、切到 `MULTIWAN` 并重启 mwan3 |
+| `aggregation.set` | `enabled`（布尔值或 `0/1`） | 开启时切到 `SMULTIWAN` 并停止 mwan3；关闭时停止 ICG、切到 `MULTIWAN` 并重启 mwan3 |
 | `multiwan.interface.set` | `section` 与探测字段 | 修改已存在 interface 的启用、Ping 目标、次数、包大小、TTL、超时、间隔和上下线阈值 |
 | `multiwan.member.set` | `section,metric,weight` | 修改已存在 member 的优先级与权重 |
 | `multiwan.policy.set` | `section,last_resort,use_member` | 修改已存在 policy 的成员列表与无可用链路时动作 |
