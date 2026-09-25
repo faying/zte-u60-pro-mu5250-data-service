@@ -6,7 +6,7 @@
 - 每条规则有编号 **V2-N**，后面跟着验证它的测试名；「测试（Tn）」表示这个测试在哪个实施任务里写。
   `tests/state_v2_doc_check.sh` 会检查每条规则都有测试名、测试名不重复；
   加 `--impl` 时还会检查 data-service 这边的测试函数都已经写出来了（T3–T5 做完后用）。
-- 旧接口 `/state`、`/events`、`/control` 的输出冻结，不因为这里的任何规则而改变，见第 8 节。
+- 旧接口 `/state`、`/events`、`/control` 的输出冻结，不因为这里的任何规则而改变，见第 9 节。
 
 ## 1. 流的标识：epoch 和 seq
 
@@ -53,12 +53,11 @@
 
 ## 4. 事件格式
 
-SSE 事件名就是事件类型：`snapshot`、`block`、`heartbeat`。`data` 是单行 JSON。连接开头照 `/events` 的做法发 `retry: 1000`。
+SSE 事件名就是事件类型：`snapshot`、`block`、`heartbeat`。`data` 是单行 JSON。
+不发 `retry:`（旧 `/events` 实际也不发，重连间隔由订阅方自己定；T1 的 golden 为证）。
 不发 SSE 的 `id:` 字段，因为重连一律从 snapshot 开始，不支持按 `Last-Event-ID` 续传。
 
 ```text
-retry: 1000
-
 event: snapshot
 data: {"epoch":"5f2c9a1e","seq":41,"blocks":{"battery":{"revision":7,"observed_at":1782396733,"stale":false,"data":{...}},"charger":{...}}}
 
