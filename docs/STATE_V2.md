@@ -48,6 +48,8 @@
 它重连后先收到新的 snapshot。其他订阅者不受影响，`seq` 照样连续。
 测试（T5）：`v2_slow_subscriber_lagged_is_closed`、`v2_lagged_reconnect_gets_new_snapshot`、`v2_other_subscriber_contiguous_during_lag`
 
+`/v2/events` 和旧 `/events` 共用同一个 SSE 连接上限（现在 16 个），满了同样回 `503`（`sse_client_limit`）。
+
 **V2-9** 旧 `/events` 仍然用现有的 `watch` 通道，推完整快照，行为不变。
 测试（T1）：`legacy_events_golden_unchanged`
 
@@ -78,6 +80,18 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
   设备时钟会被 SNTP 调整，订阅方判断「多久没收到」要用自己的单调时钟，不能用 `observed_at` 相减。
 
 测试（T5）：`v2_event_shapes_match_doc`
+
+块的 `data` 和旧 `/state` 里对应的子对象**同一形状**，消费方从旧接口迁过来只换数据来源：
+
+| 块 | `data` | 来源 |
+|---|---|---|
+| `battery` | 旧 `/state` 的 `battery` 对象 | `zwrt_bsp.battery` 的回复 + 充电器块最近一次读成功的回复 + sysfs 电压电流 |
+| `charger` | 旧 `/state` 的 `power` 对象；旧 `/state` 没有 `power` 时是 `{}` | `zwrt_bsp.charger` 的回复 |
+| `signal` | 旧 `/state` 的 `net` 对象 | 旧采集算好的 `net`（不另调 ubus） |
+| `live` | `{ "system", "runtime", "traffic" }`，三个值分别是旧 `/state` 的同名对象 | 旧采集算好的结果（不另调 ubus） |
+
+stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
+`signal` 在 `nwinfo_get_netinfo` 失败时读失败；`live` 在 `system info` 或实时流量 `get_wwandst` 失败时读失败。
 
 ## 5. 块：revision、stale、max_age
 
@@ -110,6 +124,9 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
   这时如果数据和上次发布的**完全相同**，就不发，也不涨 revision。
 - 凡是发布了，并且数据和上次发布的不同，revision +1（V2-11）。
 - `stale` 翻转照 V2-12 立即发布，不受阈值限制。
+- 信号块的 `data` 是旧 `/state` 的 `net`。按 dB 比的是 `nr_rsrp`、`nr_rsrq`、`nr_snr`、`lte_rsrp`、`lte_rsrq`、`lte_snr`，
+  以及 `nrca`、`lteca`、`ltecasig` 里每个载波的 RSRP/RSRQ/SINR；`bars`、各个 RSSI 自己不触发发布，随下一次发布带出；
+  载波个数、载波的 PCI/频段/频点/带宽和 `net` 里其余字段（制式、频段、小区、运营商、漫游……）变了立即发布。
 
 测试（T5）：`signal_drift_0_3db_publishes_once_at_30s`、`signal_unchanged_not_published`、`signal_1db_change_publishes_immediately`、`signal_cell_change_publishes_immediately`
 
