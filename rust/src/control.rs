@@ -95,7 +95,7 @@ fn integer(params: &Value, name: &str, required: bool) -> Result<Option<i64>, St
 }
 /// JSON 布尔或数字 0/1（上游 b8828c1 的放宽）。其余输入（缺失、2、1.5、字符串……）
 /// 的错误文字保持旧版不变：`{name} must be boolean`。
-fn boolean(params: &Value, name: &str) -> Result<bool, String> {
+pub(crate) fn boolean(params: &Value, name: &str) -> Result<bool, String> {
     match object(params).get(name) {
         Some(Value::Bool(v)) => Ok(*v),
         Some(Value::Number(n)) if n.as_u64() == Some(0) => Ok(false),

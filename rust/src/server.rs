@@ -485,11 +485,7 @@ async fn control_task(app: App, action: &str, body: Value) -> Response {
         return (StatusCode::OK,Json(json!({"ok":true,"action":action,"result":app.inner.neighbor.lock().await.status()}))).into_response();
     }
     if action == "neighbor.set" {
-        let enabled = body
-            .get("params")
-            .and_then(|v| v.get("enabled"))
-            .and_then(Value::as_bool);
-        let Some(enabled) = enabled else {
+        let Some(enabled) = neighbor_enabled(&body) else {
             return (StatusCode::BAD_REQUEST,Json(json!({"ok":false,"action":action,"error":{"code":"invalid_parameter","message":"enabled must be boolean"}}))).into_response();
         };
         return match app.inner.neighbor.lock().await.set_enabled(enabled).await {Ok(value)=>(StatusCode::OK,Json(json!({"ok":true,"action":action,"result":value}))).into_response(),Err(error)=>(StatusCode::BAD_GATEWAY,Json(json!({"ok":false,"action":action,"error":{"code":"device_call_failed","message":error}}))).into_response()};
@@ -761,6 +757,16 @@ async fn control_task(app: App, action: &str, body: Value) -> Response {
         .into_response()
 }
 
+/// `neighbor.set` 的 `enabled`：布尔或 0/1（CONTROL_API.md），和其他动作同一个 `boolean()`。
+fn neighbor_enabled(body: &Value) -> Option<bool> {
+    let empty = json!({});
+    let params = body
+        .get("params")
+        .filter(|p| p.is_object())
+        .unwrap_or(&empty);
+    crate::control::boolean(params, "enabled").ok()
+}
+
 fn control_ok(action: &str, value: Value) -> Response {
     (
         StatusCode::OK,
@@ -820,6 +826,26 @@ mod tests {
         let controls = capability_controls();
         assert_eq!(controls.len(), 79);
         assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 79);
+    }
+
+    #[test]
+    fn neighbor_set_enabled_accepts_bool_and_01() {
+        for (v, want) in [
+            (json!(true), Some(true)),
+            (json!(false), Some(false)),
+            (json!(1), Some(true)),
+            (json!(0), Some(false)),
+            (json!(2), None),
+            (json!("1"), None),
+            (json!(null), None),
+        ] {
+            assert_eq!(
+                neighbor_enabled(&json!({"params":{"enabled":v}})),
+                want,
+                "{v}"
+            );
+        }
+        assert_eq!(neighbor_enabled(&json!({})), None);
     }
 
     #[test]
