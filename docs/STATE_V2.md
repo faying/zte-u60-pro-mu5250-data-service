@@ -89,6 +89,7 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
 | `charger` | 旧 `/state` 的 `power` 对象；旧 `/state` 没有 `power` 时是 `{}` | `zwrt_bsp.charger` 的回复 |
 | `signal` | 旧 `/state` 的 `net` 对象 | 旧采集算好的 `net`（不另调 ubus） |
 | `live` | `{ "system", "runtime", "traffic" }`，三个值分别是旧 `/state` 的同名对象 | 旧采集算好的结果（不另调 ubus） |
+| `sms` | `{ "unread", "max_id", "count" }`：`unread` 同旧 `/state` 的 `sms.unread`；`max_id`、`count` 是 `/v2` 新加的（V2-30）；不带 `list` | 旧采集读好的容量和两库第一页（不另调 ubus） |
 
 stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 `signal` 在 `nwinfo_get_netinfo` 失败时读失败；`live` 在 `system info` 或实时流量 `get_wwandst` 失败时读失败。
@@ -202,3 +203,21 @@ stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 **V2-29** 旧的 `/state`、`/events` 和 `/v2` 从同一份状态生成。遇到 stale 的块，按今天读失败时的样子输出（字段缺失或为 `-1`），
 不输出保留的旧值。只有 `/v2` 才看得到 `stale` 和保留的旧值。
 测试（T4）：`legacy_state_stale_block_renders_as_failure`
+
+## 10. 短信
+
+**V2-30** `sms` 块是短信摘要，用来告诉订阅方「有没有新短信」，不带短信内容：
+
+- `unread` = `sms_dev_unread_num` + `sms_sim_unread_num`（和旧 `/state` 的 `sms.unread` 相同）。
+- `max_id` = NV（`mem_store=1`）和 SIM（`mem_store=0`）两库降序第一页里最大的编号（含已发送、草稿；两库共用一个编号计数）。
+- `count` = 两库 `sms_{nv,sim}_{rev,send,draftbox}_total` 之和（B27 的字段；`sms_nvused_total` 实测不可信，不用）。
+- 容量和两库第一页三次读取都成功才算读成功，任一失败按 V2-12 置 stale。节拍沿用旧采集读短信的节拍（容量 30 秒、列表 10 秒），不另调 ubus。
+- 发布按 V2-17（有变化就发）。
+
+要短信本身用 `/control` 的 `sms.list_after {after_id, limit}`（`limit` 1～50，默认 50）：返回编号 > `after_id` 的前 `limit` 条（升序）和 `has_more`。
+固件的 `order_by` 只接受 `"order by id desc"`，所以 datad 两库各自降序翻页（每页 50 条），读到编号 ≤ `after_id`、短页或没有新编号就停，
+合并去重后升序取前 `limit` 条；每库最多翻 20 页，超过或任一库任一页读失败，整次失败（`502`），不返回半截。
+每次调用的 ubus 次数 = 每库 ⌈(该库编号 > `after_id` 的条数 + 1) / 50⌉。它是一个控制任务（V2-24、V2-26），只读：不清慢数据缓存、不标块。
+条目字段和 `zte_libwms_get_sms_data` 相同（`id`、`number`、`content`、`date`、`tag`），号码和正文是解开厂商信封后的 UCS-2 hex。
+订阅方在 `max_id`、`count` 变化或来源切换时按 `after_id` 翻页到 `has_more=false`。
+测试（T10）：`sms_block_summary_fields`、`sms_list_after_pages_desc_only`、`sms_list_after_merges_stores_dedup`、`sms_list_after_limit_has_more`、`sms_list_after_one_store_fails_whole`、`sms_list_after_returns_plain_fields`；测试（T10，manager）：`sms_burst_600_paged_forwarded_once`、`sms_interrupted_on_page_3_resumes`、`sms_datad_outage_120_backfilled`、`sms_list_after_busy_retried_over_http`

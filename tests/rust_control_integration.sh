@@ -37,6 +37,7 @@ export MOCK_IWINFO_DELAY_FILE="$TMP/iwinfo-delay.count"
 export MOCK_IWINFO_DELAY_CALLS=3
 export MOCK_UCI_STATE_DIR="$TMP/uci-state"
 export MOCK_SIM_SLOT_FILE="$TMP/sim-slot"
+export MOCK_SMS_COUNT_FILE="$TMP/sms-count"
 export ZWRT_DATAD_WIFI_CONFIG="$TMP/datad_wifi"
 export ZWRT_DATAD_COOLING_CONFIG="$TMP/cooling.conf"
 export ZWRT_DATAD_FAN_PWM_PATH="$TMP/pwm1"
@@ -224,7 +225,7 @@ status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: applica
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["error"]["code"]=="invalid_parameter"' "$TMP/bad.json"
 
 curl -fsS "http://127.0.0.1:$PORT/capabilities" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==79; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert "discovery" not in d; assert "passthrough" not in d; assert d["transport"]==["http","sse"]'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==80; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert "discovery" not in d; assert "passthrough" not in d; assert d["transport"]==["http","sse"]'
 # R10：ubus 透传已删除，三个路由都必须 404
 route_status() {
     curl -sS -o /dev/null -w '%{http_code}' "$@"
@@ -304,4 +305,39 @@ grep -F 'fan_mode=1' "$ZWRT_DATAD_COOLING_CONFIG" >/dev/null
 grep -F 'custom_pwm_5=255' "$ZWRT_DATAD_COOLING_CONFIG" >/dev/null
 grep -F 'liquid_always_on=0' "$ZWRT_DATAD_COOLING_CONFIG" >/dev/null
 
+# T10 / R16：sms.list_after。600 条突发（两库共用编号），按 after_id 每页 50 翻完，升序、不重不漏；
+# 固件只接受降序：调用记录里不能有升序；参数错回 400；只读动作不让短信块以外的东西重读。
+printf '600\n' >"$MOCK_SMS_COUNT_FILE"
+: >"$TMP/sms-pages.jsonl"
+after=0
+for _ in $(seq 1 20); do
+    post "{\"action\":\"sms.list_after\",\"params\":{\"after_id\":$after,\"limit\":50}}" >"$TMP/sms-page.json"
+    cat "$TMP/sms-page.json" >>"$TMP/sms-pages.jsonl"; echo >>"$TMP/sms-pages.jsonl"
+    after=$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1]))["result"]; ids=[i["id"] for i in r["items"]]; print(ids[-1] if ids else sys.argv[2]); sys.exit(0)' "$TMP/sms-page.json" "$after")
+    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["result"]["has_more"] else 1)' "$TMP/sms-page.json" || break
+done
+python3 - "$TMP/sms-pages.jsonl" <<'PY'
+import json, sys
+pages = [json.loads(l)["result"] for l in open(sys.argv[1]) if l.strip()]
+ids = [i["id"] for p in pages for i in p["items"]]
+assert ids == list(range(1, 601)), (len(ids), ids[:5])
+assert len(pages) == 12 and not pages[-1]["has_more"] and all(p["has_more"] for p in pages[:-1])
+first = pages[0]["items"][0]
+assert first["number"] == "00310030003000380036" and first["content"] == "0041" and first["tag"] == "1", first
+PY
+! grep -F 'order by id asc' "$MOCK_CALL_LOG" >/dev/null
+status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: application/json' \
+    --data-binary '{"action":"sms.list_after","params":{"after_id":0,"limit":51}}' \
+    "http://127.0.0.1:$PORT/control")
+[ "$status" = 400 ]
+# /v2 短信块：max_id / count / unread（count 来自容量回复，这个 mock 没有分库总数 → 0）。
+for _ in $(seq 1 40); do
+    curl -fsS "http://127.0.0.1:$PORT/v2/state" >"$TMP/v2.json"
+    python3 -c 'import json,sys; b=json.load(open(sys.argv[1]))["blocks"]["sms"]; sys.exit(0 if not b["stale"] and b["data"]["max_id"]==600 else 1)' "$TMP/v2.json" && break
+    sleep 0.5
+done
+python3 -c 'import json,sys; b=json.load(open(sys.argv[1]))["blocks"]["sms"]; assert b["data"]=={"unread":1,"max_id":600,"count":0}, b' "$TMP/v2.json"
+: >"$MOCK_SMS_COUNT_FILE"
+
 echo 'rust control HTTP fixture: PASS'
+

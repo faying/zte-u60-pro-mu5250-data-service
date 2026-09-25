@@ -473,7 +473,7 @@ async fn control(
     let task = async move {
         let response = control_task(app, &task_action, body).await;
         // V2-27：成功后相关块下一轮立即读（没有映射就全部块），不另起一轮采集。
-        if response.status().is_success() {
+        if response.status().is_success() && !read_only(&task_action) {
             crate::state::invalidate_cache();
             marker.mark_immediate(blocks_for_action(&task_action));
         }
@@ -485,10 +485,16 @@ async fn control(
     }
 }
 
+/// 只读、不改设备的动作：不清慢数据缓存、不标块（`sms.list_after` 翻页时每页一次，清缓存会让下一轮全部重读）。
+fn read_only(action: &str) -> bool {
+    action == "sms.list_after"
+}
+
 /// `/control` 动作 → 它会改变的块。没列出的动作算「没有映射」，成功后全部块立即读（R12）。
 fn blocks_for_action(action: &str) -> Option<&'static [&'static str]> {
     match action {
         "power.direct_supply.set" | "power.direct_supply.status" => Some(&["charger"]),
+        "sms.list_after" => Some(&[]),
         _ => None,
     }
 }
@@ -507,7 +513,9 @@ async fn control_task(app: App, action: &str, body: Value) -> Response {
     // stale (state.rs `invalidate_cache`); it is cleared again after a
     // successful action (the task runs on the executor, so no round can refill
     // the cache with pre-action values in between).
-    crate::state::invalidate_cache();
+    if !read_only(action) {
+        crate::state::invalidate_cache();
+    }
     if action == "neighbor.status" {
         return (StatusCode::OK,Json(json!({"ok":true,"action":action,"result":app.inner.neighbor.lock().await.status()}))).into_response();
     }
@@ -851,8 +859,8 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 79);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 79);
+        assert_eq!(controls.len(), 80);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 80);
     }
 
     #[test]

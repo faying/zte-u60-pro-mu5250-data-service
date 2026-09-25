@@ -1185,6 +1185,11 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     let nfc_ok = nfc.is_ok();
     let nfc = object(nfc);
     let sms_ok = sms_capacity.is_ok();
+    // V2-30：短信块。容量和两库第一页都读成功才算读成功（任一失败 → stale）。
+    let sms_block = match (&sms_capacity, &sms_nv, &sms_sim) {
+        (Ok(capacity), Ok(nv), Ok(sim)) => Ok(crate::sms::block_data(capacity, nv, sim)),
+        _ => Err("zwrt_wms capacity or SMS list read failed".to_string()),
+    };
     let sms_capacity = object(sms_capacity);
     let sms_nv = object(sms_nv);
     let sms_sim = object(sms_sim);
@@ -1795,6 +1800,7 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         },
         now,
     );
+    hub.record("sms", sms_block, now);
     Snapshot {
         ts: SystemTime::now()
             .duration_since(UNIX_EPOCH)

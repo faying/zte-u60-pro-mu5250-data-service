@@ -54,6 +54,7 @@ pub const ACTIONS: &[&str] = &[
     "sms.delete",
     "sms.mark_read",
     "sms.send_raw",
+    "sms.list_after",
     "client.kick",
     "client.rename",
     "client.block",
@@ -403,6 +404,11 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             .await
         }
         "sms.send_raw" => match crate::sms::send(params).await {
+            Ok(value) => Outcome::Ok(value),
+            Err((true, error)) => Outcome::Invalid(error),
+            Err((false, error)) => Outcome::Failed(error),
+        },
+        "sms.list_after" => match crate::sms::list_after(params).await {
             Ok(value) => Outcome::Ok(value),
             Err((true, error)) => Outcome::Invalid(error),
             Err((false, error)) => Outcome::Failed(error),

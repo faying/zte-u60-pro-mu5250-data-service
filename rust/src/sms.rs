@@ -97,6 +97,12 @@ fn encrypt(key: &[u8; 32], plaintext: &str) -> Result<String, String> {
 }
 
 async fn decrypt(value: &str) -> Result<Option<String>, String> {
+    let key = *SESSION_KEY.lock().await;
+    open_envelope(key.as_ref(), value)
+}
+
+/// 解厂商 AES-GCM 信封。不是信封（明文 hex、太短、不是 base64）→ `Ok(None)`。
+fn open_envelope(key: Option<&[u8; 32]>, value: &str) -> Result<Option<String>, String> {
     if value.len() < 40
         || value.len().is_multiple_of(2) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
@@ -108,8 +114,8 @@ async fn decrypt(value: &str) -> Result<Option<String>, String> {
     if raw.len() <= 28 {
         return Ok(None);
     }
-    let key = (*SESSION_KEY.lock().await).ok_or("vendor SMS crypto session unavailable")?;
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "invalid AES key")?;
+    let key = key.ok_or("vendor SMS crypto session unavailable")?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| "invalid AES key")?;
     let mut input = raw[28..].to_vec();
     input.extend_from_slice(&raw[12..28]);
     cipher
@@ -206,6 +212,177 @@ pub async fn normalize_lists(replies: &[Value]) -> Vec<Value> {
         }));
     }
     output
+}
+
+/// `sms.list_after` 每页条数（`data_per_page`）。等于 `limit` 上限，也是 zte-agent 在真机上一直用的页大小。
+pub const LIST_PAGE: u64 = 50;
+/// `sms.list_after` 的 `limit` 上限。
+pub const LIST_LIMIT_MAX: u64 = 50;
+/// 每个库最多翻多少页（50 × 20 = 1000 条）。翻到上限还没到 `after_id`，就证明不了哪些是最小的，整次失败。
+pub const LIST_MAX_PAGES: u64 = 20;
+
+fn item_id(item: &Value) -> Option<u64> {
+    item.get("id").and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str()?.trim().parse::<u64>().ok())
+    })
+}
+
+fn page_items(reply: &Value) -> Vec<Value> {
+    reply
+        .get("messages")
+        .or_else(|| reply.get("list"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// `zte_libwms_get_sms_data` 一页的参数。固件的 `order_by` 只接受 `"order by id desc"`（Gate 0 实测）。
+pub fn list_page_args(mem_store: u64, page: u64) -> Value {
+    json!({"page":page,"data_per_page":LIST_PAGE,"mem_store":mem_store,"tags":10,"order_by":"order by id desc"})
+}
+
+/// `sms.list_after` 的核心（纯逻辑，取页由调用方给）：`fetch(mem_store, page)` 读一页降序列表。
+///
+/// 两个库（NV = 1，SIM = 0，编号共用一个计数）各自从第 0 页往下翻，读到 id ≤ `after_id`、
+/// 短页（不满 `LIST_PAGE`）或者一页里没有新 id 就停；合并去重、升序，取前 `limit` 条。
+/// 因为每个库都翻到了 `after_id`，`has_more`（还有更多 > `after_id` 的）是确定的。
+/// 任一库任一页读失败 → 整次失败，不返回半截（和 T6「两库都成功才可信」一致）。
+/// 每次调用的 ubus 次数：每个库 ⌈(该库 > after_id 的条数 + 1) / 50⌉，最多 `LIST_MAX_PAGES`。
+pub async fn list_after_with<F, Fut>(
+    after_id: u64,
+    limit: u64,
+    mut fetch: F,
+) -> Result<(Vec<Value>, bool), String>
+where
+    F: FnMut(u64, u64) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    let mut found: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
+    for store in [1_u64, 0] {
+        let mut page = 0;
+        loop {
+            if page >= LIST_MAX_PAGES {
+                return Err(format!(
+                    "mem_store {store}: more than {} SMS above id {after_id}",
+                    LIST_MAX_PAGES * LIST_PAGE
+                ));
+            }
+            let reply = fetch(store, page)
+                .await
+                .map_err(|error| format!("mem_store {store}: {error}"))?;
+            let items = page_items(&reply);
+            let mut reached = false;
+            let mut fresh = false;
+            for item in &items {
+                let Some(id) = item_id(item) else { continue };
+                if id <= after_id {
+                    reached = true;
+                    continue;
+                }
+                if let std::collections::btree_map::Entry::Vacant(slot) = found.entry(id) {
+                    fresh = true;
+                    slot.insert(item.clone());
+                }
+            }
+            if reached || !fresh || (items.len() as u64) < LIST_PAGE {
+                break;
+            }
+            page += 1;
+        }
+    }
+    let has_more = found.len() as u64 > limit;
+    Ok((found.into_values().take(limit as usize).collect(), has_more))
+}
+
+/// 返回给调用方的一条：字段名和 `zte_libwms_get_sms_data` 原样（`id`、`number`、`content`、`date`、`tag`），
+/// 号码和正文如果是厂商 AES-GCM 信封就解开成明文（仍是 UCS-2 hex）；解不开保留原值，不丢这条。
+fn plain_item(key: Option<&[u8; 32]>, item: Value) -> Value {
+    let text = |name: &str| item.get(name).and_then(Value::as_str).map(str::to_owned);
+    let mut out = serde_json::Map::new();
+    out.insert("id".into(), json!(item_id(&item).unwrap_or_default()));
+    for (name, alt) in [("number", "num"), ("content", "text")] {
+        let raw = text(name).or_else(|| text(alt)).unwrap_or_default();
+        let plain = match open_envelope(key, &raw) {
+            Ok(Some(plain)) => plain,
+            _ => raw,
+        };
+        out.insert(name.into(), json!(plain));
+    }
+    for name in ["date", "tag", "mem_store"] {
+        if let Some(value) = item.get(name) {
+            out.insert(name.into(), value.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+/// `/control` 的 `sms.list_after {after_id, limit}`（R16）：在控制任务里（执行者上）连着调完。
+pub async fn list_after(params: &Value) -> Result<Value, (bool, String)> {
+    let object = params.as_object().expect("server validates params");
+    let number = |name: &str, default: u64| match object.get(name) {
+        None => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| (true, format!("{name} must be a non-negative integer"))),
+    };
+    let after_id = number("after_id", 0)?;
+    let limit = number("limit", LIST_LIMIT_MAX)?;
+    if limit == 0 || limit > LIST_LIMIT_MAX {
+        return Err((true, format!("limit must be 1..={LIST_LIMIT_MAX}")));
+    }
+    let (items, has_more) = list_after_with(after_id, limit, |store, page| {
+        state::ubus(
+            "zwrt_wms",
+            "zte_libwms_get_sms_data",
+            list_page_args(store, page),
+        )
+    })
+    .await
+    .map_err(|error| (false, error))?;
+    let key = *SESSION_KEY.lock().await;
+    let plain: Vec<Value> = items
+        .into_iter()
+        .map(|item| plain_item(key.as_ref(), item))
+        .collect();
+    Ok(json!({"items":plain,"has_more":has_more}))
+}
+
+/// `/v2` 短信块的 data（V2-30）：未读数、最大编号、条数。三次读取（容量、NV 第一页、SIM 第一页）
+/// 都成功才算读成功。`max_id` 取两库降序第一页的原始回复（含已发送、草稿），
+/// `count` = 两库 `sms_{nv,sim}_{rev,send,draftbox}_total` 之和（B27 字段；`sms_nvused_total` 不可信）。
+pub fn block_data(capacity: &Value, nv: &Value, sim: &Value) -> Value {
+    let num = |name: &str| {
+        capacity
+            .get(name)
+            .and_then(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+            })
+            .unwrap_or(0)
+    };
+    let max_id = [nv, sim]
+        .iter()
+        .flat_map(|reply| page_items(reply))
+        .filter_map(|item| item_id(&item))
+        .max()
+        .unwrap_or(0);
+    let count: i64 = ["nv", "sim"]
+        .iter()
+        .flat_map(|store| {
+            ["rev", "send", "draftbox"]
+                .iter()
+                .map(move |kind| format!("sms_{store}_{kind}_total"))
+        })
+        .map(|name| num(&name))
+        .sum();
+    json!({
+        "unread": num("sms_dev_unread_num") + num("sms_sim_unread_num"),
+        "max_id": max_id,
+        "count": count
+    })
 }
 
 async fn send_external(
@@ -410,5 +587,163 @@ mod tests {
         *SESSION_KEY.lock().await = None;
         assert_eq!(list[0]["num"], "10086");
         assert_eq!(list[0]["text"], "测试");
+    }
+
+    /// 假的 `zte_libwms_get_sms_data`：照固件的规矩，只接受 `order by id desc`，按 page/data_per_page 切页。
+    fn fake_wms(nv: &[u64], sim: &[u64], args: &Value) -> Result<Value, String> {
+        if args["order_by"] != "order by id desc" {
+            return Err("Invalid argument".into());
+        }
+        let mut ids: Vec<u64> = if args["mem_store"] == 1 { nv } else { sim }.to_vec();
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        let per = args["data_per_page"].as_u64().unwrap() as usize;
+        let page = args["page"].as_u64().unwrap() as usize;
+        let rows: Vec<Value> = ids
+            .iter()
+            .skip(page * per)
+            .take(per)
+            .map(|id| json!({"id":id.to_string(),"number":"10086","content":"0041","tag":"1","date":"26,08,27,04,00,00,+32"}))
+            .collect();
+        Ok(json!({"messages":rows}))
+    }
+
+    async fn run(
+        nv: &[u64],
+        sim: &[u64],
+        after: u64,
+        limit: u64,
+        fail_store: Option<u64>,
+    ) -> (Result<(Vec<u64>, bool), String>, Vec<Value>) {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let r = list_after_with(after, limit, |store, page| {
+            let args = list_page_args(store, page);
+            calls.borrow_mut().push(args.clone());
+            let reply = if fail_store == Some(store) {
+                Err("timeout".into())
+            } else {
+                fake_wms(nv, sim, &args)
+            };
+            async move { reply }
+        })
+        .await
+        .map(|(items, more)| (items.iter().filter_map(item_id).collect(), more));
+        (r, calls.into_inner())
+    }
+
+    #[tokio::test]
+    async fn sms_list_after_pages_desc_only() {
+        // 升序被固件拒绝：只能降序翻页，每个库一直翻到 ≤ after_id。
+        assert!(
+            fake_wms(
+                &[1],
+                &[],
+                &json!({"order_by":"order by id asc","mem_store":1,"page":0,"data_per_page":50})
+            )
+            .is_err()
+        );
+        let nv: Vec<u64> = (1..=130).collect();
+        let (r, calls) = run(&nv, &[], 10, 50, None).await;
+        let (ids, more) = r.unwrap();
+        assert_eq!(ids, (11..=60).collect::<Vec<_>>());
+        assert!(more);
+        assert!(calls.iter().all(|a| a["order_by"] == "order by id desc"
+            && a["data_per_page"] == 50
+            && a["tags"] == 10));
+        // NV：第 0 页 130..81，第 1 页 80..31，第 2 页 30..1（碰到 10，停）；SIM：空页一次。
+        let nv_pages: Vec<u64> = calls
+            .iter()
+            .filter(|a| a["mem_store"] == 1)
+            .map(|a| a["page"].as_u64().unwrap())
+            .collect();
+        assert_eq!(nv_pages, vec![0, 1, 2]);
+        assert_eq!(calls.len(), 4);
+        // 什么都没有新的：每个库一页。
+        let (r, calls) = run(&nv, &[], 130, 50, None).await;
+        assert_eq!(r.unwrap(), (vec![], false));
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sms_list_after_merges_stores_dedup() {
+        // 编号在两库之间共用：奇数在 NV，偶数在 SIM；7 两边都有（重复只出一次）。
+        let nv: Vec<u64> = (1..=40).filter(|i| i % 2 == 1).collect();
+        let sim: Vec<u64> = (1..=40).filter(|i| i % 2 == 0).chain([7]).collect();
+        let (r, _) = run(&nv, &sim, 4, 50, None).await;
+        let (ids, more) = r.unwrap();
+        assert_eq!(ids, (5..=40).collect::<Vec<_>>());
+        assert!(!more);
+    }
+
+    #[tokio::test]
+    async fn sms_list_after_limit_has_more() {
+        let nv: Vec<u64> = (1..=600).filter(|i| i % 5 != 0).collect();
+        let sim: Vec<u64> = (1..=600).filter(|i| i % 5 == 0).collect();
+        let (r, _) = run(&nv, &sim, 0, 3, None).await;
+        assert_eq!(r.unwrap(), (vec![1, 2, 3], true));
+        let (r, _) = run(&nv, &sim, 597, 3, None).await;
+        assert_eq!(r.unwrap(), (vec![598, 599, 600], false));
+        let (r, _) = run(&nv, &sim, 596, 3, None).await;
+        assert_eq!(r.unwrap(), (vec![597, 598, 599], true));
+        // 600 条突发：按 after_id 翻页全部拿到，不重不漏。
+        let (mut after, mut got, mut rounds) = (0, Vec::new(), 0);
+        loop {
+            let (r, _) = run(&nv, &sim, after, 50, None).await;
+            let (ids, more) = r.unwrap();
+            after = *ids.last().unwrap_or(&after);
+            got.extend(ids);
+            rounds += 1;
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(got, (1..=600).collect::<Vec<_>>());
+        assert_eq!(rounds, 12);
+    }
+
+    #[tokio::test]
+    async fn sms_list_after_one_store_fails_whole() {
+        let nv: Vec<u64> = (1..=10).collect();
+        for store in [1, 0] {
+            let (r, _) = run(&nv, &[20], 0, 50, Some(store)).await;
+            assert!(r.unwrap_err().contains(&format!("mem_store {store}")));
+        }
+        // 固件不理 page、每页都回同样内容：没有新 id 就停，不会死循环。
+        let same = std::cell::Cell::new(0);
+        let r = list_after_with(0, 50, |_, _| {
+            same.set(same.get() + 1);
+            let rows: Vec<Value> = (1..=50).map(|i| json!({"id":i})).collect();
+            async move { Ok(json!({"messages":rows})) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(r.0.len(), 50);
+        assert_eq!(same.get(), 3);
+    }
+
+    #[test]
+    fn sms_list_after_returns_plain_fields() {
+        let key = [5_u8; 32];
+        let number = encrypt(&key, "00310030003000380036").unwrap();
+        let item = json!({"id":"9","number":number,"content":"0041","tag":"0","date":"d","x":1});
+        let want =
+            json!({"id":9,"number":"00310030003000380036","content":"0041","tag":"0","date":"d"});
+        assert_eq!(plain_item(Some(&key), item.clone()), want);
+        // 没有会话密钥：解不开就保留原值，不丢这条。
+        assert_eq!(plain_item(None, item)["number"], json!(number));
+    }
+
+    #[test]
+    fn sms_block_summary_fields() {
+        let capacity = json!({"sms_dev_unread_num":"2","sms_sim_unread_num":1,"sms_nv_rev_total":"6","sms_nv_send_total":2,"sms_nv_draftbox_total":0,"sms_sim_rev_total":1,"sms_nvused_total":0});
+        let nv = json!({"messages":[{"id":"31","tag":"2"},{"id":30}]});
+        let sim = json!({"messages":[{"id":12}]});
+        assert_eq!(
+            block_data(&capacity, &nv, &sim),
+            json!({"unread":3,"max_id":31,"count":9})
+        );
+        assert_eq!(
+            block_data(&json!({}), &json!({}), &json!({"messages":[]})),
+            json!({"unread":0,"max_id":0,"count":0})
+        );
     }
 }

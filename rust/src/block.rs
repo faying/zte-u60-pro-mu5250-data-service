@@ -81,7 +81,7 @@ impl BlockSpec {
     }
 }
 
-/// 阶段 1 的块：电池、充电器（ubus，间隔沿用 `ubus_ttl` 的 5 秒），信号、live（派生，每轮）。
+/// 阶段 1 的块：电池、充电器（ubus，间隔沿用 `ubus_ttl` 的 5 秒），信号、live、短信（派生，每轮）。
 /// `/v2` 的 data 和旧 `/state` 同形：battery = `battery` 对象，charger = `power` 对象
 /// （旧 `/state` 没有 `power` 时是 `{}`），signal = `net` 对象，live = `{system, runtime, traffic}`。
 pub fn phase1_blocks() -> Vec<BlockSpec> {
@@ -102,6 +102,8 @@ pub fn phase1_blocks() -> Vec<BlockSpec> {
         .with_shape(crate::state::charger_v2, &[]),
         BlockSpec::derived("signal", Box::new(SignalPolicy)),
         BlockSpec::derived("live", Box::new(LivePolicy)),
+        // V2-30：短信摘要，由旧采集按原来的短信节拍（容量 30 秒、列表 10 秒）交进来。
+        BlockSpec::derived("sms", Box::new(OnChange)),
     ]
 }
 

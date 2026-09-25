@@ -109,6 +109,23 @@ case "$service:$method" in
         printf '%s\n' '{"sms_dev_unread_num":1,"sms_sim_unread_num":0}'
         ;;
     zwrt_wms:zte_libwms_get_sms_data)
+        # 固件只接受降序（Gate 0 实测），升序回 Invalid argument。
+        case "$args" in *'order by id asc'*) echo 'Command failed: Invalid argument' >&2; exit 2 ;; esac
+        n=${MOCK_SMS_COUNT:-}
+        [ -n "${MOCK_SMS_COUNT_FILE:-}" ] && [ -s "$MOCK_SMS_COUNT_FILE" ] && n=$(cat "$MOCK_SMS_COUNT_FILE")
+        if [ -n "$n" ]; then
+            # 大量短信（T10）：编号 1..N 两库共用计数，5 的倍数在 SIM（mem_store 0），其余在 NV；
+            # 按 page / data_per_page 降序切页。N 取 MOCK_SMS_COUNT_FILE 的内容（非空时，测试中途可改）或 MOCK_SMS_COUNT。
+            python3 -c '
+import json, sys
+a = json.loads(sys.argv[1]); n = int(sys.argv[2])
+sim = a.get("mem_store") == 0
+ids = [i for i in range(n, 0, -1) if (i % 5 == 0) == sim]
+per = int(a.get("data_per_page", 8)); page = int(a.get("page", 0))
+rows = [{"id": str(i), "number": "00310030003000380036", "date": "26,08,27,04,00,00,+32", "tag": "1", "content": "0041"} for i in ids[page * per:(page + 1) * per]]
+print(json.dumps({"messages": rows}))' "$args" "$n"
+            exit 0
+        fi
         printf '%s\n' '{"messages":[{"id":7,"number":"10086","date":"26,08,27,04,00,00,+,0","tag":"1","content":"6D4B8BD5"}]}'
         ;;
     zwrt_web:web_login)
