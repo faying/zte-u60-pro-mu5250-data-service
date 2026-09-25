@@ -1,11 +1,11 @@
 //! ubus 读取后端（docs/STATE_V2.md V2-18）：`ZWRT_DATAD_UBUS=cli|socket` 选择，默认 `cli`。
 //!
-//! - `Cli`：现状，每次起一个 `ubus call`（和 `state::ubus` 一样：同样的名字校验、8 秒超时、
+//! - `Cli`：默认，每次起一个 `ubus call`（和原来的 `state::ubus` 一样：同样的名字校验、8 秒超时、
 //!   同样的错误文字，`ZWRT_DATAD_UBUS_BIN` 指定程序）。
 //! - `Socket`：直连 ubusd（`client::UbusClient`），`ZWRT_DATAD_UBUS_SOCK` 指定 socket，
 //!   `ZWRT_DATAD_UBUS_TIMEOUT_MS` 指定单请求超时（默认 2000）。
 //!
-//! T4 接入：本任务不把后端接进 `state.rs` 的采集，执行者在 T4 里持有一个 `Backend`。
+//! 执行者（`executor.rs`）持有一个 `Backend`；`state::ubus` 经执行者调到这里（T4）。
 
 use super::client::{DEFAULT_SOCKET, DEFAULT_TIMEOUT, UbusClient, UbusError};
 use crate::command;
@@ -89,7 +89,7 @@ impl UbusBackend for CliBackend {
         BackendKind::Cli
     }
 
-    // 和 state::ubus 一致（那边在 T4 前不动）。
+    // 原来 state::ubus 的实现（T4 起那边只转给执行者）。
     async fn call(&mut self, object: &str, method: &str, args: &Value) -> Result<Value, UbusError> {
         super::validate_name(object).map_err(UbusError::InvalidArgument)?;
         super::validate_name(method).map_err(UbusError::InvalidArgument)?;

@@ -25,6 +25,10 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["limit", "trace"] }
 zeroize = "1"
 
+[dev-dependencies]
+# 可控时钟（tokio::time::pause）给执行者测试用；不引入新包。
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 lto = true
 codegen-units = 1

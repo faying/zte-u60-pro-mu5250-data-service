@@ -1,5 +1,7 @@
 use crate::{
     auth::{self, Sessions},
+    block::{self, Hub},
+    executor::{self, Executor, RoundDriver},
     model::{DatadVersion, Snapshot},
     neighbor_manager::Manager as NeighborManager,
     state,
@@ -15,16 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Map, Value, json};
-use std::{
-    convert::Infallible,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{Mutex, RwLock, Semaphore, watch},
@@ -39,7 +32,8 @@ pub struct App {
 struct Inner {
     snapshot: RwLock<Snapshot>,
     tx: watch::Sender<Snapshot>,
-    interval_ms: AtomicU64,
+    /// 单一采集执行者：采样循环、全部 ubus 调用、/control 排队（STATE_V2.md 第 7、8 节）。
+    exec: Executor,
     _data_dir: PathBuf,
     token: Option<String>,
     sessions: Mutex<Sessions>,
@@ -60,9 +54,25 @@ impl App {
         token: Option<String>,
         neighbor_enabled: bool,
     ) -> Result<Self> {
+        let hub = Arc::new(Hub::new(block::phase1_blocks(), Box::new(block::NoSink)));
+        let cfg = executor::Config {
+            cache: state::cache_enabled(),
+            ..executor::Config::default()
+        };
+        let exec = Executor::spawn(
+            crate::ubus::backend::Backend::from_env(),
+            hub.clone(),
+            cfg,
+            interval,
+        );
+        executor::install(&exec);
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
-        let mut initial = state::collect(interval.as_millis() as u64).await;
+        // 第一轮在执行者里立即采（块 + 旧采集），之后执行者自己「睡一个采样间隔 → 一轮」。
+        let interval_ms = interval.as_millis() as u64;
+        let mut initial = exec
+            .round_now(async move { state::collect(interval_ms, &hub).await })
+            .await;
         let mut neighbor = NeighborManager::new(neighbor_enabled);
         neighbor
             .tick(initial.fields.get("net").unwrap_or(&Value::Null))
@@ -73,7 +83,7 @@ impl App {
             inner: Arc::new(Inner {
                 snapshot: RwLock::new(initial),
                 tx,
-                interval_ms: AtomicU64::new(interval.as_millis() as u64),
+                exec,
                 neighbor: Mutex::new(neighbor),
                 _data_dir: data_dir,
                 token,
@@ -82,28 +92,18 @@ impl App {
                 sse_slots: Arc::new(Semaphore::new(16)),
             }),
         };
-        app.spawn_sampler();
+        app.inner.exec.start_rounds(Arc::new(app.clone()));
         Ok(app)
     }
     pub async fn snapshot(&self) -> Snapshot {
         self.inner.snapshot.read().await.clone()
     }
-    fn spawn_sampler(&self) {
-        let app = self.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(
-                    app.inner.interval_ms.load(Ordering::Relaxed),
-                ))
-                .await;
-                app.refresh_snapshot().await;
-            }
-        });
-    }
+    /// 一轮里的旧采集（在执行者里跑，块已经读完）。别在持有 neighbor/snapshot 锁时调 ubus：
+    /// 控制任务只在 `ubus_ttl` 这类安全点插进来，这里的锁段里没有安全点。
     async fn refresh_snapshot(&self) {
         crate::cooling::tick().await;
         crate::extra_wifi::tick().await;
-        let mut next = state::collect(self.inner.interval_ms.load(Ordering::Relaxed)).await;
+        let mut next = state::collect(self.inner.exec.interval_ms(), self.inner.exec.hub()).await;
         let mut neighbor = self.inner.neighbor.lock().await;
         neighbor
             .tick(next.fields.get("net").unwrap_or(&Value::Null))
@@ -120,6 +120,16 @@ impl App {
             old.ts = next.ts;
         }
     }
+}
+
+impl RoundDriver for App {
+    fn legacy(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        let app = self.clone();
+        Box::pin(async move { app.refresh_snapshot().await })
+    }
+}
+
+impl App {
     pub async fn serve(
         self,
         addr: SocketAddr,
@@ -427,9 +437,49 @@ async fn control(
         )
             .into_response();
     }
+    // 整个处理过程作为一个控制任务交给执行者（V2-24）：排队中的满 8 个立即 503（V2-25），
+    // 否则挂到做完才回复（和原来一样；请求方断开了任务也做完）。
+    let action = action.to_owned();
+    let exec = app.inner.exec.clone();
+    let marker = exec.clone();
+    let task_action = action.clone();
+    let task = async move {
+        let response = control_task(app, &task_action, body).await;
+        // V2-27：成功后相关块下一轮立即读（没有映射就全部块），不另起一轮采集。
+        if response.status().is_success() {
+            crate::state::invalidate_cache();
+            marker.mark_immediate(blocks_for_action(&task_action));
+        }
+        response
+    };
+    match exec.control(task).await {
+        Ok(response) => response,
+        Err(executor::Busy) => control_busy(&action),
+    }
+}
+
+/// `/control` 动作 → 它会改变的块。没列出的动作算「没有映射」，成功后全部块立即读（R12）。
+fn blocks_for_action(action: &str) -> Option<&'static [&'static str]> {
+    match action {
+        "power.direct_supply.set" | "power.direct_supply.status" => Some(&["charger"]),
+        _ => None,
+    }
+}
+
+/// V2-25：控制队列满。
+pub(crate) fn control_busy(action: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"ok":false,"action":action,"error":{"code":"busy","message":"control queue full"}})),
+    )
+        .into_response()
+}
+
+async fn control_task(app: App, action: &str, body: Value) -> Response {
     // Whatever this action changes, the cached slow-moving state may now be
-    // stale (state.rs `invalidate_cache`); the post-action refreshes below
-    // clear it again once the change has been made.
+    // stale (state.rs `invalidate_cache`); it is cleared again after a
+    // successful action (the task runs on the executor, so no round can refill
+    // the cache with pre-action values in between).
     crate::state::invalidate_cache();
     if action == "neighbor.status" {
         return (StatusCode::OK,Json(json!({"ok":true,"action":action,"result":app.inner.neighbor.lock().await.status()}))).into_response();
@@ -631,11 +681,12 @@ async fn control(
         };
     }
     if action == "apn.list" {
-        let values = tokio::join!(
-            state::ubus("zwrt_apn_object", "get_apn_mode", json!({})),
-            state::ubus("zwrt_apn_object", "getAutoApnList", json!({})),
-            state::ubus("zwrt_apn_object", "getManuApnList", json!({})),
-            state::ubus("zwrt_apn_object", "get_enabled_manu_apn_id", json!({}))
+        // 同一个控制任务里依次调完（V2-26）；四个都调，错误取第一个，和原来的 join 一样。
+        let values = (
+            state::ubus("zwrt_apn_object", "get_apn_mode", json!({})).await,
+            state::ubus("zwrt_apn_object", "getAutoApnList", json!({})).await,
+            state::ubus("zwrt_apn_object", "getManuApnList", json!({})).await,
+            state::ubus("zwrt_apn_object", "get_enabled_manu_apn_id", json!({})).await,
         );
         return match values {
             (Ok(mode), Ok(automatic), Ok(manual), Ok(enabled)) => control_ok(
@@ -649,22 +700,25 @@ async fn control(
         };
     }
     if action == "client.access" {
-        let values = tokio::join!(
+        let values = (
             state::ubus(
                 "uci",
                 "get",
-                json!({"config":"wireless","section":"main_2g"})
-            ),
+                json!({"config":"wireless","section":"main_2g"}),
+            )
+            .await,
             state::ubus(
                 "zwrt_router.api",
                 "router_lan_access_list",
-                json!({"start_id":1,"end_id":64})
-            ),
+                json!({"start_id":1,"end_id":64}),
+            )
+            .await,
             state::ubus(
                 "zwrt_router.api",
                 "router_wireless_access_list",
-                json!({"start_id":1,"end_id":64})
+                json!({"start_id":1,"end_id":64}),
             )
+            .await,
         );
         return match values {
             (Ok(policy), Ok(lan), Ok(wifi)) => {
@@ -677,11 +731,6 @@ async fn control(
     }
     match crate::control::execute(action, body.get("params").unwrap_or(&json!({}))).await {
         crate::control::Outcome::Ok(value) => {
-            let refresh = app.clone();
-            tokio::spawn(async move {
-                crate::state::invalidate_cache();
-                refresh.refresh_snapshot().await
-            });
             return control_ok(action, value);
         }
         crate::control::Outcome::Invalid(error) => return invalid_parameter(action, &error),
@@ -689,11 +738,6 @@ async fn control(
         crate::control::Outcome::NotHandled => {}
     }
     if action == "state.refresh" {
-        let refresh = app.clone();
-        tokio::spawn(async move {
-            crate::state::invalidate_cache();
-            refresh.refresh_snapshot().await
-        });
         return control_ok(action, json!({"queued":true}));
     }
     if action == "state.set_interval" {
@@ -704,20 +748,10 @@ async fn control(
         let Some(milliseconds) = milliseconds.filter(|value| (500..=5000).contains(value)) else {
             return (StatusCode::BAD_REQUEST,Json(json!({"ok":false,"action":action,"error":{"code":"invalid_parameter","message":"milliseconds must be between 500 and 5000"}}))).into_response();
         };
-        app.inner.interval_ms.store(milliseconds, Ordering::Relaxed);
-        let refresh = app.clone();
-        tokio::spawn(async move {
-            crate::state::invalidate_cache();
-            refresh.refresh_snapshot().await
-        });
+        app.inner.exec.set_interval_ms(milliseconds);
         return control_ok(action, json!({"sample_interval_ms":milliseconds}));
     }
     if action == "qos.reload" {
-        let refresh = app.clone();
-        tokio::spawn(async move {
-            crate::state::invalidate_cache();
-            refresh.refresh_snapshot().await
-        });
         return control_ok(action, json!({"queued":true}));
     }
     (

@@ -32,7 +32,35 @@ type Cache<T> = Mutex<Option<HashMap<String, Cached<T>>>>;
 static UBUS_CACHE: Cache<Result<Value, String>> = Mutex::new(None);
 static UCI_CACHE: Cache<BTreeMap<String, String>> = Mutex::new(None);
 
-fn cache_enabled() -> bool {
+/// 电池、充电器在旧 `/state` 里的样子。读失败（或块 stale）时和原来一样：没有 `battery`，
+/// `power` 看充电器那份 `{}`。
+fn power_fields(
+    fields: &mut Map<String, Value>,
+    template: &str,
+    battery: Result<Value, String>,
+    charger: Result<Value, String>,
+) {
+    let battery_ok = battery.is_ok();
+    let battery = object(battery);
+    let charger = object(charger);
+    let hide_battery = matches!(template, "MC7523" | "MC8532B");
+    if !hide_battery
+        && battery_ok
+        && battery
+            .as_object()
+            .is_some_and(|v| v.keys().any(|k| k.starts_with("battery_")))
+    {
+        fields.insert("battery".into(),json!({"percent":integer_or(&battery,"battery_capacity",-1),"temp":integer(&battery,"battery_temperature"),"online":integer(&battery,"battery_online"),"health":integer(&battery,"battery_health"),"time_to_full":integer_or(&battery,"battery_time_to_full",-1),"charging":integer(&charger,"charge_status"),"charger_connect":integer(&charger,"charger_connect"),"charger_type":integer(&charger,"charger_type"),"chg_uv":read_i64(host_path("/sys/class/power_supply/usb/voltage_now")),"chg_ua":read_i64(host_path("/sys/class/power_supply/usb/current_now")),"bat_uv":read_i64(host_path("/sys/class/power_supply/battery/voltage_now")),"bat_ua":read_i64(host_path("/sys/class/power_supply/battery/current_now"))}));
+    }
+    if let Some(mode) = charger
+        .get("direct_power_supply_mode")
+        .and_then(Value::as_str)
+    {
+        fields.insert("power".into(),json!({"direct_supply":{"supported":true,"enabled":match mode{"enable"=>json!(true),"disable"=>json!(false),_=>Value::Null},"mode":if matches!(mode,"enable"|"disable"){json!(mode)}else{Value::Null}}}));
+    }
+}
+
+pub(crate) fn cache_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("ZWRT_DATAD_CACHE").as_deref() != Ok("0"))
 }
@@ -71,6 +99,8 @@ fn cache_put<T>(cache: &Cache<T>, key: String, ttl: Duration, value: T) {
 /// does not exist on this model should not fork every second, but a transient
 /// error must not stick.
 async fn ubus_ttl(ttl_s: u64, service: &str, method: &str, args: Value) -> Result<Value, String> {
+    // 旧采集里的安全点：这里不持有任何锁，排队的 /control 可以先做（V2-24）。
+    crate::executor::preempt().await;
     if ttl_s == 0 || !cache_enabled() {
         return ubus(service, method, args).await;
     }
@@ -101,9 +131,6 @@ async fn uci_show_ttl(ttl_s: u64, package: &str) -> BTreeMap<String, String> {
     v
 }
 
-fn ubus_bin() -> String {
-    std::env::var("ZWRT_DATAD_UBUS_BIN").unwrap_or_else(|_| "/bin/ubus".into())
-}
 fn uci_bin() -> String {
     std::env::var("ZWRT_DATAD_UCI_BIN").unwrap_or_else(|_| "/sbin/uci".into())
 }
@@ -137,7 +164,7 @@ fn interface(v: &Value) -> Value {
 }
 
 async fn uci_show(package: &str) -> BTreeMap<String, String> {
-    if validate_name(package).is_err() {
+    if crate::ubus::validate_name(package).is_err() {
         return BTreeMap::new();
     }
     let Ok(raw) = command::run(&uci_bin(), ["-q", "show", package], Duration::from_secs(5)).await
@@ -971,7 +998,9 @@ fn runtime(runtime_zones: Value) -> (i64, Value) {
     )
 }
 
-pub async fn collect(sample_interval_ms: u64) -> Snapshot {
+/// 旧接口的一轮采集。电池、充电器已迁到块模型（`block::phase1_blocks`），从 `hub` 取；
+/// stale 的块按读失败输出（V2-29）。其余读取仍走 `ubus_ttl`。
+pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapshot {
     // Vendor ubus implementations on these devices lose replies under a large
     // burst of concurrent clients, so state collection is deliberately serial.
     let common = ubus_ttl(60, "zwrt_zte_mdm.api", "get_zwrt_common_info", json!({})).await;
@@ -1026,8 +1055,8 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         ubus_ttl(5, "zwrt_router.api", "router_get_status_no_auth", json!({})).await;
     let thermal = ubus_ttl(5, "zwrt_bsp.thermal", "get_cpu_temp", json!({})).await;
     let usb = ubus_ttl(30, "zwrt_bsp.usb", "list", json!({})).await;
-    let battery = ubus_ttl(5, "zwrt_bsp.battery", "list", json!({})).await;
-    let charger = ubus_ttl(5, "zwrt_bsp.charger", "list", json!({})).await;
+    let battery = hub.legacy("battery");
+    let charger = hub.legacy("charger");
     let nfc = ubus_ttl(60, "zwrt_nfc", "zwrt_nfc_wifi_get", json!({})).await;
     let _ = crate::sms::prepare().await;
     let sms_capacity = ubus_ttl(30, "zwrt_wms", "zwrt_wms_get_wms_capacity", json!({})).await;
@@ -1071,9 +1100,6 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     let router_status = object(router_status);
     let thermal = object(thermal);
     let usb = object(usb);
-    let battery_ok = battery.is_ok();
-    let battery = object(battery);
-    let charger = object(charger);
     let nfc_ok = nfc.is_ok();
     let nfc = object(nfc);
     let sms_ok = sms_capacity.is_ok();
@@ -1242,21 +1268,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
         "clients".into(),
         json!({"total":wifi_count+lan_count,"wifi":wifi_count,"lan":lan_count,"list":client_list}),
     );
-    let hide_battery = matches!(template, "MC7523" | "MC8532B");
-    if !hide_battery
-        && battery_ok
-        && battery
-            .as_object()
-            .is_some_and(|v| v.keys().any(|k| k.starts_with("battery_")))
-    {
-        fields.insert("battery".into(),json!({"percent":integer_or(&battery,"battery_capacity",-1),"temp":integer(&battery,"battery_temperature"),"online":integer(&battery,"battery_online"),"health":integer(&battery,"battery_health"),"time_to_full":integer_or(&battery,"battery_time_to_full",-1),"charging":integer(&charger,"charge_status"),"charger_connect":integer(&charger,"charger_connect"),"charger_type":integer(&charger,"charger_type"),"chg_uv":read_i64(host_path("/sys/class/power_supply/usb/voltage_now")),"chg_ua":read_i64(host_path("/sys/class/power_supply/usb/current_now")),"bat_uv":read_i64(host_path("/sys/class/power_supply/battery/voltage_now")),"bat_ua":read_i64(host_path("/sys/class/power_supply/battery/current_now"))}));
-    }
-    if let Some(mode) = charger
-        .get("direct_power_supply_mode")
-        .and_then(Value::as_str)
-    {
-        fields.insert("power".into(),json!({"direct_supply":{"supported":true,"enabled":match mode{"enable"=>json!(true),"disable"=>json!(false),_=>Value::Null},"mode":if matches!(mode,"enable"|"disable"){json!(mode)}else{Value::Null}}}));
-    }
+    power_fields(&mut fields, template, battery, charger);
     if sms_ok {
         let list = crate::sms::normalize_lists(&[sms_nv.clone(), sms_sim.clone()]).await;
         fields.insert("sms".into(),json!({"unread":integer(&sms_capacity,"sms_dev_unread_num")+integer(&sms_capacity,"sms_sim_unread_num"),"list":list}));
@@ -1691,32 +1703,12 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
     }
 }
 
+/// 一次 ubus 调用。经过单一采集执行者（`executor.rs`，V2-18）：执行者里直接发，别处排队；
+/// 后端由 `ZWRT_DATAD_UBUS=cli|socket` 选（`ubus::backend`），错误文字和原来的 `ubus call` 版一致。
 pub async fn ubus(service: &str, method: &str, args: Value) -> Result<Value, String> {
-    validate_name(service)?;
-    validate_name(method)?;
-    if !args.is_object() {
-        return Err("args must be an object".into());
-    }
-    let body = serde_json::to_string(&args).map_err(|e| e.to_string())?;
-    let raw = command::run(
-        &ubus_bin(),
-        ["call", service, method, &body],
-        Duration::from_secs(8),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    serde_json::from_slice(&raw).map_err(|e| format!("invalid ubus JSON: {e}"))
-}
-fn validate_name(v: &str) -> Result<(), String> {
-    if v.is_empty()
-        || v.len() > 128
-        || !v
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-    {
-        return Err("invalid ubus name".into());
-    }
-    Ok(())
+    crate::executor::call(service, method, &args)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1752,6 +1744,60 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn legacy_state_stale_block_renders_as_failure() {
+        use crate::block::{Hub, NoSink, phase1_blocks};
+        let hub = Hub::new(phase1_blocks(), Box::new(NoSink));
+        let render = |hub: &Hub| {
+            let mut f = Map::new();
+            power_fields(
+                &mut f,
+                "MU5250",
+                hub.legacy("battery"),
+                hub.legacy("charger"),
+            );
+            f
+        };
+        let failed = {
+            let mut f = Map::new();
+            power_fields(&mut f, "MU5250", Err("x".into()), Err("x".into()));
+            f
+        };
+        // 从没读成功：和读失败一样。
+        assert_eq!(render(&hub), failed);
+        assert!(failed.is_empty());
+        let now = tokio::time::Instant::now();
+        hub.record_read(
+            0,
+            Ok(json!({"battery_capacity":80,"battery_online":1})),
+            now,
+        );
+        hub.record_read(
+            1,
+            Ok(json!({"direct_power_supply_mode":"enable","charge_status":1})),
+            now,
+        );
+        let fresh = render(&hub);
+        assert_eq!(fresh["battery"]["percent"], 80);
+        assert_eq!(fresh["battery"]["charging"], 1);
+        assert_eq!(fresh["power"]["direct_supply"]["enabled"], true);
+        // 读失败 → stale：旧接口不给保留的旧值，按读失败输出；/v2 仍带着旧值。
+        hub.record_read(0, Err("timeout".into()), now);
+        hub.record_read(1, Err("timeout".into()), now);
+        assert_eq!(render(&hub), failed);
+        assert_eq!(hub.view("battery").unwrap().data["battery_capacity"], 80);
+        // 只有电池 stale：电池不出，充电器照常。
+        hub.record_read(1, Ok(json!({"direct_power_supply_mode":"disable"})), now);
+        let f = render(&hub);
+        assert!(!f.contains_key("battery"));
+        assert_eq!(f["power"]["direct_supply"]["enabled"], false);
+        // max_age 过期导致的 stale 同样按失败输出。
+        hub.record_read(0, Ok(json!({"battery_capacity":81})), now);
+        hub.round_end(now + Duration::from_secs(16), Duration::from_secs(1));
+        assert_eq!(render(&hub), failed);
+    }
+
     #[test]
     fn profile() {
         assert_eq!(normalize_profile("MC7523 HW1.0"), "mc7523_hw1_0");

@@ -1,7 +1,9 @@
 mod auth;
+mod block;
 mod command;
 mod control;
 mod cooling;
+mod executor;
 mod extra_wifi;
 mod model;
 mod neighbor;

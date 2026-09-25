@@ -5,7 +5,8 @@
 //!   `UbusError`、`RoundSkips`（本轮跳过超时对象）。
 //! - `backend`：`ZWRT_DATAD_UBUS=cli|socket` 选后端，`UbusBackend` trait、`Backend`。
 //!
-//! T4 接入：采集执行者还没用它们，所以整个模块暂时允许未使用。
+//! 执行者（`executor.rs`，T4）持有一个 `Backend`，datad 的全部 ubus 调用都经过它。
+//! 客户端里有些接口只给测试和日志用（统计、缓存查询），所以整个模块允许未使用。
 #![allow(dead_code)]
 
 pub mod backend;
@@ -18,7 +19,7 @@ mod mock_ubusd;
 #[cfg(test)]
 mod tests;
 
-/// 对象名、方法名的校验，和 `state::ubus` 的 `validate_name` 一致（错误文字也一致）。
+/// 对象名、方法名（以及 uci 包名）的校验；错误文字和原来 `state::ubus` 的一致。
 pub(crate) fn validate_name(v: &str) -> Result<(), String> {
     if v.is_empty()
         || v.len() > 128
