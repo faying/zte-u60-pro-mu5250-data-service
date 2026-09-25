@@ -10,6 +10,7 @@ mod qos;
 mod server;
 mod sms;
 mod state;
+mod ubus;
 mod wifi;
 
 use anyhow::Result;
