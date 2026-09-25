@@ -132,6 +132,8 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
 单个 ubus 请求的超时是 2 秒。每轮 ubus 预算 3 秒，不算 `/control` 插进来的时间：
 每次**开始**读下一个对象前，看本轮已经用掉的 ubus 时间，满 3 秒就不再开始新的请求。已经发出的请求照常等到回复或 2 秒超时。
 所以一轮最长是 3 秒 + 一次超时 = 5 秒。
+单个请求的超时按后端分：`socket` 是 2 秒；`cli`（`ubus call`，默认）保留原来的 8 秒（fork 开销大），
+这时一轮最长是 3 + 8 = 11 秒。
 例：同一轮有 3 个对象都不回复。第 1 个 0～2 秒超时，第 2 个 2～4 秒超时，第 3 个没开始。这一轮约 4 秒，心跳照发，下一轮先读第 3 个。
 测试（T4）：`round_three_timeouts_within_budget_plus_one_timeout`
 
@@ -140,7 +142,7 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
 
 **V2-21** 每块自带采集间隔，取代现在的 `ubus_ttl`：
 距上次读取满间隔才读；读失败的块 5 秒内重读，不等满间隔；`ZWRT_DATAD_CACHE=0` 时每块每轮都读。
-`/control` 成功后，相关的块标成「立即读」，在执行者读下一块时先读它们（V2-26）。
+`/control` 成功后，相关的块标成「立即读」，**下一轮**不管间隔到没到都读；动作没有对应的块时，全部块都标（V2-27）。
 测试（T4）：`block_interval_respected`、`block_failure_retried_within_5s`、`block_cache_off_reads_every_round`
 
 **V2-22** 每轮结束时（包括超出预算的那一轮）执行者发一条 `heartbeat`，没有任何变化也照发。
@@ -149,6 +151,7 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
 
 **V2-23** 所有 `/v2` 订阅方统一用 **M = 20 秒**：超过 20 秒没收到任何事件，就当作连接断了，按 V2-3 重连。
 没有 `/control` 时，心跳最长间隔 = 5 秒采样间隔 + 5 秒最长一轮 = 10 秒，M 留出一倍余量。
+10 秒这个上限只对 `socket` 后端成立；`cli` 后端一轮最长 11 秒（V2-19），心跳最长间隔 5 + 11 = 16 秒，仍小于 M = 20 秒。
 `/control` 任务不算进每轮预算，控制请求很多时间隔可能超过 10 秒，这不是硬保证。
 测试（T4）：`heartbeat_gap_at_most_10s_without_control`；测试（T7，manager）：`datad_feed_disconnects_after_20s_silence`
 
@@ -171,7 +174,7 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
 **V2-26** 一个动作要连着调几次 ubus 的（比如 `apn.list`），在同一个任务里依次调完，中间不插入采集。
 测试（T4）：`control_multi_call_runs_as_one_task`
 
-**V2-27** `/control` 成功后只把相关的块标成「立即读」（V2-21），**不**另起一轮采集。
+**V2-27** `/control` 成功后只把相关的块标成「立即读」（V2-21）：下一轮立即读它们，动作没有对应的块时全部块都读；**不**另起一轮采集。
 测试（T4）：`control_success_marks_blocks_no_second_round`
 
 **V2-28** 所有读写都经过同一个执行者，按顺序执行，所以在控制任务之前读到的旧值，不会覆盖控制任务之后的新值。
