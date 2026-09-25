@@ -102,6 +102,35 @@ fn blobmsg_roundtrip_all_types() {
 }
 
 #[test]
+fn blobmsg_nesting_depth_limited() {
+    // 顶层对象里套 n 层 table/array（交替）。32 层能解，33 层是协议错误（不无限递归）。
+    fn nested(n: usize) -> Value {
+        let mut v = json!(1);
+        for i in 0..n {
+            v = if i % 2 == 0 {
+                json!({"t": v})
+            } else {
+                json!([v])
+            };
+        }
+        v
+    }
+    for (n, ok) in [(blob::MAX_DEPTH, true), (blob::MAX_DEPTH + 1, false)] {
+        let top = json!({"x": nested(n)});
+        let bytes = blob::blobmsg_table(top.as_object().unwrap());
+        match blob::blobmsg_object(&bytes) {
+            Ok(m) if ok => assert_eq!(Value::Object(m), top),
+            Err(e) if !ok => assert!(e.0.contains("nested deeper than 32"), "{e:?}"),
+            r => panic!("depth {n}: {r:?}"),
+        }
+    }
+    // 顶层就是数组时同样算层数。
+    let mut deep = Vec::new();
+    blob::blobmsg_put_json(&mut deep, "", &nested(blob::MAX_DEPTH + 1));
+    assert!(blob::blobmsg_array(&deep).is_err());
+}
+
+#[test]
 fn blobmsg_decodes_int16_and_rejects_bad_input() {
     let mut out = Vec::new();
     blob::blobmsg_put_raw(&mut out, blobmsg_type::INT16, "h", &(-2_i16).to_be_bytes());

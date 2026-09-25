@@ -297,6 +297,14 @@ pub fn blobmsg_table(map: &Map<String, Value>) -> Vec<u8> {
 /// 解一个 blobmsg 字段，返回（名字，值）。值的 JSON 形式和 ubus CLI（`blobmsg_format_json`）一致：
 /// INT8 → true/false，INT16/32/64 → 有符号整数，DOUBLE → 数（NaN/Inf → null），UNSPEC → null。
 pub fn blobmsg_decode(a: &Attr<'_>) -> Result<(String, Value), BlobError> {
+    decode_at(a, 0)
+}
+
+/// 嵌套 table/array 的最大层数：超过就当协议错误，不无限递归（坏帧或恶意帧不会把栈打爆）。
+pub const MAX_DEPTH: usize = 32;
+
+/// `depth` = 这个字段外面已经套了几层 table/array（顶层对象里的字段是 0）。
+fn decode_at(a: &Attr<'_>, depth: usize) -> Result<(String, Value), BlobError> {
     use blobmsg_type as t;
     if !a.extended {
         return err("blobmsg attribute without the extended bit");
@@ -325,8 +333,11 @@ pub fn blobmsg_decode(a: &Attr<'_>) -> Result<(String, Value), BlobError> {
     };
     let v = match a.id {
         t::UNSPEC => Value::Null,
-        t::ARRAY => Value::Array(blobmsg_array(d)?),
-        t::TABLE => Value::Object(blobmsg_object(d)?),
+        t::ARRAY | t::TABLE if depth >= MAX_DEPTH => {
+            return err(format!("blobmsg nested deeper than {MAX_DEPTH}"));
+        }
+        t::ARRAY => Value::Array(array_at(d, depth + 1)?),
+        t::TABLE => Value::Object(object_at(d, depth + 1)?),
         t::STRING => {
             let end = d.iter().position(|&b| b == 0).unwrap_or(d.len());
             Value::String(String::from_utf8_lossy(&d[..end]).into_owned())
@@ -346,9 +357,13 @@ pub fn blobmsg_decode(a: &Attr<'_>) -> Result<(String, Value), BlobError> {
 
 /// 一串 blobmsg 字段 → JSON 对象（重复的名字后者覆盖前者，同 `serde_json` 解析 CLI 输出的结果）。
 pub fn blobmsg_object(buf: &[u8]) -> Result<Map<String, Value>, BlobError> {
+    object_at(buf, 0)
+}
+
+fn object_at(buf: &[u8], depth: usize) -> Result<Map<String, Value>, BlobError> {
     let mut m = Map::new();
     for a in parse_attrs(buf)? {
-        let (k, v) = blobmsg_decode(&a)?;
+        let (k, v) = decode_at(&a, depth)?;
         m.insert(k, v);
     }
     Ok(m)
@@ -356,9 +371,13 @@ pub fn blobmsg_object(buf: &[u8]) -> Result<Map<String, Value>, BlobError> {
 
 /// 一串 blobmsg 字段 → JSON 数组（忽略名字）。
 pub fn blobmsg_array(buf: &[u8]) -> Result<Vec<Value>, BlobError> {
+    array_at(buf, 0)
+}
+
+fn array_at(buf: &[u8], depth: usize) -> Result<Vec<Value>, BlobError> {
     parse_attrs(buf)?
         .iter()
-        .map(|a| blobmsg_decode(a).map(|(_, v)| v))
+        .map(|a| decode_at(a, depth).map(|(_, v)| v))
         .collect()
 }
 
