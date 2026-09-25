@@ -86,7 +86,7 @@ printf '47000\n' >"$ZWRT_DATAD_COOLING_ZONE_PATH/temp"
 printf 'fixture\n' >"$ZWRT_DATAD_QOS_LOG"
 printf 'rotated\n' >"$ZWRT_DATAD_QOS_LOG_ROTATED"
 
-"$ROOT/rust/target/debug/zwrt-datad" --bind 127.0.0.1 --port "$PORT" \
+"${ZWRT_DATAD_TEST_BIN:-$ROOT/rust/target/debug/zwrt-datad}" --bind 127.0.0.1 --port "$PORT" \
     --data-dir "$TMP/data" >"$TMP/server.log" 2>&1 &
 PID=$!
 i=0

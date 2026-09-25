@@ -719,7 +719,7 @@ fn count_lines(path: &str, header: bool) -> u64 {
 }
 
 fn tcp_active() -> u64 {
-    fs::read_to_string("/proc/net/tcp")
+    fs::read_to_string(host_path("/proc/net/tcp"))
         .unwrap_or_default()
         .lines()
         .skip(1)
@@ -727,9 +727,23 @@ fn tcp_active() -> u64 {
         .count() as u64
 }
 
+/// 测试用：ZWRT_DATAD_HOST_ROOT 设了时，下面这些写死的 /proc、/sys、/data 路径整体挪到它下面，
+/// 让 golden（tests/golden/）不受宿主机影响。设备上不设，路径和原来完全一样。
+fn host_path(path: &str) -> String {
+    static ROOT: OnceLock<Option<String>> = OnceLock::new();
+    match ROOT.get_or_init(|| {
+        std::env::var("ZWRT_DATAD_HOST_ROOT")
+            .ok()
+            .filter(|v| !v.is_empty())
+    }) {
+        Some(root) => format!("{root}{path}"),
+        None => path.to_owned(),
+    }
+}
+
 fn meminfo() -> Value {
     let mut values = BTreeMap::new();
-    let contents = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let contents = fs::read_to_string(host_path("/proc/meminfo")).unwrap_or_default();
     for line in contents.lines() {
         if let Some((key, rest)) = line.split_once(':') {
             values.insert(
@@ -747,7 +761,7 @@ fn meminfo() -> Value {
 // libc exposes statvfs counters with different integer widths across targets.
 #[allow(clippy::unnecessary_cast)]
 fn storage() -> Value {
-    let Ok(path) = CString::new("/data") else {
+    let Ok(path) = CString::new(host_path("/data")) else {
         return json!({"total":0,"used":0,"available":0});
     };
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -874,7 +888,7 @@ fn throughput(now: u64) -> Value {
 
 fn runtime(runtime_zones: Value) -> (i64, Value) {
     let mut current = BTreeMap::new();
-    for line in fs::read_to_string("/proc/stat").unwrap_or_default().lines() {
+    for line in fs::read_to_string(host_path("/proc/stat")).unwrap_or_default().lines() {
         let mut parts = line.split_whitespace();
         let Some(label) = parts.next() else { continue };
         if label != "cpu"
@@ -918,7 +932,7 @@ fn runtime(runtime_zones: Value) -> (i64, Value) {
     drop(old);
     let mut freqs = Map::new();
     for core in usage.keys() {
-        let root = format!("/sys/devices/system/cpu/{core}/cpufreq");
+        let root = host_path(&format!("/sys/devices/system/cpu/{core}/cpufreq"));
         let mut cur = read_i64(format!("{root}/scaling_cur_freq"));
         let mut max = read_i64(format!("{root}/scaling_max_freq"));
         if cur == 0 {
@@ -930,8 +944,8 @@ fn runtime(runtime_zones: Value) -> (i64, Value) {
         freqs.insert(core.clone(), json!({"cur":cur/1000,"max":max/1000}));
     }
     let active = tcp_active();
-    let tcp4 = count_lines("/proc/net/tcp", true);
-    let connections = json!({"tcp_active":active,"tcp_other":tcp4.saturating_sub(active),"tcp4":tcp4,"tcp6":count_lines("/proc/net/tcp6",true),"udp4":count_lines("/proc/net/udp",true),"udp6":count_lines("/proc/net/udp6",true),"unix":count_lines("/proc/net/unix",true)});
+    let tcp4 = count_lines(&host_path("/proc/net/tcp"), true);
+    let connections = json!({"tcp_active":active,"tcp_other":tcp4.saturating_sub(active),"tcp4":tcp4,"tcp6":count_lines(&host_path("/proc/net/tcp6"),true),"udp4":count_lines(&host_path("/proc/net/udp"),true),"udp6":count_lines(&host_path("/proc/net/udp6"),true),"unix":count_lines(&host_path("/proc/net/unix"),true)});
     let now = now_ms();
     (
         total_usage,
@@ -1216,7 +1230,7 @@ pub async fn collect(sample_interval_ms: u64) -> Snapshot {
             .as_object()
             .is_some_and(|v| v.keys().any(|k| k.starts_with("battery_")))
     {
-        fields.insert("battery".into(),json!({"percent":integer_or(&battery,"battery_capacity",-1),"temp":integer(&battery,"battery_temperature"),"online":integer(&battery,"battery_online"),"health":integer(&battery,"battery_health"),"time_to_full":integer_or(&battery,"battery_time_to_full",-1),"charging":integer(&charger,"charge_status"),"charger_connect":integer(&charger,"charger_connect"),"charger_type":integer(&charger,"charger_type"),"chg_uv":read_i64("/sys/class/power_supply/usb/voltage_now"),"chg_ua":read_i64("/sys/class/power_supply/usb/current_now"),"bat_uv":read_i64("/sys/class/power_supply/battery/voltage_now"),"bat_ua":read_i64("/sys/class/power_supply/battery/current_now")}));
+        fields.insert("battery".into(),json!({"percent":integer_or(&battery,"battery_capacity",-1),"temp":integer(&battery,"battery_temperature"),"online":integer(&battery,"battery_online"),"health":integer(&battery,"battery_health"),"time_to_full":integer_or(&battery,"battery_time_to_full",-1),"charging":integer(&charger,"charge_status"),"charger_connect":integer(&charger,"charger_connect"),"charger_type":integer(&charger,"charger_type"),"chg_uv":read_i64(host_path("/sys/class/power_supply/usb/voltage_now")),"chg_ua":read_i64(host_path("/sys/class/power_supply/usb/current_now")),"bat_uv":read_i64(host_path("/sys/class/power_supply/battery/voltage_now")),"bat_ua":read_i64(host_path("/sys/class/power_supply/battery/current_now"))}));
     }
     if let Some(mode) = charger
         .get("direct_power_supply_mode")

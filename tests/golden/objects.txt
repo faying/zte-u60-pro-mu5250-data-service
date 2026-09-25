@@ -1,0 +1,15 @@
+network.interface.lan
+network.interface.zte_wan
+network.interface.zte_wan6
+system
+zte_nwinfo_api
+zwrt_bsp.battery
+zwrt_bsp.charger
+zwrt_bsp.thermal
+zwrt_bsp.usb
+zwrt_data
+zwrt_nfc
+zwrt_router.api
+zwrt_web
+zwrt_wms
+zwrt_zte_mdm.api
