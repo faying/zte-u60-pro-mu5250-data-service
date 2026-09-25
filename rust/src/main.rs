@@ -13,6 +13,7 @@ mod server;
 mod sms;
 mod state;
 mod ubus;
+mod uci;
 mod v2;
 mod wifi;
 

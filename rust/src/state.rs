@@ -136,7 +136,10 @@ async fn ubus_ttl(ttl_s: u64, service: &str, method: &str, args: Value) -> Resul
     v
 }
 
+/// 按块间隔读一个 UCI 包（R19）：`ttl_s` 就是间隔（阶段 2 迁完之前沿用 UCI_CACHE 的 TTL）。
 async fn uci_show_ttl(ttl_s: u64, package: &str) -> BTreeMap<String, String> {
+    // 和 ubus_ttl 一样的安全点：排队的 /control 先做，这里读到的是控制之后的值（V2-24/V2-28）。
+    crate::executor::preempt().await;
     if ttl_s == 0 || !cache_enabled() {
         return uci_show(package).await;
     }
@@ -185,15 +188,36 @@ fn interface(v: &Value) -> Value {
     json!({"up":v.get("up").and_then(Value::as_bool).unwrap_or(false),"proto":string(v,"proto"),"device":string(v,"l3_device"),"ipv4":v.get("ipv4-address").cloned().unwrap_or_else(||json!([])),"ipv6":v.get("ipv6-address").cloned().unwrap_or_else(||json!([])),"dns":v.get("dns-server").cloned().unwrap_or_else(||json!([]))})
 }
 
-async fn uci_show(package: &str) -> BTreeMap<String, String> {
-    if crate::ubus::validate_name(package).is_err() {
-        return BTreeMap::new();
+/// `/etc/config`（`ZWRT_DATAD_UCI_CONFIG_DIR` 可改，测试用）。
+fn uci_config_dir() -> std::path::PathBuf {
+    std::env::var("ZWRT_DATAD_UCI_CONFIG_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| host_path("/etc/config"))
+        .into()
+}
+/// uci 的 savedir `/tmp/.uci`（未保存改动；`ZWRT_DATAD_UCI_SAVEDIR` 可改，测试用）。
+fn uci_save_dir() -> std::path::PathBuf {
+    std::env::var("ZWRT_DATAD_UCI_SAVEDIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| host_path("/tmp/.uci"))
+        .into()
+}
+
+/// R19：`/tmp/.uci/<包>` 不存在或为 0 字节（设备上 commit 后留下的空文件）且配置文件能解析时，
+/// datad 自己解析 `/etc/config/<包>`，不 fork；否则返回 `None`，调用方退回 `uci` 子进程。
+/// `ZWRT_DATAD_UCI_PARSE=0` 一律走子进程（回退开关）。
+fn uci_parsed(package: &str) -> Option<crate::uci::Package> {
+    if std::env::var("ZWRT_DATAD_UCI_PARSE").as_deref() == Ok("0") {
+        return None;
     }
-    let Ok(raw) = command::run(&uci_bin(), ["-q", "show", package], Duration::from_secs(5)).await
-    else {
-        return BTreeMap::new();
-    };
-    String::from_utf8_lossy(&raw)
+    crate::uci::load(package, &uci_config_dir(), &uci_save_dir())
+}
+
+/// `uci show` 文本 → `路径 → 值`（值去掉最外层单引号）。解析路径和子进程路径共用。
+fn uci_show_map(raw: &[u8]) -> BTreeMap<String, String> {
+    String::from_utf8_lossy(raw)
         .lines()
         .filter_map(|line| {
             let (k, raw) = line.split_once('=')?;
@@ -204,6 +228,39 @@ async fn uci_show(package: &str) -> BTreeMap<String, String> {
             Some((k.into(), v.into()))
         })
         .collect()
+}
+
+// uci 子进程不另走执行者队列：会 fork uci 的只有旧采集（在执行者的采集轮里）和 /control
+// （整个作为控制任务在执行者里跑），两者本来就由执行者串行，同一时间最多一个 uci 在途。
+async fn uci_show(package: &str) -> BTreeMap<String, String> {
+    if crate::ubus::validate_name(package).is_err() {
+        return BTreeMap::new();
+    }
+    if let Some(pkg) = uci_parsed(package) {
+        return uci_show_map(&crate::uci::render_show(package, &pkg));
+    }
+    let Ok(raw) = command::run(&uci_bin(), ["-q", "show", package], Duration::from_secs(5)).await
+    else {
+        return BTreeMap::new();
+    };
+    uci_show_map(&raw)
+}
+
+/// 采集用的 `uci get <包>.<节>.<选项>`：能自己解析时不 fork（R19），否则同 `uci_read`。
+/// /control 的读改写仍用 `uci_read`（要看到未保存的改动，走 uci 子进程更直接）。
+async fn uci_value(path: &str) -> String {
+    let mut parts = path.splitn(3, '.');
+    if let (Some(package), Some(section), Some(option)) = (parts.next(), parts.next(), parts.next())
+        && !path.contains('@')
+        && !option.contains('.')
+        && crate::ubus::validate_name(package).is_ok()
+        && let Some(pkg) = uci_parsed(package)
+    {
+        return crate::uci::get(&pkg, section, option)
+            .map(|v| String::from_utf8_lossy(&v).trim().to_owned())
+            .unwrap_or_default();
+    }
+    uci_read(path).await
 }
 pub async fn uci_read(path: &str) -> String {
     if path.is_empty()
@@ -1589,7 +1646,7 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
             thermal["modems"] = Value::Array(thermal_modems);
         }
         fields.insert("modems".into(), Value::Array(modems));
-        let mode = uci_read("zwrt_router.network.opms_wan_mode").await;
+        let mode = uci_value("zwrt_router.network.opms_wan_mode").await;
         let mwan_running = std::env::var("ZWRT_DATAD_MWAN3_RUNNING")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
@@ -1651,9 +1708,9 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         let path_count = paths.len();
         let online_path_count = paths.iter().filter(|path| path["online"] == true).count();
         let (tcp_tunnel_count, runtime_ip, runtime_port, icg_running) = tcp_aggregation_summary();
-        let provisioned = !uci_read("zwrt_router.icgmwan.IcgDevId").await.is_empty();
-        let remaining = uci_read("zwrt_router.icgmwan.residual_flow").await;
-        let today_used = uci_read("zwrt_router.icgmwan.count_flow_today").await;
+        let provisioned = !uci_value("zwrt_router.icgmwan.IcgDevId").await.is_empty();
+        let remaining = uci_value("zwrt_router.icgmwan.residual_flow").await;
+        let today_used = uci_value("zwrt_router.icgmwan.count_flow_today").await;
         let config_path = std::env::var("ZWRT_DATAD_ICG_CONFIG")
             .unwrap_or_else(|_| "/etc/config/icg.conf".into());
         let icg_config: BTreeMap<String, String> = fs::read_to_string(config_path)
@@ -1690,11 +1747,11 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
             "multiwan".into(),
             topflow_multiwan(&uci_sets, &mode, mwan_running),
         );
-        let fan_enabled = uci_read("zwrt_deviceui.Device.fan_switch_status")
+        let fan_enabled = uci_value("zwrt_deviceui.Device.fan_switch_status")
             .await
             .parse()
             .unwrap_or_default();
-        let liquid_enabled = uci_read("zwrt_deviceui.Device.liquid_cooling_switch_status")
+        let liquid_enabled = uci_value("zwrt_deviceui.Device.liquid_cooling_switch_status")
             .await
             .parse()
             .unwrap_or_default();
