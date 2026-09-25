@@ -24,8 +24,12 @@ cargo zigbuild --locked --release --target $TARGET 2>&1 | tail -2
 "
 BIN=$ROOT/rust/target-zig/$TARGET/release/zwrt-datad
 cp "$BIN" "$OUT"
-# 装机包要求：Rust 版（认 ZWRT_DATAD_OTA_DISABLE_AUTO）、没有写死的外部更新源
-grep -a -q ZWRT_DATAD_OTA_DISABLE_AUTO "$OUT" || { echo "不是 Rust 版 datad？" >&2; exit 1; }
+# 装机包要求：Rust 版、没有写死的外部更新源。
+# Rust 版的认法（和 manager 的 onboard/build-kit.sh 一致）：有构建标记
+# ZWRT_DATAD_FORK_RUST_SELF_CONTAINED（main.rs 的 BUILD_MARKER，删掉 OTA 之后的版本），
+# 或有旧的 ZWRT_DATAD_OTA_DISABLE_AUTO（删 OTA 之前的旧程序，如备份 b5e8786）。
+grep -a -q -e ZWRT_DATAD_FORK_RUST_SELF_CONTAINED -e ZWRT_DATAD_OTA_DISABLE_AUTO "$OUT" ||
+  { echo "不是 Rust 版 datad？" >&2; exit 1; }
 if grep -a -q 'releases/latest/download' "$OUT"; then echo "带着外部更新源" >&2; exit 1; fi
 ls -l "$OUT"
 shasum -a 256 "$OUT" 2>/dev/null || sha256sum "$OUT"

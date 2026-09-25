@@ -52,8 +52,15 @@ struct Args {
     data_dir: PathBuf,
 }
 
+/// 构建标记：给打包脚本认「这是本 fork 的 Rust 版、不带外部更新源」用
+/// （scripts/build-docker.sh、manager 的 onboard/build-kit.sh 用 `grep -a` 查）。
+/// 不参与任何 HTTP 输出；`#[used]` + main 里的 black_box 保证 LTO/strip 后仍在二进制里。
+#[used]
+static BUILD_MARKER: [u8; 35] = *b"ZWRT_DATAD_FORK_RUST_SELF_CONTAINED";
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    std::hint::black_box(&BUILD_MARKER);
     // reqwest（短信 HTTP 发送）用 rustls，进程里装一次 ring 作为默认加密实现。
     let _ = rustls::crypto::ring::default_provider().install_default();
     let raw: Vec<String> = std::env::args().collect();
