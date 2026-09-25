@@ -1,7 +1,7 @@
 # ZTE U60 Pro（MU5250）数据服务：zwrt-datad
 
 `zwrt-datad` 跑在设备本机，把 `ubus`、`uci`、`sysfs` 和必要的设备日志整理成稳定的 JSON 状态，通过 HTTP 和 SSE 提供给触屏界面、脚本和其他本机服务。
-本仓库是 [33333s/zwrt-datad](https://github.com/33333s/zwrt-datad) 的 fork，在 `main` 分支上加了 MU5250 的对齐修复和慢数据缓存，**并去掉了所有内置的外部更新源，自动更新默认关闭**。
+本仓库是 [33333s/zwrt-datad](https://github.com/33333s/zwrt-datad) 的 fork，在 `main` 分支上加了 MU5250 的对齐修复和慢数据缓存，**并删掉了上游的自更新（OTA）、云端、WebShell 和 `/ubus` 透传，程序不连任何外网地址**。
 
 [English](README_EN.md) · [API 文档](docs/API.md)
 
@@ -39,9 +39,7 @@ curl -fsS http://127.0.0.1:9460/state
 curl -N  http://127.0.0.1:9460/events
 ```
 
-装机包的启动方式带 `ZWRT_DATAD_OTA_DISABLE_AUTO=1`；程序里也没有写死的更新地址。要更新就自己编译，再用装机包 `./install.sh devui` 装上。
-
-> **安全提示**：`POST /ubus/call` 能调用任意已注册的 ubus 方法，包括改网络、断连、重启。只对受信任的本机程序开放。
+程序里没有自更新（上游的 OTA、云端、WebShell 和 `/ubus` 透传都已删掉），也没有写死的外网地址。要更新就自己编译，再用装机包 `./install.sh devui` 装上。
 
 ## 构建
 
@@ -65,7 +63,7 @@ bash scripts/build.sh     # → zwrt-datad-aarch64（静态、已 strip）
 - [docs/STATE_SCHEMA.md](docs/STATE_SCHEMA.md)：状态字段约定
 - [docs/CONTROL_API.md](docs/CONTROL_API.md)：控制动作与安全边界
 - [docs/models/](docs/models/)：各机型模板
-- [docs/RUNTIME.md](docs/RUNTIME.md)、[docs/NEIGHBOR.md](docs/NEIGHBOR.md)、[docs/CLOUD.md](docs/CLOUD.md)：上游的运行说明和可选功能（U60 Pro 装机包不使用上游安装器）
+- [docs/RUNTIME.md](docs/RUNTIME.md)、[docs/NEIGHBOR.md](docs/NEIGHBOR.md)：上游的运行说明和可选功能（U60 Pro 装机包用自己的启动方式）
 
 ## 致谢
 

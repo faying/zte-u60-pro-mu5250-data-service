@@ -6,10 +6,6 @@
 /zwrt-datad-hostcheck
 /zwrt-datad-aarch64-check
 /zwrt-datad-test
-/json-test
-/device-exec-test
-/json-test.exe
-/json-test.pdb
 /zwrt-datad-*.stripped
 /*.stripped
 /u60-datad
@@ -36,19 +32,10 @@ scripts/_*.sh
 *.swp
 .DS_Store
 /tests/auth.token
-/tests/mock-calls.log
-/tests/mu5252-calls.log
 
-/zwrt-datad-cloud-aarch64
-/cloud/cloud
 
-/web-crypto-test
-/zwrt-datad-linked-test
 
 /build/
-
-# Generated from version.json before compiling
-/include/datad_version_generated.h
 
 /rust/target/
 /rust/target-zig/

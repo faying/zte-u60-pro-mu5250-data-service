@@ -77,9 +77,4 @@ if [ -n "$QEMU" ]; then
   }
 fi
 
-python3 scripts/render-installer.py "$ASSET" build/install-datad.sh
-sh -n build/install-datad.sh
-if [ -n "${DATAD_OTA_SIGNING_KEY_FILE:-}" ]; then
-  python3 scripts/sign-update.py --key "$DATAD_OTA_SIGNING_KEY_FILE" --binary "$ASSET"
-fi
 echo "BUILD-OK"

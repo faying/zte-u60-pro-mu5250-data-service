@@ -253,7 +253,7 @@ SSE  /events
 - `battery`、`wlan`、`nfc`、`sms` 等可选块由模板决定是否输出；兼容模板会按实际接口探测结果输出。缺少整个块表示该接口不可用，块存在而字段值为 `0` 表示有效零值。
 - 当模板不输出 `battery` 时，`uci_device_info` 内的 `battery_*` 与 `power_adapter` 厂商占位字段也会同步过滤，避免消费者从兼容缓存重新推断出不存在的电池。
 - `/state.wlan` 不输出 Wi-Fi 密钥；密码只允许通过显式鉴权的 Wi-Fi 管理接口读取。
-- `device.full_ubus = 1` 表示当前模板开放 `POST /ubus/call`；现有模板默认均为 `1`。
+- `device.full_ubus`：旧字段，为兼容保留，恒为 `1`；`/ubus/call` 已删除，它不再表示任何能力。
 - MC8532B 的 `net` 优先读取实时 ubus，失败时回退选定的 `zte_nwinfo` UCI 缓存；`uci_device_info.radio_*` 同步暴露这组只读缓存字段，不提供任意 UCI 透传。
 - 机型适配应优先使用 `device.model_name`；`device.profile` 是基于它生成的规范化键，便于模板映射。
 - `device.market_name` / `device.alias_name` 只适合展示，不应作为模板切换主键，因为同名产品可能对应不同 `model_name` / 基带方案。

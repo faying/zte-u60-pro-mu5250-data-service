@@ -1,6 +1,8 @@
 # 运行与日志
 
-`zwrt-datad` 读取设备 `ubus/uci/sysfs` 与 QoS 日志，并在本机 `127.0.0.1:9460` 提供 HTTP/SSE 和白名单控制接口。云端 TLS/MQTT/WebSocket 运行时静态链接在同一个 `zwrt-datad` 二进制和进程中；`cloud.json` 仍留在正式数据目录。
+`zwrt-datad` 读取设备 `ubus/uci/sysfs` 与 QoS 日志，并在本机 `127.0.0.1:9460` 提供 HTTP/SSE 和白名单控制接口。上游的云端、自更新（OTA）、WebShell 和 `/ubus` 透传已删除。
+
+> U60 Pro（MU5250）装机包不用下面的 `service.sh`，而是 `/data/plugins/zwrt-datad/` + procd（`/etc/init.d/zwrt-datad`），见 manager 仓库。本页是上游的通用运行说明。
 
 ## 推荐启动方式
 
@@ -18,11 +20,10 @@ sh /data/zwrt-datad/service.sh status
 ```sh
 nohup /data/zwrt-datad/zwrt-datad -i 1000 \
   --auth-token-file /data/zwrt-datad/auth.token \
-  --webshell \
   >/dev/null 2>&1 </dev/null &
 ```
 
-`--auth-token-file` 现在是有效运行参数。文件首行去除首尾空白后作为 Bearer Token；指定了该参数但文件不存在或为空时，进程拒绝启动。`/healthz` 保持公开，其余数据和控制接口要求：
+`--auth-token-file` 现在是有效运行参数。文件首行去除首尾空白后作为 Bearer Token；指定了该参数但文件不存在或为空时，进程拒绝启动。回环主监听（9460）不要求 Token；`--lan-bind` 的 LAN 监听上，`/healthz` 保持公开，其余数据和控制接口要求：
 
 主监听若配置为非回环地址但未启用鉴权，datad 会拒绝启动，避免误把控制接口暴露到网络。对外提供内网访问时使用 `--lan-bind`，该监听始终要求鉴权。
 
@@ -32,9 +33,9 @@ Authorization: Bearer <token>
 
 也兼容仅供本机服务间调用的 `X-Auth-Token` 请求头。不要把 Token 写入前端静态文件。
 
-正式 `service.sh` 使用 `--webshell` 启用回环 WebShell。该接口不会在 9461 LAN
-监听开放，并且回环访问也必须携带有效 Token。首次启动会从 `/dev/urandom`
-生成 32 字节随机 Token，以 `0600` 原子保存；异常 Token 文件会令启动失败。
+`service.sh` 首次启动会从 `/dev/urandom` 生成 32 字节随机 Token，以 `0600`
+原子保存；异常 Token 文件会令启动失败。它仍带着 `--webshell`：WebShell 已删除，
+这个参数只为兼容旧启动脚本保留为隐藏的空开关，不起任何作用。
 
 不要把长期、无轮转的输出重定向到 `/tmp/*.log`。在常见 OpenWrt 设备中，`/tmp` 位于 tmpfs；如果某个扩展构建或诊断后端输出高频调试信息，日志文件会直接占用 RAM，表现为“可用内存持续下降”，并不等同于进程 RSS 泄漏。
 

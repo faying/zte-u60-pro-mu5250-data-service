@@ -35,13 +35,17 @@ echo "token length verified"
 case "$datad_test_token" in *[!0-9a-f]*) exit 1 ;; esac
 echo "token generated securely"
 
+# 回环 9460 不要 Token；LAN 9461 始终要 Token。
 test "$(curl -s -o /dev/null -w '%{http_code}' \
-    http://127.0.0.1:9460/webshell/status)" = 401
+    http://127.0.0.1:9460/state)" = 200
+test "$(curl -s -o /dev/null -w '%{http_code}' \
+    http://127.0.0.1:9461/state)" = 401
+test "$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer wrong-token" \
+    http://127.0.0.1:9461/state)" = 401
 test "$(curl -s -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer $datad_test_token" \
-    http://127.0.0.1:9461/webshell/status)" = 403
-curl -fsS -H "Authorization: Bearer $datad_test_token" \
-    http://127.0.0.1:9460/webshell/status | grep -q '"enabled":true'
+    http://127.0.0.1:9461/state)" = 200
 echo "listener policy verified"
 
 service_command stop >/dev/null

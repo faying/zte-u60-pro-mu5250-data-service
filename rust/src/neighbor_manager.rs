@@ -155,7 +155,7 @@ impl Manager {
         fs::set_permissions(&ring, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
         let mask = run.join("qtrace.cfg");
         let mut bytes = Vec::new();
-        for token in include_str!("../../src/neighbor/qtrace_mask.h")
+        for token in include_str!("qtrace_mask.h")
             .split(|c: char| c == ',' || c.is_whitespace() || c == '{' || c == '}' || c == ';')
         {
             if let Some(hex) = token.trim().strip_prefix("0x")

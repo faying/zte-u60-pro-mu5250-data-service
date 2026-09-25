@@ -1,7 +1,7 @@
 # zwrt-datad for the ZTE U60 Pro (MU5250)
 
 On-device data and control service: reads `ubus`, `uci`, `sysfs` and selected logs, and serves a stable JSON state over HTTP (`GET /state`) and SSE (`GET /events`) on `127.0.0.1:9460`.
-This is a fork of [33333s/zwrt-datad](https://github.com/33333s/zwrt-datad) with MU5250 fixes and a slow-data cache on `main`. **All built-in update sources are removed and auto-update is off.**
+This is a fork of [33333s/zwrt-datad](https://github.com/33333s/zwrt-datad) with MU5250 fixes and a slow-data cache on `main`. **The upstream self-updater (OTA), cloud client, WebShell and `/ubus` passthrough are removed; the binary never contacts an Internet host.**
 
 [中文](README.md) · [API](docs/API.md)
 
