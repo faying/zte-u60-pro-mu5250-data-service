@@ -42,6 +42,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `cell.lock_lte` | `pci`, `earfcn` |
 | `cell.lock_nr` | `pci`, `arfcn`, `band` |
 | `cell.unlock_all` | 无 |
+| `band.reset` | 无；原厂 `nwinfo_reset_band_cell_setting`，频段和小区锁定全部恢复默认 |
 | `sim.set_slot` | `slot`，设备侧编号 `1/2` |
 
 `cellular.set` 会先读取完整 `get_wwaniface` 对象，再覆盖调用方提供的字段，避免固件清空未指定的 PDP、配置档案等属性。

@@ -162,6 +162,10 @@ post '{"action":"multiwan.rule.set","params":{"section":"default_rule_v4","use_p
 post '{"action":"aggregation.set","params":{"enabled":true}}' >/dev/null
 post '{"action":"aggregation.set","params":{"enabled":false}}' >/dev/null
 post '{"action":"qos.clear","params":{}}' >/dev/null
+# 触屏锁频页（T13）：NR 的 nr5g_type 按原厂网页 SA="0"、NSA="1"；重置走原厂 reset
+post '{"action":"band.set_nr_sa","params":{"bands":"78"}}' >/dev/null
+post '{"action":"band.set_nr_nsa","params":{"bands":"41,78"}}' >/dev/null
+post '{"action":"band.reset","params":{}}' >/dev/null
 post '{"action":"wifi.txpower.apply","params":{"band":"2g","percent":90,"limit_dbm":19}}' >/dev/null
 post '{"action":"wifi.psm.set","params":{"section":"main_5g","mode":"off"}}' >/dev/null
 post '{"action":"wifi.txpower.set_dbm","params":{"band":"5g","dbm":17}}' >/dev/null
@@ -228,7 +232,7 @@ status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: applica
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["error"]["code"]=="invalid_parameter"' "$TMP/bad.json"
 
 curl -fsS "http://127.0.0.1:$PORT/capabilities" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==80; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert "discovery" not in d; assert "passthrough" not in d; assert d["transport"]==["http","sse"]'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==81; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert "discovery" not in d; assert "passthrough" not in d; assert d["transport"]==["http","sse"]'
 # R10：ubus 透传已删除，三个路由都必须 404
 route_status() {
     curl -sS -o /dev/null -w '%{http_code}' "$@"
@@ -279,6 +283,9 @@ for send in sends:
 PY
 ! grep -F '1;reboot' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'wireless.main_2g.ssid=Fixture New' "$MOCK_CALL_LOG" >/dev/null
+grep -F 'nwinfo_set_nrbandlock' "$MOCK_CALL_LOG" | grep -F '"nr5g_type":"0"' | grep -F '"nr5g_band":"78"' >/dev/null
+grep -F 'nwinfo_set_nrbandlock' "$MOCK_CALL_LOG" | grep -F '"nr5g_type":"1"' | grep -F '"nr5g_band":"41,78"' >/dev/null
+grep -F 'nwinfo_reset_band_cell_setting' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'wireless.main_2g.denymaclist=00:11:22:33:44:55' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'mwan3.zte_mwan2.timeout=5' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'mwan3.zte_mwan2.track_ip=8.8.8.8' "$MOCK_CALL_LOG" >/dev/null

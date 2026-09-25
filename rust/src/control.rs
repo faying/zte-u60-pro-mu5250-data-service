@@ -22,6 +22,7 @@ pub const ACTIONS: &[&str] = &[
     "cell.lock_lte",
     "cell.lock_nr",
     "cell.unlock_all",
+    "band.reset",
     "sim.set_slot",
     "wifi.set_dual_band",
     "wifi.set_module",
@@ -215,6 +216,15 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             .await
         }
         "cell.unlock_all" => unlock_all().await,
+        // 原厂「恢复默认频段/小区」：解开全部锁频和锁小区（触屏锁频页的重置按钮）。
+        "band.reset" => {
+            call(
+                "zte_nwinfo_api",
+                "nwinfo_reset_band_cell_setting",
+                json!({}),
+            )
+            .await
+        }
         "sim.set_slot" => sim_slot(params).await,
         "wifi.set_dual_band" => wifi_dual_band(params).await,
         "wifi.set_module" => {

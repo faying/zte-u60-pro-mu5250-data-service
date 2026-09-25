@@ -873,8 +873,8 @@ mod tests {
     #[test]
     fn capability_controls_match_complete_legacy_count() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 80);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 80);
+        assert_eq!(controls.len(), 81);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 81);
     }
 
     #[test]
