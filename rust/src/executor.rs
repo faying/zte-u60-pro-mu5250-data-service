@@ -212,9 +212,11 @@ impl Shared {
         r
     }
 
-    /// 把排队的任务按先后做完（包括做的过程中新来的）。
+    /// 安全点：按先后做完「进入时已在排队的」任务（快照计数），做的过程中新来的留给下一个安全点。
+    /// 控制任务和内部任务同一规则，所以持续有任务进来也挡不住采集轮和轮末心跳（V2-24）。
     async fn drain(self: &Arc<Self>) {
-        loop {
+        let n = lock(&self.queue).jobs.len();
+        for _ in 0..n {
             let job = {
                 let mut q = lock(&self.queue);
                 let job = q.jobs.pop_front();
@@ -230,6 +232,10 @@ impl Shared {
             };
             CTX.scope(ctx, job.fut).await;
         }
+    }
+
+    fn queued(&self) -> bool {
+        !lock(&self.queue).jobs.is_empty()
     }
 
     fn sample_interval(&self) -> Duration {
@@ -329,12 +335,14 @@ impl Shared {
                     last_round_end = Instant::now();
                     continue;
                 }
+                Some(_) if self.queued() => {}
                 Some(d) => {
                     tokio::select! {
                         _ = self.wake.notified() => {}
                         _ = tokio::time::sleep_until(d) => {}
                     }
                 }
+                None if self.queued() => {}
                 None => self.wake.notified().await,
             }
             self.drain().await;

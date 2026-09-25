@@ -890,3 +890,49 @@ async fn sms_event_updates_block_within_one_round() {
     tokio::time::sleep(Duration::from_millis(4000)).await;
     assert_eq!(exec.stats().rounds.load(Ordering::Relaxed), rounds + 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn rounds_and_heartbeats_continue_under_control_flood() {
+    // 持续灌控制任务和内部任务：每个安全点只做进入时已在排队的，采集轮和心跳照常发生。
+    let (exec, mock, sink) = setup(vec![spec("a", 0), spec("b", 0)], Config::default(), 1000);
+    mock.default_step("ctl.set", Step::Reply(json!({}), Duration::from_millis(200)));
+    mock.default_step("int.get", Step::Reply(json!({}), Duration::from_millis(100)));
+    let t0 = Instant::now();
+    exec.start_rounds(Arc::new(NoLegacy));
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut floods = Vec::new();
+    for _ in 0..4 {
+        let (e, stop) = (exec.clone(), stop.clone());
+        floods.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = e
+                    .control(async {
+                        call("ctl", "set", &json!({})).await.unwrap();
+                    })
+                    .await;
+            }
+        }));
+    }
+    for _ in 0..2 {
+        let (e, stop) = (exec.clone(), stop.clone());
+        floods.push(tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = e.call("int", "get", &json!({})).await;
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    stop.store(true, Ordering::Relaxed);
+    let hb = sink.heartbeats();
+    assert!(hb.len() >= 10, "心跳只有 {} 次", hb.len());
+    let mut prev = t0;
+    for (t, _) in &hb {
+        assert!(*t - prev <= Duration::from_secs(10), "{:?}", *t - prev);
+        prev = *t;
+    }
+    assert!(mock.times("a.list").len() >= 10);
+    assert!(mock.times("ctl.set").len() >= 100, "控制任务也一直在做");
+    for f in floods {
+        f.await.unwrap();
+    }
+}
