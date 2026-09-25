@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SSE client limit: 16 concurrent /events streams, the 17th gets 503, and a
-closed stream frees its slot.
+closed stream frees its slot. /v2/events shares the same 16 slots
+(docs/STATE_V2.md section 3) and starts with a snapshot event.
 
 Usage: rust_sse_limit_test.py PATH_TO_ZWRT_DATAD   (starts it against the mocks)
        rust_sse_limit_test.py PORT                 (tests an already running instance)
@@ -17,28 +18,33 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
-def connect(port):
+def connect(port, path="/events"):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
-    connection.request("GET", "/events")
+    connection.request("GET", path)
     return connection, connection.getresponse()
 
 
 def check(port):
     clients = []
     try:
-        for _ in range(16):
-            connection, response = connect(port)
-            assert response.status == 200, response.status
+        for i in range(16):
+            path = "/events" if i < 8 else "/v2/events"
+            connection, response = connect(port, path)
+            assert response.status == 200, (path, response.status)
+            if path == "/v2/events":
+                assert response.getheader("content-type") == "text/event-stream"
+                assert response.readline() == b"event: snapshot\n"
             clients.append((connection, response))
-        rejected, response = connect(port)
-        assert response.status == 503, response.status
-        response.read()
-        rejected.close()
+        for path in ("/events", "/v2/events"):
+            rejected, response = connect(port, path)
+            assert response.status == 503, (path, response.status)
+            response.read()
+            rejected.close()
 
         clients.pop(0)[0].close()
         deadline = time.monotonic() + 8
         while True:
-            replacement, response = connect(port)
+            replacement, response = connect(port, "/v2/events")
             if response.status == 200:
                 replacement.close()
                 break
@@ -111,7 +117,7 @@ def main():
         check(int(target))
     else:
         run_binary(pathlib.Path(target).resolve())
-    print("sse limit: 16 streams accepted, 17th rejected with 503, slot released PASS")
+    print("sse limit: 16 streams (/events + /v2/events) accepted, 17th rejected with 503, slot released PASS")
 
 
 if __name__ == "__main__":

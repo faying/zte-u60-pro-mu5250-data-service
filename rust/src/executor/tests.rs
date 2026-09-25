@@ -762,3 +762,64 @@ async fn call_without_executor_fails_instead_of_hanging() {
         assert!(e.to_string().contains("executor"), "{e}");
     }
 }
+
+/// 旧采集把 live 块的数据交进来（和 `state::collect` 一样经 `Hub::record`），每轮一个新值。
+struct FeedLive(Arc<Hub>, Arc<AtomicU64>);
+impl RoundDriver for FeedLive {
+    fn legacy(&self) -> BoxFuture<'static, ()> {
+        let (hub, n) = (self.0.clone(), self.1.clone());
+        Box::pin(async move {
+            let n = n.fetch_add(1, Ordering::Relaxed);
+            hub.record("live", Ok(json!({"system":{"uptime":n}})), Instant::now());
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn live_block_cadence_follows_round_length() {
+    let (exec, mock, sink) = setup(
+        vec![
+            spec("a", 0),
+            BlockSpec::derived("live", Box::new(crate::block::LivePolicy)),
+        ],
+        Config::default(),
+        1000,
+    );
+    let short = Step::Reply(json!({"x":1}), Duration::from_millis(100));
+    mock.default_step("a.list", short.clone());
+    // 第 4 轮的 a 很慢：这一轮 3.5 秒（超出预算）。
+    for _ in 0..3 {
+        mock.push("a.list", short.clone());
+    }
+    mock.push(
+        "a.list",
+        Step::Reply(json!({"x":1}), Duration::from_millis(3500)),
+    );
+    let t0 = Instant::now();
+    exec.start_rounds(Arc::new(FeedLive(exec.hub().clone(), Arc::default())));
+    tokio::time::sleep(Duration::from_millis(12_000)).await;
+    let live = sink.blocks("live");
+    let hb = sink.heartbeats();
+    // 每轮一次，和心跳一一对应、同一时刻，live 在心跳前一个号。
+    assert_eq!(live.len(), hb.len());
+    for (l, h) in live.iter().zip(&hb) {
+        assert_eq!(l.0, h.0);
+        assert_eq!(l.1.seq + 1, h.1);
+    }
+    // 节拍 = 采样间隔 + 这一轮的长度；慢的那一轮之后不补发。
+    let gaps: Vec<u64> = live
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0).as_millis() as u64)
+        .collect();
+    assert_eq!(live[0].0 - t0, Duration::from_millis(1100));
+    assert_eq!(&gaps[..4], [1100, 1100, 4500, 1100]);
+    assert_eq!(
+        live.len(),
+        7,
+        "12 秒里：1.1、2.2、3.3、7.8、8.9、10.0、11.1"
+    );
+    assert_eq!(
+        live.iter().map(|l| l.1.revision).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6, 7]
+    );
+}

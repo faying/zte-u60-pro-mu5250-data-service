@@ -13,6 +13,7 @@ mod server;
 mod sms;
 mod state;
 mod ubus;
+mod v2;
 mod wifi;
 
 use anyhow::Result;

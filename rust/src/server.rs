@@ -4,7 +4,7 @@ use crate::{
     executor::{self, Executor, RoundDriver},
     model::{DatadVersion, Snapshot},
     neighbor_manager::Manager as NeighborManager,
-    state,
+    state, v2,
 };
 use anyhow::Result;
 use axum::{
@@ -38,7 +38,10 @@ struct Inner {
     token: Option<String>,
     sessions: Mutex<Sessions>,
     device_session: Mutex<Option<DeviceSession>>,
+    /// `/events` 和 `/v2/events` 共用的 SSE 连接名额。
     sse_slots: Arc<Semaphore>,
+    /// `/v2` 的流（epoch + broadcast），事件由 `Hub` 在锁里发进来。
+    feed: Arc<v2::Feed>,
     neighbor: Mutex<NeighborManager>,
 }
 
@@ -54,7 +57,11 @@ impl App {
         token: Option<String>,
         neighbor_enabled: bool,
     ) -> Result<Self> {
-        let hub = Arc::new(Hub::new(block::phase1_blocks(), Box::new(block::NoSink)));
+        let feed = v2::Feed::new(v2::CAPACITY);
+        let hub = Arc::new(Hub::new(
+            block::phase1_blocks(),
+            Box::new(v2::FeedSink(feed.clone())),
+        ));
         let cfg = executor::Config {
             cache: state::cache_enabled(),
             ..executor::Config::default()
@@ -90,6 +97,7 @@ impl App {
                 sessions: Mutex::new(Sessions::default()),
                 device_session: Mutex::new(None),
                 sse_slots: Arc::new(Semaphore::new(16)),
+                feed,
             }),
         };
         app.inner.exec.start_rounds(Arc::new(app.clone()));
@@ -142,6 +150,8 @@ impl App {
             .route("/version", get(version))
             .route("/state", get(snapshot))
             .route("/events", get(events))
+            .route("/v2/events", get(v2_events))
+            .route("/v2/state", get(v2_state))
             .route("/capabilities", get(capabilities))
             .route("/control", post(control));
         if open_auth_routes {
@@ -387,13 +397,17 @@ async fn capabilities() -> Json<Value> {
     }))
 }
 
+fn sse_limit() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"ok":false,"error":{"code":"sse_client_limit","message":"too many SSE clients"}})),
+    )
+        .into_response()
+}
+
 async fn events(State(app): State<App>) -> Response {
     let Ok(permit) = app.inner.sse_slots.clone().try_acquire_owned() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"ok":false,"error":{"code":"sse_client_limit","message":"too many SSE clients"}})),
-        )
-            .into_response();
+        return sse_limit();
     };
     let stream = WatchStream::new(app.inner.tx.subscribe()).map(move |v| {
         let _keep_permit_alive = &permit;
@@ -403,6 +417,19 @@ async fn events(State(app): State<App>) -> Response {
         .keep_alive(axum::response::sse::KeepAlive::new())
         .into_response()
 }
+/// `/v2/events`（STATE_V2.md 第 2–4 节）：和 `/events` 共用连接名额，满了同样 503。
+async fn v2_events(State(app): State<App>) -> Response {
+    let Ok(permit) = app.inner.sse_slots.clone().try_acquire_owned() else {
+        return sse_limit();
+    };
+    v2::events_response(app.inner.exec.hub(), &app.inner.feed, permit)
+}
+
+/// `/v2/state`（V2-6）：调试用，内容同 snapshot。
+async fn v2_state(State(app): State<App>) -> Response {
+    v2::state_response(app.inner.exec.hub(), &app.inner.feed)
+}
+
 async fn control(
     State(app): State<App>,
     method: Method,

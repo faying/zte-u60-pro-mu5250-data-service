@@ -50,14 +50,36 @@ fn power_fields(
             .as_object()
             .is_some_and(|v| v.keys().any(|k| k.starts_with("battery_")))
     {
-        fields.insert("battery".into(),json!({"percent":integer_or(&battery,"battery_capacity",-1),"temp":integer(&battery,"battery_temperature"),"online":integer(&battery,"battery_online"),"health":integer(&battery,"battery_health"),"time_to_full":integer_or(&battery,"battery_time_to_full",-1),"charging":integer(&charger,"charge_status"),"charger_connect":integer(&charger,"charger_connect"),"charger_type":integer(&charger,"charger_type"),"chg_uv":read_i64(host_path("/sys/class/power_supply/usb/voltage_now")),"chg_ua":read_i64(host_path("/sys/class/power_supply/usb/current_now")),"bat_uv":read_i64(host_path("/sys/class/power_supply/battery/voltage_now")),"bat_ua":read_i64(host_path("/sys/class/power_supply/battery/current_now"))}));
+        fields.insert("battery".into(), battery_object(&battery, &charger));
     }
-    if let Some(mode) = charger
+    if let Some(power) = power_object(&charger) {
+        fields.insert("power".into(), power);
+    }
+}
+
+/// 旧 `/state` 的 `battery` 对象（`/v2` 的 battery 块同形）。
+fn battery_object(battery: &Value, charger: &Value) -> Value {
+    json!({"percent":integer_or(battery,"battery_capacity",-1),"temp":integer(battery,"battery_temperature"),"online":integer(battery,"battery_online"),"health":integer(battery,"battery_health"),"time_to_full":integer_or(battery,"battery_time_to_full",-1),"charging":integer(charger,"charge_status"),"charger_connect":integer(charger,"charger_connect"),"charger_type":integer(charger,"charger_type"),"chg_uv":read_i64(host_path("/sys/class/power_supply/usb/voltage_now")),"chg_ua":read_i64(host_path("/sys/class/power_supply/usb/current_now")),"bat_uv":read_i64(host_path("/sys/class/power_supply/battery/voltage_now")),"bat_ua":read_i64(host_path("/sys/class/power_supply/battery/current_now"))})
+}
+
+/// 旧 `/state` 的 `power` 对象；充电器回复里没有 `direct_power_supply_mode` 时旧 `/state` 不输出它。
+fn power_object(charger: &Value) -> Option<Value> {
+    let mode = charger
         .get("direct_power_supply_mode")
-        .and_then(Value::as_str)
-    {
-        fields.insert("power".into(),json!({"direct_supply":{"supported":true,"enabled":match mode{"enable"=>json!(true),"disable"=>json!(false),_=>Value::Null},"mode":if matches!(mode,"enable"|"disable"){json!(mode)}else{Value::Null}}}));
-    }
+        .and_then(Value::as_str)?;
+    Some(
+        json!({"direct_supply":{"supported":true,"enabled":match mode{"enable"=>json!(true),"disable"=>json!(false),_=>Value::Null},"mode":if matches!(mode,"enable"|"disable"){json!(mode)}else{Value::Null}}}),
+    )
+}
+
+/// `/v2` battery 块的 data = 旧 `/state` 的 `battery`（充电字段取充电器块最近一次读成功的回复）。
+pub(crate) fn battery_v2(raw: &Value, other: &dyn Fn(&str) -> Option<Value>) -> Value {
+    battery_object(raw, &other("charger").unwrap_or(Value::Null))
+}
+
+/// `/v2` charger 块的 data = 旧 `/state` 的 `power`；旧 `/state` 没有 `power` 时是 `{}`。
+pub(crate) fn charger_v2(raw: &Value, _other: &dyn Fn(&str) -> Option<Value>) -> Value {
+    power_object(raw).unwrap_or_else(|| json!({}))
 }
 
 pub(crate) fn cache_enabled() -> bool {
@@ -1085,6 +1107,9 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         json!({"source_module":"web","cid":1,"connect_status":""}),
     )
     .await;
+    // `/v2` 派生块的健康：信号块看 nwinfo，live 块看 system info 和实时流量。
+    let signal_ok = net.is_ok();
+    let live_ok = info.is_ok() && traffic.is_ok();
     let common = object(common);
     let board = object(board);
     let info = object(info);
@@ -1693,6 +1718,26 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     fields.insert("system".into(),json!({"uptime":integer(&info,"uptime"),"cpu_temp":cpu_temp,"cpu_usage":cpu_usage,"mem_used_pct":mp,"mem_total":mt,"mem_avail":ma,"model":string(&board,"model"),"hostname":string(&board,"hostname"),"fw":string(release,"description"),"sw_version":sw,"imei":string(&imei,"imei")}));
     fields.insert("sample_interval_ms".into(), json!(sample_interval_ms));
     fields.insert("runtime".into(), runtime);
+    // `/v2` 的派生块（不多调 ubus）：信号块 = `net`，live 块 = `system`、`runtime`、`traffic`。
+    let now = tokio::time::Instant::now();
+    hub.record(
+        "signal",
+        if signal_ok {
+            Ok(fields["net"].clone())
+        } else {
+            Err("zte_nwinfo_api nwinfo_get_netinfo failed".into())
+        },
+        now,
+    );
+    hub.record(
+        "live",
+        if live_ok {
+            Ok(json!({"system":fields["system"],"runtime":fields["runtime"],"traffic":fields["traffic"]}))
+        } else {
+            Err("system info or zwrt_data get_wwandst failed".into())
+        },
+        now,
+    );
     Snapshot {
         ts: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1786,7 +1831,7 @@ mod tests {
         hub.record_read(0, Err("timeout".into()), now);
         hub.record_read(1, Err("timeout".into()), now);
         assert_eq!(render(&hub), failed);
-        assert_eq!(hub.view("battery").unwrap().data["battery_capacity"], 80);
+        assert_eq!(hub.view("battery").unwrap().data["percent"], 80);
         // 只有电池 stale：电池不出，充电器照常。
         hub.record_read(1, Ok(json!({"direct_power_supply_mode":"disable"})), now);
         let f = render(&hub);
@@ -1796,6 +1841,32 @@ mod tests {
         hub.record_read(0, Ok(json!({"battery_capacity":81})), now);
         hub.round_end(now + Duration::from_secs(16), Duration::from_secs(1));
         assert_eq!(render(&hub), failed);
+    }
+
+    #[test]
+    fn v2_block_data_same_shape_as_legacy_state() {
+        use crate::block::{Hub, NoSink, phase1_blocks};
+        let hub = Hub::new(phase1_blocks(), Box::new(NoSink));
+        let now = tokio::time::Instant::now();
+        let bat = json!({"battery_capacity":80,"battery_online":1,"battery_temperature":300});
+        let chg =
+            json!({"direct_power_supply_mode":"enable","charge_status":1,"charger_connect":1});
+        hub.record_read(0, Ok(bat.clone()), now);
+        hub.record_read(1, Ok(chg.clone()), now);
+        let mut f = Map::new();
+        power_fields(&mut f, "MU5250", Ok(bat), Ok(chg));
+        // 电池先读、充电器后读：充电器读成功后电池的 data 跟着重算。
+        assert_eq!(hub.view("battery").unwrap().data, f["battery"]);
+        assert_eq!(hub.view("battery").unwrap().data["charging"], 1);
+        assert_eq!(hub.view("charger").unwrap().data, f["power"]);
+        // 充电器回复里没有 direct_power_supply_mode：旧 /state 没有 power，/v2 是 {}。
+        hub.record_read(1, Ok(json!({"charge_status":0})), now);
+        assert_eq!(hub.view("charger").unwrap().data, json!({}));
+        assert_eq!(hub.view("battery").unwrap().data["charging"], 0);
+        // 电池自己读成功 1 次、跟着充电器变 2 次。
+        assert_eq!(hub.view("battery").unwrap().revision, 3);
+        // 旧接口拿到的仍是原始回复。
+        assert_eq!(hub.legacy("charger"), Ok(json!({"charge_status":0})));
     }
 
     #[test]
