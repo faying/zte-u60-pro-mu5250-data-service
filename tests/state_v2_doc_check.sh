@@ -69,7 +69,7 @@ check() {
   fi
   rules=$(echo "$list" | awk '{print $1}' | sort -u | wc -l | tr -d ' ')
   tests=$(echo "$list" | wc -l | tr -d ' ')
-  echo "ok：$rules 条规则，$tests 个测试名（$doc）"
+  echo "ok：$rules 条规则，$tests 个测试名（${doc}）"
 }
 
 self_test() {
