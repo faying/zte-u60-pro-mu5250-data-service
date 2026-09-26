@@ -492,6 +492,29 @@ fn pinned_mode(sel: &str) -> Option<&'static str> {
     Some("限定了制式")
 }
 
+/// The radio-mode preference (`net_select`) in words: the firmware's 14 values
+/// (zte_topsw_nwinfo) are all named, anything else comes back as-is, "" as "-".
+/// B27 reports both WL_AND_5G and TCHGWL_5G for automatic.
+fn net_select_word(sel: &str) -> String {
+    const K: &[(&str, &str)] = &[
+        ("WL_AND_5G", "自动"), ("TCHGWL_5G", "自动"),
+        ("Only_5G", "只用 5G SA"), ("LTE_AND_5G", "只用 5G NSA"),
+        ("4G_AND_5G", "4G + 5G"), ("WL_AND_NSA", "5G NSA + 4G + 3G"),
+        ("Only_LTE", "只用 4G"), ("WCDMA_AND_LTE", "4G + 3G"),
+        ("GSM_AND_LTE", "4G + 2G"), ("TDSCDMA_AND_LTE", "4G + TD-SCDMA"),
+        ("Only_WCDMA", "只用 3G"), ("Only_GSM_WCDMA", "只用 3G 和 2G"),
+        ("Only_TDSCDMA", "只用 TD-SCDMA"), ("Only_GSM", "只用 2G"),
+    ];
+    if sel.is_empty() {
+        return "-".into();
+    }
+    K.iter().find(|k| k.0 == sel).map_or_else(|| sel.to_string(), |k| k.1.to_string())
+}
+
+fn net_select_is_auto(sel: &str) -> bool {
+    sel == "WL_AND_5G" || sel == "TCHGWL_5G"
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Tone {
@@ -918,6 +941,10 @@ pub struct NetView {
     pub ca_sub: String,
     /// Status-bar dot colour: 2 green, 1 orange, 0 red, -1 none.
     pub bars_tier: i64,
+    /// Radio-mode preference in words (自动 / 只用 4G …), "-" when unknown.
+    pub mode_word: String,
+    /// The preference is one of the automatic values.
+    pub mode_auto: bool,
 }
 
 fn carriers(d: &Data, v: &mut NetView) {
@@ -1147,6 +1174,8 @@ pub fn net_view(state: &Value) -> NetView {
 
     summary(&d, &mut v);
     v.bars_tier = bars_tier(d.bars);
+    v.mode_word = net_select_word(&d.net_select);
+    v.mode_auto = net_select_is_auto(&d.net_select);
     v
 }
 

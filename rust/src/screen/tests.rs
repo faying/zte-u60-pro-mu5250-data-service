@@ -32,6 +32,11 @@ fn matches_the_screens_c_on_the_corpus() {
         let got = serde_json::to_value(net_view(&state)).unwrap();
         let mut want = case["view"].clone();
         want.as_object_mut().unwrap().remove("parsed");
+        // fields added after the corpus was frozen: tested on their own below
+        let mut got = got;
+        for k in ["mode_word", "mode_auto"] {
+            got.as_object_mut().unwrap().remove(k);
+        }
         n += 1;
         if got != want {
             let (g, w) = (got.as_object().unwrap(), want.as_object().unwrap());
@@ -339,4 +344,23 @@ fn phone_style_labels_and_families() {
     ] {
         assert_eq!((net_label(raw), rat_family(raw)), (want, fam), "{raw}");
     }
+}
+
+#[test]
+fn radio_mode_words() {
+    assert_eq!(net_select_word("TCHGWL_5G"), "自动");
+    assert_eq!(net_select_word("WL_AND_5G"), "自动");
+    assert_eq!(net_select_word("Only_5G"), "只用 5G SA");
+    assert_eq!(net_select_word("LTE_AND_5G"), "只用 5G NSA");
+    assert_eq!(net_select_word("Only_GSM_WCDMA"), "只用 3G 和 2G");
+    assert_eq!(net_select_word(""), "-");
+    assert_eq!(net_select_word("SOMETHING_NEW"), "SOMETHING_NEW");
+    assert!(net_select_is_auto("TCHGWL_5G") && net_select_is_auto("WL_AND_5G") && !net_select_is_auto("Only_LTE"));
+    let mut state: Value = serde_json::from_str(
+        &std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/golden/normal.state.json")).unwrap(),
+    )
+    .unwrap();
+    state["net"]["net_select"] = "Only_LTE".into();
+    let v = net_view(&state);
+    assert_eq!((v.mode_word.as_str(), v.mode_auto), ("只用 4G", false));
 }
