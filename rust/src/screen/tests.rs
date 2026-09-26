@@ -300,3 +300,43 @@ fn logos_and_imsi() {
     assert_eq!(operator_logo(0, 0), None);
     assert_eq!(operator_logo(234, 15), None);
 }
+
+#[test]
+fn phone_style_labels_and_families() {
+    for (raw, want, fam) in [
+        ("GSM", "2G", "GSM"),
+        ("GPRS", "2G", "GPRS"),
+        ("EDGE", "2G", "EDGE"),
+        ("CDMA", "2G", "CDMA 1X"),
+        ("1xRTT", "2G", "CDMA 1X"),
+        ("WCDMA", "3G", "WCDMA"),
+        ("UMTS", "3G", "WCDMA"),
+        ("HSPA", "3G", "HSPA"),
+        ("HSPA+", "3G", "HSPA+"),
+        ("DC-HSPA+", "3G", "HSPA+"),
+        ("TD-SCDMA", "3G", "TD-SCDMA"),
+        ("CDMA2000", "3G", "CDMA2000"),
+        ("EVDO", "3G", "CDMA2000"),
+        ("eHRPD", "3G", "CDMA2000"),
+        ("LTE", "4G", "LTE"),
+        ("TD-LTE", "4G", "LTE"),
+        ("FDD-LTE", "4G", "LTE"),
+        ("4G", "4G", "LTE"),
+        ("LTE", "4G", "LTE"),
+        ("LTE-A", "4G", "LTE"),
+        ("LTE_CA", "4G", "LTE"),
+        ("4G+", "4G", "LTE"),
+        ("SA", "5G", "NR"),
+        ("NSA", "5G", "NR"),
+        ("ENDC", "5G", "NR"),
+        ("SA", "5G", "NR"),
+        ("NSA", "5G", "NR"),
+        ("SA", "5G", "NR"),
+        ("5G-A", "5G-A", "NR"),
+        ("LIMITED_SERVICE", "", ""),
+        ("LIMITED_SERVICE_SA", "", ""),
+        ("", "", ""),
+    ] {
+        assert_eq!((net_label(raw), rat_family(raw)), (want, fam), "{raw}");
+    }
+}

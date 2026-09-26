@@ -5,7 +5,8 @@
 //! 一条规则都没变，这里刻意照着 C 的读法：同样的字段长度截断、`atoi`/`atof`/`sscanf`
 //! 的前缀解析、`(int)` 向零取整、`%.0f`/`%.1f` 的写法。`tests/fixtures/screen_net_corpus.jsonl`
 //! 是 C 对 1700 多份 /state 算出的结果，测试要求这里逐字段一样
-//! （生成方法见 touch-ui `tests/parity/gen.py`）。
+//! （生成工具在 touch-ui tag `parity-net-v1` 的 `tests/parity/`；那之后 C 里的规则已删除，
+//! 这份样本就是固定的参照，改规则时连同样本和 `screen/tests.rs` 一起改）。
 //!
 //! 不在这里的：大字换结论前的 15 秒稳定、「已 N 分钟」无服务计时——那是「这块屏
 //! 显示过什么、什么时候」，留在屏幕上。
