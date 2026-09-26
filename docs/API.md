@@ -89,6 +89,30 @@ data: {"ts":1782396733,...}
 
 ```
 
+### `GET /v2/screen`
+
+触屏首页信号卡和状态栏要显示的结论，由当前这份 `/state` 快照算出（`rust/src/screen.rs`）。
+这些规则原来在触屏的 C 里，2026-09-26 搬到这里，屏幕只负责画；为了一条规则都不变，
+`rust/tests/fixtures/screen_net_corpus.jsonl` 里是 C 对 1700 多份快照算出的结果，测试要求逐字段相同。
+
+不是旧接口，不冻结；靠 `v` 区分版本。`ts` 是算它用的那份快照的 `ts`。
+内容只随快照变化，订阅 `/events` 的客户端在收到新快照后读一次即可。
+
+```jsonc
+{ "v": 1, "ts": 1782396733,
+  "net": {
+    "story": { "headline": "慢：信号弱", "hint": "RSRP -115：离基站远，靠窗通常好些", "tone": "warn",
+               "cause": "weak", "rat": "5G", "sig": "弱", "sig_tone": "bad", "noise": "中", "noise_tone": "warn",
+               "load": "", "limit": "—", "link": "单载波 · 带宽充足" },
+    "carriers": [ { "kind": "nr", "band": 0, "label": "78", "label_short": "n78", "bw": 100, "active": true,
+                    "pci": 17, "arfcn": 627264, "rsrp": "-115", "rsrq": "-11", "sinr": "5.5" } ],
+    "ca_val": "单载波", "ca_sub": "↓ n78 100M   ↑ n78",
+    "fine": "5G SA", "name": "中国移动", "where": "本地", "logo": "china-mobile",
+    "nosvc": false, "sim_usable": true, "other": false, "roam": false, "roam_known": true,
+    "bars_tier": 0, "act_n": 1, "act_bw": 100, "act_nr": 1, "act_lte": 0, "cfg": 1,
+    "nr_band0": 78, "nr_mhz": 100, "have_home": true, "home_mcc": 460, "home_mnc": 0 } }
+```
+
 ### `GET /capabilities`
 
 返回内部协议版本、支持的控制动作和事件类型。

@@ -6,6 +6,7 @@ mod cooling;
 mod executor;
 mod extra_wifi;
 mod model;
+mod screen;
 mod neighbor;
 mod neighbor_manager;
 mod qos;

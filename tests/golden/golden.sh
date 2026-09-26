@@ -131,6 +131,17 @@ capture() {
     done
     curl -fsS "http://127.0.0.1:$PORT/state" >"$OUT/$name.state.json"
     curl -sN --max-time 1 "http://127.0.0.1:$PORT/events" >"$OUT/$name.events.raw" || true
+    # /v2/screen（新接口，不进 golden）：能回、版本对、从同一份快照算出结论
+    curl -fsS "http://127.0.0.1:$PORT/v2/screen" >"$TMP/$name.screen.json" ||
+        { echo "golden: $name 的 /v2/screen 没回" >&2; exit 1; }
+    python3 - "$TMP/$name.screen.json" "$OUT/$name.state.json" "$name" <<'PY' || exit 1
+import json, sys
+s = json.load(open(sys.argv[1])); st = json.load(open(sys.argv[2]))
+assert s["v"] == 1 and s["ts"] == st["ts"], "v/ts"
+assert s["net"]["story"]["headline"], "empty headline"
+if sys.argv[3] == "normal":
+    assert s["net"]["story"]["headline"] == "顺畅", s["net"]["story"]
+PY
     kill "$PID" 2>/dev/null || true
     wait "$PID" 2>/dev/null || true
     PID=

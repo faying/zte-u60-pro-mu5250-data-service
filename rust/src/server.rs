@@ -164,6 +164,7 @@ impl App {
             .route("/events", get(events))
             .route("/v2/events", get(v2_events))
             .route("/v2/state", get(v2_state))
+            .route("/v2/screen", get(v2_screen))
             .route("/capabilities", get(capabilities))
             .route("/control", post(control));
         if open_auth_routes {
@@ -440,6 +441,19 @@ async fn v2_events(State(app): State<App>) -> Response {
 /// `/v2/state`（V2-6）：调试用，内容同 snapshot。
 async fn v2_state(State(app): State<App>) -> Response {
     v2::state_response(app.inner.exec.hub(), &app.inner.feed)
+}
+
+/// `/v2/screen`：触屏首页信号卡和状态栏的结论（screen.rs），从当前这份 /state 算。
+/// 不冻结（不是旧接口），靠 `v` 区分版本；`ts` 就是算它用的那份快照的 `ts`。
+async fn v2_screen(State(app): State<App>) -> Json<Value> {
+    let snap = app.snapshot().await;
+    let ts = snap.ts;
+    let state = serde_json::to_value(&snap).unwrap_or(Value::Null);
+    Json(serde_json::json!({
+        "v": crate::screen::SCREEN_VERSION,
+        "ts": ts,
+        "net": crate::screen::net_view(&state),
+    }))
 }
 
 async fn control(
