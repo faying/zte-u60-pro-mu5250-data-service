@@ -1237,6 +1237,7 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         "zwrt_tr069",
         "zwrt_router",
         "zte_nwinfo",
+        "zwrt_zte_nwinfo",
         "wireless",
         "mwan3",
     ];
@@ -1293,6 +1294,21 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         ("nr_nsa_supported_bands", "nr5g_nsa_band_lock"),
     ] {
         net.insert(to.into(), json!(string(&raw_net, from)));
+    }
+    // The *_band_lock fields are the current lock set: after locking to n78
+    // they read "78", so they cannot list what the modem supports. The stock
+    // web UI takes the choices from zwrt_zte_nwinfo.default_band_lock (the
+    // full set a band reset goes back to); use it, and keep the lock field
+    // only as a fallback for firmware without that section.
+    for (to, opt) in [
+        ("lte_supported_bands", "default_lte_ext_band_lock"),
+        ("nr_sa_supported_bands", "default_nr5g_sa_band_lock"),
+        ("nr_nsa_supported_bands", "default_nr5g_nsa_band_lock"),
+    ] {
+        let v = uci_get(&uci_sets, &format!("zwrt_zte_nwinfo.default_band_lock.{opt}"));
+        if !v.is_empty() {
+            net.insert(to.into(), json!(v));
+        }
     }
     for (to, from) in [
         ("bars", "signalbar"),
