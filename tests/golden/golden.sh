@@ -132,7 +132,8 @@ capture() {
     curl -fsS "http://127.0.0.1:$PORT/state" >"$OUT/$name.state.json"
     curl -sN --max-time 1 "http://127.0.0.1:$PORT/events" >"$OUT/$name.events.raw" || true
     # /v2/screen（新接口，不进 golden）：能回、版本对、从同一份快照算出结论
-    curl -fsS "http://127.0.0.1:$PORT/v2/screen" >"$TMP/$name.screen.json" ||
+    # HTTP/1.0 + Connection: close, as the touch screen asks (screen_feed.c)
+    curl -fsS --http1.0 "http://127.0.0.1:$PORT/v2/screen" >"$TMP/$name.screen.json" ||
         { echo "golden: $name 的 /v2/screen 没回" >&2; exit 1; }
     python3 - "$TMP/$name.screen.json" "$OUT/$name.state.json" "$name" <<'PY' || exit 1
 import json, sys
