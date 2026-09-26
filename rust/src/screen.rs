@@ -828,6 +828,8 @@ pub struct Carrier {
     pub label: String,
     /// Summary label: n78 / B3.
     pub label_short: String,
+    /// Row colour of the SINR: ≥ 13 ok, ≥ 0 warn, else bad.
+    pub sinr_tone: Tone,
     #[serde(skip)]
     rsrp_v: f64,
     #[serde(skip)]
@@ -858,6 +860,7 @@ fn parse_ca(s: &str, max: usize, nr: bool) -> Vec<Carrier> {
             sinr: String::new(),
             label: String::new(),
             label_short: String::new(),
+            sinr_tone: Tone::Ok,
             rsrp_v: rsrp,
             rsrq_v: rsrq,
             sinr_v: sinr,
@@ -932,6 +935,7 @@ fn carriers(d: &Data, v: &mut NetView) {
             sinr: String::new(),
             label: String::new(),
             label_short: String::new(),
+            sinr_tone: Tone::Ok,
             rsrp_v: d.nr_rsrp as f64,
             rsrq_v: d.nr_rsrq as f64,
             sinr_v: atof(if d.nr_snr.is_empty() { "0" } else { &d.nr_snr }),
@@ -966,6 +970,7 @@ fn carriers(d: &Data, v: &mut NetView) {
                 sinr: String::new(),
                 label: String::new(),
                 label_short: String::new(),
+                sinr_tone: Tone::Ok,
                 rsrp_v: d.lte_rsrp as f64,
                 rsrq_v: d.lte_rsrq as f64,
                 sinr_v: lte_snr,
@@ -988,6 +993,13 @@ fn carriers(d: &Data, v: &mut NetView) {
         c.rsrp = fmt0(c.rsrp_v);
         c.rsrq = fmt0(c.rsrq_v);
         c.sinr = fmt1(c.sinr_v);
+        c.sinr_tone = if c.sinr_v >= 13.0 {
+            Tone::Ok
+        } else if c.sinr_v >= 0.0 {
+            Tone::Warn
+        } else {
+            Tone::Bad
+        };
         if c.active {
             v.act_n += 1;
             v.act_bw += c.bw;
