@@ -13,6 +13,7 @@ use crate::ubus::blob::{self, MsgHdr, attr, msg_type, status};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
+    os::fd::AsFd,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -72,9 +73,12 @@ struct State {
     next_client: u32,
 }
 
+/// 一条连接：服务任务，和同一个 socket 的一份 dup（stop 时用它 shutdown，dup 失败时为 None）。
+type Conn = (JoinHandle<()>, Option<std::os::unix::net::UnixStream>);
+
 struct Server {
     accept: JoinHandle<()>,
-    conns: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    conns: Arc<Mutex<Vec<Conn>>>,
 }
 
 pub struct MockUbusd {
@@ -179,20 +183,33 @@ impl MockUbusd {
         let accept = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 counter.fetch_add(1, Ordering::SeqCst);
+                let dup = stream
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .ok()
+                    .map(std::os::unix::net::UnixStream::from);
                 let h = tokio::spawn(serve(stream, state.clone()));
-                conns2.lock().unwrap().push(h);
+                conns2.lock().unwrap().push((h, dup));
             }
         });
         self.server = Some(Server { accept, conns });
     }
 
     /// 停止：关掉监听和所有连接（等它们真的关掉再返回），删掉 socket 文件。
+    ///
+    /// 连接先 shutdown 再关：只关本进程的 fd 不够。整套测试并行时，别的用例起子进程的瞬间
+    /// （fork 到 exec 之间）子进程也拿着这些 fd，socket 就还活着——客户端这时写旧连接会成功，
+    /// 等子进程 exec 关掉它，客户端读到 ECONNRESET，而不是 ubusd 重启该有的「写不进去」
+    /// （ubus_ubusd_restart_reconnects 曾因此约一成失败）。shutdown 作用在 socket 本身，谁拿着都一样。
     pub async fn stop(&mut self) {
         if let Some(s) = self.server.take() {
             s.accept.abort();
             let _ = s.accept.await;
-            let handles: Vec<_> = s.conns.lock().unwrap().drain(..).collect();
-            for h in handles {
+            let conns: Vec<_> = s.conns.lock().unwrap().drain(..).collect();
+            for (h, dup) in conns {
+                if let Some(d) = &dup {
+                    let _ = d.shutdown(std::net::Shutdown::Both);
+                }
                 h.abort();
                 let _ = h.await;
             }
@@ -206,13 +223,29 @@ impl MockUbusd {
         self.stop().await;
         self.start();
     }
+
+    /// 替「正在 fork 的子进程」多拿一份现有连接的服务端 socket（测 stop 不靠「最后一个 fd 关掉」）。
+    pub fn hold_server_sockets(&self) -> Vec<std::os::unix::net::UnixStream> {
+        let Some(s) = &self.server else {
+            return Vec::new();
+        };
+        s.conns
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, dup)| dup.as_ref()?.try_clone().ok())
+            .collect()
+    }
 }
 
 impl Drop for MockUbusd {
     fn drop(&mut self) {
         if let Some(s) = self.server.take() {
             s.accept.abort();
-            for h in s.conns.lock().unwrap().drain(..) {
+            for (h, dup) in s.conns.lock().unwrap().drain(..) {
+                if let Some(d) = &dup {
+                    let _ = d.shutdown(std::net::Shutdown::Both);
+                }
                 h.abort();
             }
         }

@@ -425,6 +425,28 @@ async fn ubus_ubusd_restart_reconnects() {
 }
 
 #[tokio::test]
+async fn ubus_ubusd_restart_reconnects_while_socket_held_elsewhere() {
+    // 整套测试并行时，别的用例起子进程的瞬间子进程也拿着 mock 的 fd（见 MockUbusd::stop）。
+    // 这里替它多拿一份：mock 重启后旧连接照样写不进去，客户端照样重连重发。
+    let mut m = MockUbusd::start_new().await;
+    m.add_method("system", 1, "info", json!({"n":1}));
+    let mut c = client(&m);
+    assert!(c.call("system", "info", &json!({})).await.is_ok());
+    let held = m.hold_server_sockets();
+    assert_eq!(held.len(), 1);
+
+    m.restart().await;
+    m.change_id("system", 2);
+    assert_eq!(
+        c.call("system", "info", &json!({})).await.unwrap(),
+        Some(json!({"n":1}))
+    );
+    assert_eq!(c.stats().connects, 2);
+    assert_eq!(m.invokes("?"), 0);
+    drop(held);
+}
+
+#[tokio::test]
 async fn ubus_status_errors_and_no_data() {
     let m = MockUbusd::start_new().await;
     m.add_method("svc", 5, "get", json!({"v":1}));
