@@ -4,6 +4,7 @@
 //! - `client`：`UbusClient`（HELLO/LOOKUP/INVOKE/DATA/STATUS，seq+peer 过滤，超时重连，LOOKUP 缓存与失效），
 //!   `UbusError`、`RoundSkips`（本轮跳过超时对象）。
 //! - `backend`：`ZWRT_DATAD_UBUS=cli|socket` 选后端，`UbusBackend` trait、`Backend`。
+//! - `compare`：`zwrt-datad --ubus-compare 对象:方法 …`，同一个只读调用经 socket 后端和 `ubus call` 各做一遍比结果（上机前核对协议）。
 //!
 //! 执行者（`executor.rs`，T4）持有一个 `Backend`，datad 的全部 ubus 调用都经过它。
 //! 客户端里有些接口只给测试和日志用（统计、缓存查询），所以整个模块允许未使用。
@@ -12,6 +13,7 @@
 pub mod backend;
 pub mod blob;
 pub mod client;
+pub mod compare;
 pub mod listen;
 
 #[cfg(test)]

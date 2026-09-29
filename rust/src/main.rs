@@ -73,6 +73,10 @@ async fn main() -> Result<()> {
     if raw.get(1).map(String::as_str) == Some("--neighbor-parse") {
         std::process::exit(neighbor::parse_cli(&raw[2..]));
     }
+    // 只读核对 socket 后端和 `ubus call` 的结果（ubus/compare.rs）；不起服务、不写文件。
+    if raw.get(1).map(String::as_str) == Some("--ubus-compare") {
+        std::process::exit(ubus::compare::run(&raw[2..]).await);
+    }
     if raw.get(1).map(String::as_str) == Some("--compare-state-shape") {
         match model::compare_state_shape(&raw[2..]) {
             Ok(value) => {
