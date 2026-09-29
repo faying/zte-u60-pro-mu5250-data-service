@@ -1,76 +1,78 @@
-# ZTE U60 Pro（MU5250）数据服务：zwrt-datad
+# ZTE U60 Pro (MU5250) data service: zwrt-datad
 
-`zwrt-datad` 跑在设备本机，把 `ubus`、`uci`、`sysfs` 和必要的设备日志整理成稳定的 JSON 状态，通过 HTTP 和 SSE 提供给触屏界面、脚本和其他本机服务。
-本仓库是 [33333s/zwrt-datad](https://github.com/33333s/zwrt-datad) 的 fork，在 `main` 分支上加了 MU5250 的对齐修复和慢数据缓存，**并删掉了上游的自更新（OTA）、云端、WebShell 和 `/ubus` 透传，程序不连任何外网地址**。
+**English** · [中文](README.zh-CN.md) · [API](docs/API.md)
 
-[English](README_EN.md) · [API 文档](docs/API.md)
+`zwrt-datad` runs on the device itself. It turns `ubus`, `uci`, `sysfs` and the device logs it needs into a stable JSON state, served over HTTP and SSE to the touch UI, scripts and other local services.
+This repo is a fork of [33333s/zwrt-datad](https://github.com/33333s/zwrt-datad). On the `main` branch it adds MU5250 alignment fixes and a slow-data cache, **and removes upstream's self-updater (OTA), cloud client, WebShell and `/ubus` passthrough; the binary does not contact any Internet address**.
 
-## 三个仓库一起用
+The documents linked under `docs/` are in Chinese.
 
-| 仓库 | 设备上的角色 |
+## Using the three repos together
+
+| Repo | Role on the device |
 |---|---|
-| [manager](https://github.com/faying/zte-u60-pro-mu5250-manager) | `zte-agent`（:9090）+ 管理网页 + 装机包 |
-| [touch-ui](https://github.com/faying/zte-u60-pro-mu5250-touch-ui) | 前面板触屏界面、屏幕守护进程、进程监督与 Wi-Fi 兜底脚本 |
-| **[data-service](https://github.com/faying/zte-u60-pro-mu5250-data-service)**（本仓库） | `zwrt-datad`：本机数据服务（`127.0.0.1:9460` 的 `/state` + SSE） |
+| [manager](https://github.com/faying/zte-u60-pro-mu5250-manager) | `zte-agent` (:9090) + admin web + install kit |
+| [touch-ui](https://github.com/faying/zte-u60-pro-mu5250-touch-ui) | Front-panel touch UI, screen daemon, process supervision and Wi-Fi fallback scripts |
+| **[data-service](https://github.com/faying/zte-u60-pro-mu5250-data-service)** (this repo) | `zwrt-datad`: local data service (`/state` + SSE on `127.0.0.1:9460`) |
 
 ```
-zwrt-datad :9460 ──▶ 触屏界面 ──(eSIM 页)──▶ zte-agent :9090 ──▶ lpac ──▶ eUICC 卡
-浏览器 ──▶ zte-agent :9090（API + 管理网页）
+zwrt-datad :9460 ──▶ touch UI ──(eSIM page)──▶ zte-agent :9090 ──▶ lpac ──▶ eUICC card
+browser ──▶ zte-agent :9090 (API + admin web)
 ```
 
-## 功能
+## Features
 
-- 聚合设备、CPU、内存、温度、电池，SIM、移动网络、信号、频段、流量、Wi-Fi、客户端、短信等数据
-- `GET /state` 返回完整 JSON 快照，`GET /events` 用 SSE 推送变化，默认每秒一次
-- 按机型模板规范化字段，`/capabilities` 报告当前能力（已适配 MU5250 / U60 Pro 等，见 [docs/models/](docs/models/)）
-- `POST /control` 执行受约束的蜂窝、Wi-Fi、APN、短信、电源等控制
-- 单个静态 ARM64 Rust 程序
+- Aggregates device, CPU, memory, temperature, battery, SIM, mobile network, signal, bands, traffic, Wi-Fi, clients, SMS and other data
+- `GET /state` returns a full JSON snapshot; `GET /events` pushes changes over SSE, once per second by default
+- Normalizes fields per model template; `/capabilities` reports the current capabilities (MU5250 / U60 Pro and others supported, see [docs/models/](docs/models/))
+- `POST /control` performs constrained cellular, Wi-Fi, APN, SMS, power and other controls
+- A single static ARM64 Rust binary
 
-## 快速开始
+## Quick start
 
-在 U60 Pro 上**不要单独装**：用 manager 仓库的装机包一起装，见 **[快速上手](https://github.com/faying/zte-u60-pro-mu5250-manager/blob/main/docs/GETTING-STARTED.md)**。
-装机包把它放在 `/data/plugins/zwrt-datad/zwrt-datad`，由 procd 监督：
+On the U60 Pro, **don't install it on its own**: install it together with the manager repo's install kit, see **[Getting started](https://github.com/faying/zte-u60-pro-mu5250-manager/blob/main/docs/GETTING-STARTED.md)**.
+The install kit puts it at `/data/plugins/zwrt-datad/zwrt-datad`, supervised by procd:
 
 ```sh
-/etc/init.d/zwrt-datad restart            # 重启
-cat /tmp/zwrt-datad.log                   # 日志
-curl -fsS http://127.0.0.1:9460/healthz   # 在设备上检查
+/etc/init.d/zwrt-datad restart            # restart
+cat /tmp/zwrt-datad.log                   # log
+curl -fsS http://127.0.0.1:9460/healthz   # check on the device
 curl -fsS http://127.0.0.1:9460/state
 curl -N  http://127.0.0.1:9460/events
 ```
 
-程序里没有自更新（上游的 OTA、云端、WebShell 和 `/ubus` 透传都已删掉），也没有写死的外网地址。要更新就自己编译，再用装机包 `./install.sh devui` 装上。
+The binary has no self-updater (upstream's OTA, cloud client, WebShell and `/ubus` passthrough are all removed) and no hard-coded Internet addresses. To update, build it yourself and install it with the install kit's `./install.sh devui`.
 
-## 构建
+## Build
 
-最简单的是用 Docker（macOS / Linux / WSL 都行，不用装工具链）：
-
-```sh
-scripts/build-docker.sh   # → zwrt-datad-aarch64（静态、已 strip，镜像按 digest 固定）
-```
-
-或者在 x86_64 Linux 上，需要 Bootlin aarch64 musl 工具链（默认 `~/aarch64--musl--stable-2025.08-1/bin`，可用 `DATAD_MUSL_TOOLCHAIN_DIR` 指定）和 rustup（脚本会装 Rust 1.89.0）：
+The simplest way is Docker (macOS / Linux / WSL all work, no toolchain to install):
 
 ```sh
-bash scripts/build.sh     # → zwrt-datad-aarch64（静态、已 strip）
+scripts/build-docker.sh   # → zwrt-datad-aarch64 (static, stripped, image pinned by digest)
 ```
 
-打装机包时用 `DATAD_BIN=…/zwrt-datad-aarch64` 指定。慢变数据的缓存可用环境变量 `ZWRT_DATAD_CACHE=0` 关闭。
+Or on x86_64 Linux, you need the Bootlin aarch64 musl toolchain (default `~/aarch64--musl--stable-2025.08-1/bin`, override with `DATAD_MUSL_TOOLCHAIN_DIR`) and rustup (the script installs Rust 1.89.0):
 
-## 文档
+```sh
+bash scripts/build.sh     # → zwrt-datad-aarch64 (static, stripped)
+```
 
-- [docs/API.md](docs/API.md)：HTTP、SSE、鉴权与命令行参数
-- [docs/STATE_SCHEMA.md](docs/STATE_SCHEMA.md)：状态字段约定
-- [docs/CONTROL_API.md](docs/CONTROL_API.md)：控制动作与安全边界
-- [docs/models/](docs/models/)：各机型模板
-- [docs/RUNTIME.md](docs/RUNTIME.md)、[docs/NEIGHBOR.md](docs/NEIGHBOR.md)：上游的运行说明和可选功能（U60 Pro 装机包用自己的启动方式）
+When building the install kit, point to it with `DATAD_BIN=…/zwrt-datad-aarch64`. The cache for slow-changing data can be turned off with the environment variable `ZWRT_DATAD_CACHE=0`.
 
-## 致谢
+## Docs
 
-- [33333s](https://github.com/33333s)：`zwrt-datad` 原作者，感谢这个参考仓库（以及 [u60pro-devui](https://github.com/33333s/u60pro-devui)）。
-- 上游贡献者见 [CONTRIBUTORS.md](CONTRIBUTORS.md)。
-- [Jesther Silvestre](https://github.com/jesther-ai)（open-u60-pro）、Wei REN（本 fork 的 MU5250 修复和三件套整合）。
+- [docs/API.md](docs/API.md): HTTP, SSE, authentication and command-line options
+- [docs/STATE_SCHEMA.md](docs/STATE_SCHEMA.md): state field conventions
+- [docs/CONTROL_API.md](docs/CONTROL_API.md): control actions and safety boundaries
+- [docs/models/](docs/models/): model templates
+- [docs/RUNTIME.md](docs/RUNTIME.md), [docs/NEIGHBOR.md](docs/NEIGHBOR.md): upstream's runtime notes and optional features (the U60 Pro install kit uses its own startup method)
 
-## 许可证与免责声明
+## Credits
 
-[MIT](LICENSE)。社区项目，和中兴通讯没有关系，风险自负。
+- [33333s](https://github.com/33333s): original author of `zwrt-datad`; thanks for this reference repo (and [u60pro-devui](https://github.com/33333s/u60pro-devui)).
+- Upstream contributors are listed in [CONTRIBUTORS.md](CONTRIBUTORS.md).
+- [Jesther Silvestre](https://github.com/jesther-ai) (open-u60-pro), Wei REN (this fork's MU5250 fixes and the three-repo integration).
+
+## License and disclaimer
+
+[MIT](LICENSE). A community project, not affiliated with ZTE Corporation; use at your own risk.
