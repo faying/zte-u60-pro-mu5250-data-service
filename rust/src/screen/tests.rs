@@ -5,7 +5,9 @@ use super::*;
 use std::path::PathBuf;
 
 fn merge(base: &mut Value, patch: &Value) {
-    let (Some(b), Some(p)) = (base.as_object_mut(), patch.as_object()) else { return };
+    let (Some(b), Some(p)) = (base.as_object_mut(), patch.as_object()) else {
+        return;
+    };
     for (k, v) in p {
         if v.is_null() {
             b.remove(k);
@@ -20,9 +22,12 @@ fn merge(base: &mut Value, patch: &Value) {
 #[test]
 fn matches_the_screens_c_on_the_corpus() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let template: Value =
-        serde_json::from_str(&std::fs::read_to_string(root.join("../tests/golden/normal.state.json")).unwrap()).unwrap();
-    let corpus = std::fs::read_to_string(root.join("tests/fixtures/screen_net_corpus.jsonl")).unwrap();
+    let template: Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("../tests/golden/normal.state.json")).unwrap(),
+    )
+    .unwrap();
+    let corpus =
+        std::fs::read_to_string(root.join("tests/fixtures/screen_net_corpus.jsonl")).unwrap();
     let mut n = 0;
     let mut bad = Vec::new();
     for line in corpus.lines().skip(1) {
@@ -43,14 +48,28 @@ fn matches_the_screens_c_on_the_corpus() {
             let mut diff: Vec<String> = w
                 .iter()
                 .filter(|(k, v)| g.get(*k) != Some(v))
-                .map(|(k, v)| format!("{k}: want {v} got {}", g.get(k).map_or("∅".into(), |x| x.to_string())))
+                .map(|(k, v)| {
+                    format!(
+                        "{k}: want {v} got {}",
+                        g.get(k).map_or("∅".into(), |x| x.to_string())
+                    )
+                })
                 .collect();
-            diff.extend(g.keys().filter(|k| !w.contains_key(*k)).map(|k| format!("{k}: extra")));
+            diff.extend(
+                g.keys()
+                    .filter(|k| !w.contains_key(*k))
+                    .map(|k| format!("{k}: extra")),
+            );
             bad.push(format!("case {}: {}", case["id"], diff.join("; ")));
         }
     }
     assert!(n > 1000, "corpus too small: {n}");
-    assert!(bad.is_empty(), "{} of {n} cases differ:\n{}", bad.len(), bad.iter().take(15).cloned().collect::<Vec<_>>().join("\n"));
+    assert!(
+        bad.is_empty(),
+        "{} of {n} cases differ:\n{}",
+        bad.len(),
+        bad.iter().take(15).cloned().collect::<Vec<_>>().join("\n")
+    );
 }
 
 #[test]
@@ -63,7 +82,10 @@ fn c_scalar_reads() {
     let mut f = [0f64; 11];
     assert_eq!(scan_floats("263,3,0,1750,20", 11, &mut f), 5);
     assert_eq!(scan_floats("1,2,x", 11, &mut f), 2);
-    assert_eq!(scan_floats("0,17,0,78,627264,100,0,-90,-10,15.5,-60,9", 11, &mut f), 11);
+    assert_eq!(
+        scan_floats("0,17,0,78,627264,100,0,-90,-10,15.5,-60,9", 11, &mut f),
+        11
+    );
     assert_eq!(band_short("LTE BAND 3", false), "B3");
     assert_eq!(band_short("GSM 900", false), "GSM 900");
     assert_eq!(band_short("", true), "-");
@@ -153,54 +175,191 @@ fn radio_names_and_bands() {
 fn story_every_situation_in_priority_order() {
     let o = with(|_| {});
     assert_eq!((o.headline.as_str(), o.tone), ("顺畅", Tone::Ok));
-    assert_eq!((o.rat.as_str(), o.link.as_str()), ("5G-A", "3 条载波聚合 · 带宽很宽"));
-    assert_eq!((o.sig.as_str(), o.sig_tone, o.noise.as_str(), o.load.as_str(), o.limit.as_str(), o.cause),
-               ("强", Tone::Ok, "小", "", "无", Cause::None));
+    assert_eq!(
+        (o.rat.as_str(), o.link.as_str()),
+        ("5G-A", "3 条载波聚合 · 带宽很宽")
+    );
+    assert_eq!(
+        (
+            o.sig.as_str(),
+            o.sig_tone,
+            o.noise.as_str(),
+            o.load.as_str(),
+            o.limit.as_str(),
+            o.cause
+        ),
+        ("强", Tone::Ok, "小", "", "无", Cause::None)
+    );
     assert_eq!(o.hint, "");
 
     let h = |f: fn(&mut NetIn<'static>)| {
         let o = with(f);
         (o.headline, o.tone)
     };
-    assert_eq!(h(|x| { x.sim_state = "sim absent"; x.bars = 0 }), ("无 SIM".into(), Tone::Bad));
-    assert_eq!(h(|x| { x.airplane = true; x.bars = 0 }), ("移动网络已关".into(), Tone::Neutral));
-    assert_eq!(h(|x| { x.net_type = "LIMITED_SERVICE"; x.bars = 0 }), ("只能紧急呼叫".into(), Tone::Bad));
-    assert_eq!(h(|x| { x.net_type = ""; x.bars = 0 }), ("无服务".into(), Tone::Bad));
+    assert_eq!(
+        h(|x| {
+            x.sim_state = "sim absent";
+            x.bars = 0
+        }),
+        ("无 SIM".into(), Tone::Bad)
+    );
+    assert_eq!(
+        h(|x| {
+            x.airplane = true;
+            x.bars = 0
+        }),
+        ("移动网络已关".into(), Tone::Neutral)
+    );
+    assert_eq!(
+        h(|x| {
+            x.net_type = "LIMITED_SERVICE";
+            x.bars = 0
+        }),
+        ("只能紧急呼叫".into(), Tone::Bad)
+    );
+    assert_eq!(
+        h(|x| {
+            x.net_type = "";
+            x.bars = 0
+        }),
+        ("无服务".into(), Tone::Bad)
+    );
     assert_eq!(h(|x| x.data_up = false), ("没连上网".into(), Tone::Bad));
 
-    assert!(with(|x| { x.data_up = false; x.roaming = 1 }).hint.contains("数据漫游"));
-    let o = with(|x| { x.data_up = false; x.roaming = 1; x.roam_sw = Sw::On });
-    assert!(o.hint.contains("正在拨号") && !o.hint.contains("打开"));
-    assert!(with(|x| { x.data_up = false; x.roaming = 1; x.roam_sw = Sw::Off }).hint.contains("数据漫游关着"));
-    assert!(with(|x| { x.data_up = false; x.roaming = 1; x.roam_sw = Sw::Off; x.data_sw = Sw::Off })
+    assert!(
+        with(|x| {
+            x.data_up = false;
+            x.roaming = 1
+        })
         .hint
-        .contains("移动数据关着"));
+        .contains("数据漫游")
+    );
+    let o = with(|x| {
+        x.data_up = false;
+        x.roaming = 1;
+        x.roam_sw = Sw::On
+    });
+    assert!(o.hint.contains("正在拨号") && !o.hint.contains("打开"));
+    assert!(
+        with(|x| {
+            x.data_up = false;
+            x.roaming = 1;
+            x.roam_sw = Sw::Off
+        })
+        .hint
+        .contains("数据漫游关着")
+    );
+    assert!(
+        with(|x| {
+            x.data_up = false;
+            x.roaming = 1;
+            x.roam_sw = Sw::Off;
+            x.data_sw = Sw::Off
+        })
+        .hint
+        .contains("移动数据关着")
+    );
 
     assert_eq!(h(|x| x.bars = 2), ("慢：信号弱".into(), Tone::Warn));
     assert_eq!(h(|x| x.sinr = -2.5), ("慢：干扰大".into(), Tone::Warn));
     assert_eq!(h(|x| x.rsrp = -115), ("慢：信号弱".into(), Tone::Warn));
-    assert_eq!(h(|x| { x.bars = 1; x.roaming = 1 }), ("慢：信号弱".into(), Tone::Warn));
-    assert_eq!(h(|x| { x.bars = 2; x.sinr = -3.0 }), ("慢：信号弱".into(), Tone::Warn));
+    assert_eq!(
+        h(|x| {
+            x.bars = 1;
+            x.roaming = 1
+        }),
+        ("慢：信号弱".into(), Tone::Warn)
+    );
+    assert_eq!(
+        h(|x| {
+            x.bars = 2;
+            x.sinr = -3.0
+        }),
+        ("慢：信号弱".into(), Tone::Warn)
+    );
     let o = with(|x| x.sinr = -2.5);
-    assert!(o.sig == "强" && o.noise == "大" && o.cause == Cause::Noise && o.hint.contains("SINR -2.5"));
+    assert!(
+        o.sig == "强" && o.noise == "大" && o.cause == Cause::Noise && o.hint.contains("SINR -2.5")
+    );
     assert_eq!([5, 4, 3, 2, 1, 0].map(bars_tier), [2, 2, 1, 0, 0, -1]);
 
     assert_eq!(h(|x| x.roaming = 1), ("顺畅".into(), Tone::Ok));
-    assert_eq!(h(|x| { x.net_type = "WCDMA"; x.n_active = 0; x.sinr_valid = false; x.rsrp_valid = false }),
-               ("只有 3G".into(), Tone::Warn));
-    assert_eq!(h(|x| { x.net_type = "EDGE"; x.n_active = 0; x.sinr_valid = false; x.rsrp_valid = false }),
-               ("只有 2G".into(), Tone::Warn));
-    let o = with(|x| { x.net_type = "WCDMA"; x.n_active = 0; x.sinr_valid = false; x.rsrp_valid = false; x.net_select = "Only_WCDMA" });
+    assert_eq!(
+        h(|x| {
+            x.net_type = "WCDMA";
+            x.n_active = 0;
+            x.sinr_valid = false;
+            x.rsrp_valid = false
+        }),
+        ("只有 3G".into(), Tone::Warn)
+    );
+    assert_eq!(
+        h(|x| {
+            x.net_type = "EDGE";
+            x.n_active = 0;
+            x.sinr_valid = false;
+            x.rsrp_valid = false
+        }),
+        ("只有 2G".into(), Tone::Warn)
+    );
+    let o = with(|x| {
+        x.net_type = "WCDMA";
+        x.n_active = 0;
+        x.sinr_valid = false;
+        x.rsrp_valid = false;
+        x.net_select = "Only_WCDMA"
+    });
     assert!(o.hint.contains("限定") && o.link == "这个制式没有载波聚合");
-    let o = with(|x| { x.net_type = "NSA"; x.n_active = 2; x.nr_active = 1; x.lte_active = 1; x.mhz = 120 });
+    let o = with(|x| {
+        x.net_type = "NSA";
+        x.n_active = 2;
+        x.nr_active = 1;
+        x.lte_active = 1;
+        x.mhz = 120
+    });
     assert!(o.headline == "顺畅" && o.rat == "5G" && o.link == "4G 锚点 + 5G，2 条载波 · 带宽充足");
-    let o = with(|x| { x.net_type = "LTE"; x.n_active = 3; x.nr_active = 0; x.lte_active = 3; x.mhz = 60 });
+    let o = with(|x| {
+        x.net_type = "LTE";
+        x.n_active = 3;
+        x.nr_active = 0;
+        x.lte_active = 3;
+        x.mhz = 60
+    });
     assert!(o.rat == "4G" && o.link == "3 条载波聚合 · 带宽一般");
-    let o = with(|x| { x.net_type = "LTE"; x.n_active = 1; x.nr_active = 0; x.lte_active = 1; x.mhz = 20; x.net_select = "Only_LTE" });
-    assert!(o.rat == "4G" && o.link == "单载波 · 带宽偏窄" && o.headline == "慢：载波窄" && o.cause == Cause::Narrow);
-    let o = with(|x| { x.net_type = "LTE"; x.n_active = 2; x.nr_active = 0; x.lte_active = 2; x.mhz = 40; x.net_select = "Only_LTE" });
+    let o = with(|x| {
+        x.net_type = "LTE";
+        x.n_active = 1;
+        x.nr_active = 0;
+        x.lte_active = 1;
+        x.mhz = 20;
+        x.net_select = "Only_LTE"
+    });
+    assert!(
+        o.rat == "4G"
+            && o.link == "单载波 · 带宽偏窄"
+            && o.headline == "慢：载波窄"
+            && o.cause == Cause::Narrow
+    );
+    let o = with(|x| {
+        x.net_type = "LTE";
+        x.n_active = 2;
+        x.nr_active = 0;
+        x.lte_active = 2;
+        x.mhz = 40;
+        x.net_select = "Only_LTE"
+    });
     assert!(o.headline == "顺畅" && o.hint.contains("只用 4G") && o.tone == Tone::Ok);
-    assert_eq!(with(|x| { x.net_type = "LTE"; x.n_active = 1; x.nr_active = 0; x.lte_active = 1; x.mhz = 0 }).link, "单载波");
+    assert_eq!(
+        with(|x| {
+            x.net_type = "LTE";
+            x.n_active = 1;
+            x.nr_active = 0;
+            x.lte_active = 1;
+            x.mhz = 0
+        })
+        .link,
+        "单载波"
+    );
     let o = with(|x| x.net_select = "TCHGWL_5G");
     assert!(o.hint.is_empty() || !o.hint.contains("只用"));
     let o = with(|x| x.bars = 3);
@@ -216,24 +375,104 @@ fn story_every_situation_in_priority_order() {
     assert!(o.cause == Cause::Limit && o.limit == "有" && o.hint.contains("5 Mbps"));
     let o = with(|x| x.ambr_dl = 0.0);
     assert!(o.limit == "—" && o.headline == "顺畅");
-    assert_eq!(h(|x| { x.ambr_dl = 5.0; x.sinr = -3.0 }), ("慢：限速".into(), Tone::Warn));
-    assert_eq!(h(|x| { x.rsrq = -18; x.rx_bps = 400_000 }), ("慢：疑似拥挤".into(), Tone::Warn));
-    let o = with(|x| { x.rsrq = -18; x.rx_bps = 400_000 });
-    assert!(o.cause == Cause::Crowd && o.load == "高" && o.sig == "强" && o.hint.contains("RSRQ -18"));
-    assert_eq!(h(|x| { x.rsrq = -18; x.rx_bps = 20_000 }), ("顺畅".into(), Tone::Ok));
+    assert_eq!(
+        h(|x| {
+            x.ambr_dl = 5.0;
+            x.sinr = -3.0
+        }),
+        ("慢：限速".into(), Tone::Warn)
+    );
+    assert_eq!(
+        h(|x| {
+            x.rsrq = -18;
+            x.rx_bps = 400_000
+        }),
+        ("慢：疑似拥挤".into(), Tone::Warn)
+    );
+    let o = with(|x| {
+        x.rsrq = -18;
+        x.rx_bps = 400_000
+    });
+    assert!(
+        o.cause == Cause::Crowd && o.load == "高" && o.sig == "强" && o.hint.contains("RSRQ -18")
+    );
+    assert_eq!(
+        h(|x| {
+            x.rsrq = -18;
+            x.rx_bps = 20_000
+        }),
+        ("顺畅".into(), Tone::Ok)
+    );
     assert_eq!(with(|x| x.rsrq = -18).load, "");
     assert_eq!(with(|x| x.rx_bps = 400_000).load, "正常");
-    assert_eq!(h(|x| { x.net_type = "LTE"; x.n_active = 2; x.lte_active = 2; x.nr_active = 0; x.mhz = 40; x.rsrq = -13; x.rx_bps = 400_000 }),
-               ("慢：疑似拥挤".into(), Tone::Warn));
-    assert_eq!(h(|x| { x.rsrp = -104; x.sinr = -1.0; x.rsrq = -18; x.rx_bps = 400_000 }), ("慢：干扰大".into(), Tone::Warn));
-    assert_eq!(h(|x| { x.n_active = 1; x.nr_active = 1; x.mhz = 20 }), ("慢：载波窄".into(), Tone::Warn));
-    assert_eq!(with(|x| { x.n_active = 1; x.nr_active = 1; x.mhz = 100 }).headline, "顺畅");
-    assert_eq!(h(|x| { x.n_active = 1; x.nr_active = 1; x.mhz = 15; x.roaming = 1 }), ("慢：载波窄".into(), Tone::Warn));
+    assert_eq!(
+        h(|x| {
+            x.net_type = "LTE";
+            x.n_active = 2;
+            x.lte_active = 2;
+            x.nr_active = 0;
+            x.mhz = 40;
+            x.rsrq = -13;
+            x.rx_bps = 400_000
+        }),
+        ("慢：疑似拥挤".into(), Tone::Warn)
+    );
+    assert_eq!(
+        h(|x| {
+            x.rsrp = -104;
+            x.sinr = -1.0;
+            x.rsrq = -18;
+            x.rx_bps = 400_000
+        }),
+        ("慢：干扰大".into(), Tone::Warn)
+    );
+    assert_eq!(
+        h(|x| {
+            x.n_active = 1;
+            x.nr_active = 1;
+            x.mhz = 20
+        }),
+        ("慢：载波窄".into(), Tone::Warn)
+    );
+    assert_eq!(
+        with(|x| {
+            x.n_active = 1;
+            x.nr_active = 1;
+            x.mhz = 100
+        })
+        .headline,
+        "顺畅"
+    );
+    assert_eq!(
+        h(|x| {
+            x.n_active = 1;
+            x.nr_active = 1;
+            x.mhz = 15;
+            x.roaming = 1
+        }),
+        ("慢：载波窄".into(), Tone::Warn)
+    );
 
     // 2026-09-25 on the device: SA, one n5 15 MHz carrier, SINR -1.9, RSRP -102, RSRQ -17
-    let o = with(|x| { x.bars = 3; x.n_active = 1; x.nr_active = 1; x.mhz = 15; x.sinr = -1.9; x.rsrp = -102; x.rsrq = -17; x.rx_bps = 0 });
-    assert!(o.headline == "慢：干扰大" && o.sig == "中" && o.noise == "大" && o.load.is_empty() && o.limit == "无"
-        && o.cause == Cause::Noise && o.hint.contains("SINR -1.9"));
+    let o = with(|x| {
+        x.bars = 3;
+        x.n_active = 1;
+        x.nr_active = 1;
+        x.mhz = 15;
+        x.sinr = -1.9;
+        x.rsrp = -102;
+        x.rsrq = -17;
+        x.rx_bps = 0
+    });
+    assert!(
+        o.headline == "慢：干扰大"
+            && o.sig == "中"
+            && o.noise == "大"
+            && o.load.is_empty()
+            && o.limit == "无"
+            && o.cause == Cause::Noise
+            && o.hint.contains("SINR -1.9")
+    );
     assert!(o.headline.len() <= 18 && o.hint.len() <= 60);
 }
 
@@ -256,36 +495,238 @@ fn status_bar_label_by_the_network_you_are_on() {
         net_badge(&x)
     };
     assert_eq!(b(|_| {}), "5G");
-    assert_eq!(b(|x| { x.nr_active = 2; x.nr_mhz = 200 }), "5G");
+    assert_eq!(
+        b(|x| {
+            x.nr_active = 2;
+            x.nr_mhz = 200
+        }),
+        "5G"
+    );
     assert_eq!(b(|x| x.nr_active = 3), "5G-A");
-    assert_eq!(b(|x| { x.net_type = "NSA"; x.nr_active = 3 }), "5G-A");
-    assert_eq!(b(|x| { x.mnc = 1; x.nr_active = 2; x.nr_mhz = 200 }), "5G-A");
-    assert_eq!(b(|x| { x.mnc = 1; x.nr_active = 2; x.nr_mhz = 160 }), "5G");
-    assert_eq!(b(|x| { x.mcc = 310; x.mnc = 260; x.nr_band = 41 }), "5G UC");
-    assert_eq!(b(|x| { x.mcc = 310; x.mnc = 260; x.nr_band = 71 }), "5G");
-    assert_eq!(b(|x| { x.mcc = 311; x.mnc = 480; x.nr_band = 77 }), "5G UW");
-    assert_eq!(b(|x| { x.mcc = 311; x.mnc = 480; x.nr_band = 48 }), "5G UW");
-    assert_eq!(b(|x| { x.mcc = 311; x.mnc = 480; x.nr_band = 5; x.mhz = 10 }), "5G");
-    assert_eq!(b(|x| { x.mcc = 310; x.mnc = 410; x.nr_band = 77 }), "5G+");
-    assert_eq!(b(|x| { x.mcc = 310; x.mnc = 410; x.nr_band = 5; x.mhz = 50 }), "5G+");
-    assert_eq!(b(|x| { x.mcc = 310; x.mnc = 410; x.nr_band = 5; x.mhz = 10 }), "5G");
-    assert_eq!(b(|x| { x.mcc = 440; x.mnc = 10; x.nr_active = 3 }), "5G");
-    assert_eq!(b(|x| { x.mcc = 466; x.mnc = 92; x.nr_active = 3 }), "5G");
-    assert_eq!(b(|x| { x.mcc = 454; x.mnc = 12; x.nr_active = 3 }), "5G");
-    assert_eq!(b(|x| { x.mcc = 234; x.mnc = 30; x.nr_active = 3 }), "5G");
-    assert_eq!(b(|x| { x.net_type = "LTE"; x.mcc = 440; x.nr_active = 0; x.lte_active = 2 }), "4G+");
-    assert_eq!(b(|x| { x.net_type = "LTE"; x.mcc = 466; x.nr_active = 0; x.lte_active = 3 }), "4G+");
-    assert_eq!(b(|x| { x.net_type = "LTE"; x.mcc = 466; x.nr_active = 0; x.lte_active = 1 }), "4G");
-    assert_eq!(b(|x| { x.net_type = "LTE"; x.nr_active = 0; x.lte_active = 3 }), "4G");
-    assert_eq!(b(|x| { x.net_type = "LTE"; x.mcc = 234; x.nr_active = 0; x.lte_active = 2 }), "4G");
-    assert_eq!(b(|x| { x.net_type = "LTE"; x.mcc = 310; x.mnc = 260; x.nr_active = 0; x.lte_active = 1 }), "LTE");
-    assert_eq!(b(|x| { x.net_type = "LTE"; x.mcc = 311; x.mnc = 480; x.nr_active = 0; x.lte_active = 2 }), "LTE");
-    assert_eq!(b(|x| { x.net_type = "HSPA+"; x.nr_active = 0 }), "3G");
-    assert_eq!(b(|x| { x.net_type = "EDGE"; x.nr_active = 0 }), "2G");
+    assert_eq!(
+        b(|x| {
+            x.net_type = "NSA";
+            x.nr_active = 3
+        }),
+        "5G-A"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mnc = 1;
+            x.nr_active = 2;
+            x.nr_mhz = 200
+        }),
+        "5G-A"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mnc = 1;
+            x.nr_active = 2;
+            x.nr_mhz = 160
+        }),
+        "5G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mcc = 310;
+            x.mnc = 260;
+            x.nr_band = 41
+        }),
+        "5G UC"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mcc = 310;
+            x.mnc = 260;
+            x.nr_band = 71
+        }),
+        "5G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mcc = 311;
+            x.mnc = 480;
+            x.nr_band = 77
+        }),
+        "5G UW"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mcc = 311;
+            x.mnc = 480;
+            x.nr_band = 48
+        }),
+        "5G UW"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mcc = 311;
+            x.mnc = 480;
+            x.nr_band = 5;
+            x.mhz = 10
+        }),
+        "5G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mcc = 310;
+            x.mnc = 410;
+            x.nr_band = 77
+        }),
+        "5G+"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mcc = 310;
+            x.mnc = 410;
+            x.nr_band = 5;
+            x.mhz = 50
+        }),
+        "5G+"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mcc = 310;
+            x.mnc = 410;
+            x.nr_band = 5;
+            x.mhz = 10
+        }),
+        "5G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mcc = 440;
+            x.mnc = 10;
+            x.nr_active = 3
+        }),
+        "5G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mcc = 466;
+            x.mnc = 92;
+            x.nr_active = 3
+        }),
+        "5G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mcc = 454;
+            x.mnc = 12;
+            x.nr_active = 3
+        }),
+        "5G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.mcc = 234;
+            x.mnc = 30;
+            x.nr_active = 3
+        }),
+        "5G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "LTE";
+            x.mcc = 440;
+            x.nr_active = 0;
+            x.lte_active = 2
+        }),
+        "4G+"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "LTE";
+            x.mcc = 466;
+            x.nr_active = 0;
+            x.lte_active = 3
+        }),
+        "4G+"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "LTE";
+            x.mcc = 466;
+            x.nr_active = 0;
+            x.lte_active = 1
+        }),
+        "4G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "LTE";
+            x.nr_active = 0;
+            x.lte_active = 3
+        }),
+        "4G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "LTE";
+            x.mcc = 234;
+            x.nr_active = 0;
+            x.lte_active = 2
+        }),
+        "4G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "LTE";
+            x.mcc = 310;
+            x.mnc = 260;
+            x.nr_active = 0;
+            x.lte_active = 1
+        }),
+        "LTE"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "LTE";
+            x.mcc = 311;
+            x.mnc = 480;
+            x.nr_active = 0;
+            x.lte_active = 2
+        }),
+        "LTE"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "HSPA+";
+            x.nr_active = 0
+        }),
+        "3G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "EDGE";
+            x.nr_active = 0
+        }),
+        "2G"
+    );
     assert_eq!(b(|x| x.net_type = "LIMITED_SERVICE"), "SOS");
-    assert_eq!(b(|x| { x.roaming = 1; x.mcc = 310; x.mnc = 260; x.nr_band = 41 }), "5G UC");
-    assert_eq!(b(|x| { x.roaming = 1; x.mcc = 440; x.mnc = 20; x.nr_active = 3 }), "5G");
-    let o = with(|x| { x.net_type = ""; x.bars = 0; x.data_up = false });
+    assert_eq!(
+        b(|x| {
+            x.roaming = 1;
+            x.mcc = 310;
+            x.mnc = 260;
+            x.nr_band = 41
+        }),
+        "5G UC"
+    );
+    assert_eq!(
+        b(|x| {
+            x.roaming = 1;
+            x.mcc = 440;
+            x.mnc = 20;
+            x.nr_active = 3
+        }),
+        "5G"
+    );
+    let o = with(|x| {
+        x.net_type = "";
+        x.bars = 0;
+        x.data_up = false
+    });
     assert!(o.rat == "无服务" && o.headline == "无服务");
 }
 
@@ -355,9 +796,16 @@ fn radio_mode_words() {
     assert_eq!(net_select_word("Only_GSM_WCDMA"), "只用 3G 和 2G");
     assert_eq!(net_select_word(""), "-");
     assert_eq!(net_select_word("SOMETHING_NEW"), "SOMETHING_NEW");
-    assert!(net_select_is_auto("TCHGWL_5G") && net_select_is_auto("WL_AND_5G") && !net_select_is_auto("Only_LTE"));
+    assert!(
+        net_select_is_auto("TCHGWL_5G")
+            && net_select_is_auto("WL_AND_5G")
+            && !net_select_is_auto("Only_LTE")
+    );
     let mut state: Value = serde_json::from_str(
-        &std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/golden/normal.state.json")).unwrap(),
+        &std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/golden/normal.state.json"),
+        )
+        .unwrap(),
     )
     .unwrap();
     state["net"]["net_select"] = "Only_LTE".into();

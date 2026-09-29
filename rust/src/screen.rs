@@ -216,7 +216,11 @@ fn mainland_operator_cn(mcc: i64, mnc: i64, raw: &str) -> Option<&'static str> {
 }
 
 fn parse(state: &Value) -> Data {
-    let mut d = Data { cell_data: -1, cell_roam: -1, ..Default::default() };
+    let mut d = Data {
+        cell_data: -1,
+        cell_roam: -1,
+        ..Default::default()
+    };
     if let Some(net) = state.get("net") {
         d.net_type = getstr(net, "type", 16);
         d.operator_name = getstr(net, "operator", 48);
@@ -320,13 +324,19 @@ fn rat_of(raw: &str) -> Rat {
     if has(u, "LTE") || has(u, "4G") {
         return Rat::G4;
     }
-    if ["WCDMA", "UMTS", "HSPA", "HSDPA", "HSUPA", "TD-SCDMA", "TDSCDMA", "CDMA2000", "EVDO", "EV-DO", "EHRPD", "HRPD", "3G"]
-        .iter()
-        .any(|w| has(u, w))
+    if [
+        "WCDMA", "UMTS", "HSPA", "HSDPA", "HSUPA", "TD-SCDMA", "TDSCDMA", "CDMA2000", "EVDO",
+        "EV-DO", "EHRPD", "HRPD", "3G",
+    ]
+    .iter()
+    .any(|w| has(u, w))
     {
         return Rat::G3;
     }
-    if ["GSM", "GPRS", "EDGE", "2G", "CDMA", "1XRTT", "1X"].iter().any(|w| has(u, w)) {
+    if ["GSM", "GPRS", "EDGE", "2G", "CDMA", "1XRTT", "1X"]
+        .iter()
+        .any(|w| has(u, w))
+    {
         return Rat::G2;
     }
     Rat::None
@@ -345,7 +355,8 @@ fn rat_family(raw: &str) -> &'static str {
     if has_ci(raw, "TD-SCDMA") || has_ci(raw, "TDSCDMA") {
         return "TD-SCDMA";
     }
-    if has_ci(raw, "CDMA2000") || has_ci(raw, "EVDO") || has_ci(raw, "EV-DO") || has_ci(raw, "HRPD") {
+    if has_ci(raw, "CDMA2000") || has_ci(raw, "EVDO") || has_ci(raw, "EV-DO") || has_ci(raw, "HRPD")
+    {
         return "CDMA2000";
     }
     if has_ci(raw, "HSPA+") || has_ci(raw, "DC-HSPA") || has_ci(raw, "HSPAP") {
@@ -378,7 +389,12 @@ fn rat_long(raw: &str, lte_active: i64) -> String {
     let s = match rat_of(raw) {
         Rat::Sa => "5G SA".to_string(),
         Rat::Nsa => "5G NSA · 4G 锚点".to_string(),
-        Rat::G4 => if lte_active >= 2 { "4G LTE-A" } else { "4G LTE" }.to_string(),
+        Rat::G4 => if lte_active >= 2 {
+            "4G LTE-A"
+        } else {
+            "4G LTE"
+        }
+        .to_string(),
         Rat::G3 => format!("3G{sp}{fam}"),
         Rat::G2 => format!("2G{sp}{fam}"),
         Rat::None => String::new(),
@@ -400,7 +416,9 @@ fn band_short(raw: &str, nr: bool) -> String {
         }
     }
     match last {
-        Some(i) if atoi(&raw[i..]) < 450 => format!("{}{}", if nr { 'n' } else { 'B' }, atoi(&raw[i..])),
+        Some(i) if atoi(&raw[i..]) < 450 => {
+            format!("{}{}", if nr { 'n' } else { 'B' }, atoi(&raw[i..]))
+        }
         _ => cstr(raw.to_string(), 16),
     }
 }
@@ -419,8 +437,8 @@ fn bars_tier(bars: i64) -> i64 {
 
 fn imsi_plmn(imsi: &str) -> Option<(i64, i64)> {
     const MNC3: [i64; 24] = [
-        302, 310, 311, 312, 313, 314, 315, 316, 334, 338, 342, 344, 346, 348, 354, 356, 358, 360, 365, 376, 405, 708,
-        722, 732,
+        302, 310, 311, 312, 313, 314, 315, 316, 334, 338, 342, 344, 346, 348, 354, 356, 358, 360,
+        365, 376, 405, 708, 722, 732,
     ];
     let b = imsi.as_bytes();
     if b.len() < 6 || !b[..6].iter().all(|c| c.is_ascii_digit()) {
@@ -440,30 +458,66 @@ fn imsi_plmn(imsi: &str) -> Option<(i64, i64)> {
 
 fn operator_logo(mcc: i64, mnc: i64) -> Option<&'static str> {
     const K: &[(i64, i64, &str)] = &[
-        (460, 0, "china-mobile"), (460, 2, "china-mobile"), (460, 4, "china-mobile"),
-        (460, 7, "china-mobile"), (460, 8, "china-mobile"),
-        (460, 1, "china-unicom"), (460, 6, "china-unicom"), (460, 9, "china-unicom"),
-        (460, 3, "china-telecom"), (460, 5, "china-telecom"), (460, 11, "china-telecom"),
-        (454, 0, "csl"), (454, 2, "csl"), (454, 10, "csl"), (454, 18, "csl"),
-        (454, 3, "three-hk"), (454, 4, "three-hk"),
-        (454, 6, "smartone"), (454, 15, "smartone"),
-        (454, 12, "cmhk"), (454, 13, "cmhk"),
-        (454, 7, "china-unicom"), (454, 16, "csl"), (454, 19, "csl"), (454, 20, "csl"),
+        (460, 0, "china-mobile"),
+        (460, 2, "china-mobile"),
+        (460, 4, "china-mobile"),
+        (460, 7, "china-mobile"),
+        (460, 8, "china-mobile"),
+        (460, 1, "china-unicom"),
+        (460, 6, "china-unicom"),
+        (460, 9, "china-unicom"),
+        (460, 3, "china-telecom"),
+        (460, 5, "china-telecom"),
+        (460, 11, "china-telecom"),
+        (454, 0, "csl"),
+        (454, 2, "csl"),
+        (454, 10, "csl"),
+        (454, 18, "csl"),
+        (454, 3, "three-hk"),
+        (454, 4, "three-hk"),
+        (454, 6, "smartone"),
+        (454, 15, "smartone"),
+        (454, 12, "cmhk"),
+        (454, 13, "cmhk"),
+        (454, 7, "china-unicom"),
+        (454, 16, "csl"),
+        (454, 19, "csl"),
+        (454, 20, "csl"),
         (454, 31, "china-telecom"),
-        (455, 5, "three-hk"), (455, 7, "china-telecom"),
-        (455, 1, "ctm"), (455, 4, "ctm"),
-        (466, 92, "chunghwa"), (466, 1, "fetnet"), (466, 97, "taiwan-mobile"),
-        (440, 10, "docomo"), (440, 20, "softbank"), (440, 11, "rakuten"),
-        (440, 50, "au"), (440, 51, "au"), (440, 52, "au"), (440, 53, "au"), (440, 54, "au"),
-        (450, 5, "skt"), (450, 8, "kt"), (450, 6, "lguplus"),
-        (525, 1, "singtel"), (525, 3, "m1"), (525, 5, "starhub"),
-        (310, 260, "t-mobile-us"), (310, 410, "att"), (311, 480, "verizon"),
+        (455, 5, "three-hk"),
+        (455, 7, "china-telecom"),
+        (455, 1, "ctm"),
+        (455, 4, "ctm"),
+        (466, 92, "chunghwa"),
+        (466, 1, "fetnet"),
+        (466, 97, "taiwan-mobile"),
+        (440, 10, "docomo"),
+        (440, 20, "softbank"),
+        (440, 11, "rakuten"),
+        (440, 50, "au"),
+        (440, 51, "au"),
+        (440, 52, "au"),
+        (440, 53, "au"),
+        (440, 54, "au"),
+        (450, 5, "skt"),
+        (450, 8, "kt"),
+        (450, 6, "lguplus"),
+        (525, 1, "singtel"),
+        (525, 3, "m1"),
+        (525, 5, "starhub"),
+        (310, 260, "t-mobile-us"),
+        (310, 410, "att"),
+        (311, 480, "verizon"),
     ];
     K.iter().find(|k| k.0 == mcc && k.1 == mnc).map(|k| k.2)
 }
 
 fn sim_logo(mcc: i64, mnc: i64, spn: &str) -> Option<&'static str> {
-    let low: String = spn.bytes().take(31).map(|c| c.to_ascii_lowercase() as char).collect();
+    let low: String = spn
+        .bytes()
+        .take(31)
+        .map(|c| c.to_ascii_lowercase() as char)
+        .collect();
     if low.contains("cmlink") {
         return Some("cmlink");
     }
@@ -497,18 +551,27 @@ fn pinned_mode(sel: &str) -> Option<&'static str> {
 /// B27 reports both WL_AND_5G and TCHGWL_5G for automatic.
 fn net_select_word(sel: &str) -> String {
     const K: &[(&str, &str)] = &[
-        ("WL_AND_5G", "自动"), ("TCHGWL_5G", "自动"),
-        ("Only_5G", "只用 5G SA"), ("LTE_AND_5G", "只用 5G NSA"),
-        ("4G_AND_5G", "4G + 5G"), ("WL_AND_NSA", "5G NSA + 4G + 3G"),
-        ("Only_LTE", "只用 4G"), ("WCDMA_AND_LTE", "4G + 3G"),
-        ("GSM_AND_LTE", "4G + 2G"), ("TDSCDMA_AND_LTE", "4G + TD-SCDMA"),
-        ("Only_WCDMA", "只用 3G"), ("Only_GSM_WCDMA", "只用 3G 和 2G"),
-        ("Only_TDSCDMA", "只用 TD-SCDMA"), ("Only_GSM", "只用 2G"),
+        ("WL_AND_5G", "自动"),
+        ("TCHGWL_5G", "自动"),
+        ("Only_5G", "只用 5G SA"),
+        ("LTE_AND_5G", "只用 5G NSA"),
+        ("4G_AND_5G", "4G + 5G"),
+        ("WL_AND_NSA", "5G NSA + 4G + 3G"),
+        ("Only_LTE", "只用 4G"),
+        ("WCDMA_AND_LTE", "4G + 3G"),
+        ("GSM_AND_LTE", "4G + 2G"),
+        ("TDSCDMA_AND_LTE", "4G + TD-SCDMA"),
+        ("Only_WCDMA", "只用 3G"),
+        ("Only_GSM_WCDMA", "只用 3G 和 2G"),
+        ("Only_TDSCDMA", "只用 TD-SCDMA"),
+        ("Only_GSM", "只用 2G"),
     ];
     if sel.is_empty() {
         return "-".into();
     }
-    K.iter().find(|k| k.0 == sel).map_or_else(|| sel.to_string(), |k| k.1.to_string())
+    K.iter()
+        .find(|k| k.0 == sel)
+        .map_or_else(|| sel.to_string(), |k| k.1.to_string())
 }
 
 fn net_select_is_auto(sel: &str) -> bool {
@@ -654,7 +717,10 @@ fn story(i: &NetIn) -> Story {
     let rat = rat_of(i.net_type);
     let pin = pinned_mode(i.net_select);
     let limited = has_ci(i.net_type, "LIMIT") || has_ci(i.net_type, "EMERGENCY");
-    let mut o = Story { rat: cstr(net_badge(i), 32), ..Default::default() };
+    let mut o = Story {
+        rat: cstr(net_badge(i), 32),
+        ..Default::default()
+    };
 
     if matches!(rat, Rat::G2 | Rat::G3) {
         o.link = "这个制式没有载波聚合".into();
@@ -678,7 +744,10 @@ fn story(i: &NetIn) -> Story {
             "单载波".to_string()
         };
         let n = cstr(n, 64);
-        o.link = cstr(format!("{n}{}{w}", if w.is_empty() { "" } else { " · " }), 96);
+        o.link = cstr(
+            format!("{n}{}{w}", if w.is_empty() { "" } else { " · " }),
+            96,
+        );
     }
 
     let st = bars_tier(i.bars);
@@ -733,10 +802,22 @@ fn story(i: &NetIn) -> Story {
         o
     };
     if !sim_usable(i.sim_state) {
-        return say(o, Cause::None, Tone::Bad, "无 SIM", "插卡，或在「功能 → eSIM」启用".into());
+        return say(
+            o,
+            Cause::None,
+            Tone::Bad,
+            "无 SIM",
+            "插卡，或在「功能 → eSIM」启用".into(),
+        );
     }
     if i.airplane {
-        return say(o, Cause::None, Tone::Neutral, "移动网络已关", "飞行模式开着，去管理网页关掉".into());
+        return say(
+            o,
+            Cause::None,
+            Tone::Neutral,
+            "移动网络已关",
+            "飞行模式开着，去管理网页关掉".into(),
+        );
     }
     if limited {
         let h = if i.roaming == 1 {
@@ -757,10 +838,22 @@ fn story(i: &NetIn) -> Story {
     }
     if !i.data_up {
         if i.data_sw == Sw::Off {
-            return say(o, Cause::None, Tone::Bad, "没连上网", "移动数据关着：去「蜂窝」打开".into());
+            return say(
+                o,
+                Cause::None,
+                Tone::Bad,
+                "没连上网",
+                "移动数据关着：去「蜂窝」打开".into(),
+            );
         }
         if i.roaming == 1 && i.roam_sw == Sw::Off {
-            return say(o, Cause::None, Tone::Bad, "没连上网", "数据漫游关着：去「蜂窝」打开，卡也要开通".into());
+            return say(
+                o,
+                Cause::None,
+                Tone::Bad,
+                "没连上网",
+                "数据漫游关着：去「蜂窝」打开，卡也要开通".into(),
+            );
         }
         if i.roaming == 1 && i.roam_sw == Sw::On {
             return say(
@@ -784,14 +877,29 @@ fn story(i: &NetIn) -> Story {
             Cause::Limit,
             Tone::Warn,
             "慢：限速",
-            format!("运营商限到 {} Mbps，换位置没用", to_int(i.ambr_dl + 0.5) as i32),
+            format!(
+                "运营商限到 {} Mbps，换位置没用",
+                to_int(i.ambr_dl + 0.5) as i32
+            ),
         );
     }
     if st == 0 || (i.rsrp_valid && i.rsrp < -110) {
         if i.rsrp_valid {
-            return say(o, Cause::Weak, Tone::Warn, "慢：信号弱", format!("RSRP {}：离基站远，靠窗通常好些{roam_note}", i.rsrp));
+            return say(
+                o,
+                Cause::Weak,
+                Tone::Warn,
+                "慢：信号弱",
+                format!("RSRP {}：离基站远，靠窗通常好些{roam_note}", i.rsrp),
+            );
         }
-        return say(o, Cause::Weak, Tone::Warn, "慢：信号弱", format!("离基站远，靠窗通常好些{roam_note}"));
+        return say(
+            o,
+            Cause::Weak,
+            Tone::Warn,
+            "慢：信号弱",
+            format!("离基站远，靠窗通常好些{roam_note}"),
+        );
     }
     if nq == 0 {
         return say(
@@ -799,25 +907,54 @@ fn story(i: &NetIn) -> Story {
             Cause::Noise,
             Tone::Warn,
             "慢：干扰大",
-            format!("SINR {}：杂波多，挪个位置或换个朝向{roam_note}", fmt1(i.sinr)),
+            format!(
+                "SINR {}：杂波多，挪个位置或换个朝向{roam_note}",
+                fmt1(i.sinr)
+            ),
         );
     }
     if crowd {
-        return say(o, Cause::Crowd, Tone::Warn, "慢：疑似拥挤", format!("RSRQ {}：人多抢网，换位置帮助不大", i.rsrq));
+        return say(
+            o,
+            Cause::Crowd,
+            Tone::Warn,
+            "慢：疑似拥挤",
+            format!("RSRQ {}：人多抢网，换位置帮助不大", i.rsrq),
+        );
     }
     if rat == Rat::G2 {
-        let h = if pin.is_some() { "制式被限定只用 2G，去「锁频」改回" } else { "上网会非常慢，附近可能没有 4G/5G" };
+        let h = if pin.is_some() {
+            "制式被限定只用 2G，去「锁频」改回"
+        } else {
+            "上网会非常慢，附近可能没有 4G/5G"
+        };
         return say(o, Cause::None, Tone::Warn, "只有 2G", h.into());
     }
     if rat == Rat::G3 {
-        let h = if pin.is_some() { "制式被限定只用 3G，去「锁频」改回" } else { "能上网但较慢，附近可能没有 4G/5G" };
+        let h = if pin.is_some() {
+            "制式被限定只用 3G，去「锁频」改回"
+        } else {
+            "能上网但较慢，附近可能没有 4G/5G"
+        };
         return say(o, Cause::None, Tone::Warn, "只有 3G", h.into());
     }
     if narrow {
-        return say(o, Cause::Narrow, Tone::Warn, "慢：载波窄", format!("这里只给了 1 条 {} MHz", i.mhz));
+        return say(
+            o,
+            Cause::Narrow,
+            Tone::Warn,
+            "慢：载波窄",
+            format!("这里只给了 1 条 {} MHz", i.mhz),
+        );
     }
     if pin.is_some() && rat == Rat::G4 {
-        return say(o, Cause::None, Tone::Ok, "顺畅", "制式限定只用 4G，去「锁频」改回".into());
+        return say(
+            o,
+            Cause::None,
+            Tone::Ok,
+            "顺畅",
+            "制式限定只用 4G，去「锁频」改回".into(),
+        );
     }
     say(o, Cause::None, Tone::Ok, "顺畅", String::new())
 }
@@ -872,7 +1009,14 @@ fn parse_ca(s: &str, max: usize, nr: bool) -> Vec<Carrier> {
         }
         let mut f = [0f64; 11];
         let nf = scan_floats(rec, 11, &mut f);
-        let c = |pci: f64, band: f64, arfcn: f64, bw: f64, rsrp: f64, rsrq: f64, sinr: f64, active: bool| Carrier {
+        let c = |pci: f64,
+                 band: f64,
+                 arfcn: f64,
+                 bw: f64,
+                 rsrp: f64,
+                 rsrq: f64,
+                 sinr: f64,
+                 active: bool| Carrier {
             kind,
             band: to_int(band) as i32 as i64,
             pci: to_int(pci) as i32 as i64,
@@ -974,7 +1118,11 @@ fn carriers(d: &Data, v: &mut NetView) {
     let rat = rat_of(&d.net_type);
     if ca.len() < CA_MAX {
         let mut lte = parse_ca(&d.lteca, CA_MAX - ca.len(), false);
-        let lte_snr = atof(if d.lte_snr.is_empty() { "0" } else { &d.lte_snr });
+        let lte_snr = atof(if d.lte_snr.is_empty() {
+            "0"
+        } else {
+            &d.lte_snr
+        });
         for c in &mut lte {
             if c.rsrp_v == 0.0 && c.pci == d.lte_pci && d.lte_rsrp != 0 {
                 c.rsrp_v = d.lte_rsrp as f64;
@@ -1012,7 +1160,14 @@ fn carriers(d: &Data, v: &mut NetView) {
             c.label = cstr(format!("{p}{}", c.band), 16);
             c.label_short = c.label.clone();
         } else if nr {
-            c.label = cstr(if d.nr_band.is_empty() { "-".into() } else { d.nr_band.clone() }, 16);
+            c.label = cstr(
+                if d.nr_band.is_empty() {
+                    "-".into()
+                } else {
+                    d.nr_band.clone()
+                },
+                16,
+            );
             c.label_short = band_short(&d.nr_band, true);
         } else {
             c.label = band_short(&d.band, false);
@@ -1078,7 +1233,12 @@ fn summary(d: &Data, v: &mut NetView) {
             first = cstr(c.label_short.clone(), 20);
         }
         let piece = if c.bw != 0 {
-            format!("{}{} {}M", if lo > 0 { " + " } else { "" }, c.label_short, c.bw)
+            format!(
+                "{}{} {}M",
+                if lo > 0 { " + " } else { "" },
+                c.label_short,
+                c.bw
+            )
         } else {
             format!("{}{}", if lo > 0 { " + " } else { "" }, c.label_short)
         };
@@ -1089,7 +1249,11 @@ fn summary(d: &Data, v: &mut NetView) {
     let r2 = rat_of(&d.net_type);
     if v.act_n == 0 && matches!(r2, Rat::G3 | Rat::G2) {
         v.ca_val = "无聚合".into();
-        v.ca_sub = if d.band.is_empty() { String::new() } else { band_short(&d.band, false) };
+        v.ca_sub = if d.band.is_empty() {
+            String::new()
+        } else {
+            band_short(&d.band, false)
+        };
     } else if v.act_n == 0 {
         v.ca_val = if v.nosvc { "没连上基站" } else { "—" }.into();
         v.ca_sub = String::new();
@@ -1111,7 +1275,8 @@ pub fn net_view(state: &Value) -> NetView {
     carriers(&d, &mut v);
 
     v.roam_known = !d.roaming.is_empty();
-    v.roam = !d.roaming.is_empty() && d.roaming != "Home" && d.roaming != "home" && d.roaming != "0";
+    v.roam =
+        !d.roaming.is_empty() && d.roaming != "Home" && d.roaming != "home" && d.roaming != "0";
 
     let ws = &d.wan_status;
     let c0 = v.carriers.first();
@@ -1121,7 +1286,11 @@ pub fn net_view(state: &Value) -> NetView {
         net_type: &d.net_type,
         bars: d.bars,
         data_up: ws.is_empty() || (ws.contains("connected") && !ws.contains("disconnect")),
-        roaming: if d.roaming.is_empty() { -1 } else { i64::from(v.roam) },
+        roaming: if d.roaming.is_empty() {
+            -1
+        } else {
+            i64::from(v.roam)
+        },
         n_active: v.act_n,
         nr_active: v.act_nr,
         lte_active: v.act_lte,
@@ -1158,10 +1327,19 @@ pub fn net_view(state: &Value) -> NetView {
     (v.home_mcc, v.home_mnc) = home.unwrap_or((d.mcc, d.mnc));
     v.other = v.have_home && v.roam && d.mcc > 0 && (v.home_mcc != d.mcc || v.home_mnc != d.mnc);
     v.sim_usable = sim_usable(&d.sim_state);
-    v.logo = if v.sim_usable { sim_logo(v.home_mcc, v.home_mnc, &d.sim_spn).unwrap_or("") } else { "" }.into();
+    v.logo = if v.sim_usable {
+        sim_logo(v.home_mcc, v.home_mnc, &d.sim_spn).unwrap_or("")
+    } else {
+        ""
+    }
+    .into();
 
     v.fine = rat_long(&d.net_type, v.act_lte);
-    v.name = if d.operator_name.is_empty() { "未注册".into() } else { d.operator_name.clone() };
+    v.name = if d.operator_name.is_empty() {
+        "未注册".into()
+    } else {
+        d.operator_name.clone()
+    };
     v.r#where = if v.nosvc || d.roaming.is_empty() {
         String::new()
     } else if v.other {

@@ -360,7 +360,9 @@ fn spn_from_ucs2_hex(value: &str) -> String {
         .filter_map(|i| u16::from_str_radix(&v[i..i + 4], 16).ok())
         .filter(|&u| u != 0 && u != 0xffff)
         .collect();
-    String::from_utf16(&units).map(|s| s.trim().to_string()).unwrap_or_default()
+    String::from_utf16(&units)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 fn valid_msisdn(value: &str) -> bool {
     let digits = value.strip_prefix('+').unwrap_or(value);
@@ -1305,7 +1307,10 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         ("nr_sa_supported_bands", "default_nr5g_sa_band_lock"),
         ("nr_nsa_supported_bands", "default_nr5g_nsa_band_lock"),
     ] {
-        let v = uci_get(&uci_sets, &format!("zwrt_zte_nwinfo.default_band_lock.{opt}"));
+        let v = uci_get(
+            &uci_sets,
+            &format!("zwrt_zte_nwinfo.default_band_lock.{opt}"),
+        );
         if !v.is_empty() {
             net.insert(to.into(), json!(v));
         }
@@ -1867,7 +1872,10 @@ pub async fn ubus(service: &str, method: &str, args: Value) -> Result<Value, Str
 mod tests {
     #[test]
     fn spn_decodes_vendor_ucs2_hex() {
-        assert_eq!(super::spn_from_ucs2_hex("0043004D004C0069006E006B"), "CMLink");
+        assert_eq!(
+            super::spn_from_ucs2_hex("0043004D004C0069006E006B"),
+            "CMLink"
+        );
         assert_eq!(super::spn_from_ucs2_hex(""), "");
         assert_eq!(super::spn_from_ucs2_hex("zz"), "");
         assert_eq!(super::spn_from_ucs2_hex("4E2D56FD79FB52A8FFFF"), "中国移动");
