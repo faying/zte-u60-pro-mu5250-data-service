@@ -791,6 +791,7 @@ fn phone_style_labels_and_families() {
 fn radio_mode_words() {
     assert_eq!(net_select_word("TCHGWL_5G"), "自动");
     assert_eq!(net_select_word("WL_AND_5G"), "自动");
+    assert_eq!(net_select_word("NETWORK_auto"), "自动");
     assert_eq!(net_select_word("Only_5G"), "只用 5G SA");
     assert_eq!(net_select_word("LTE_AND_5G"), "只用 5G NSA");
     assert_eq!(net_select_word("Only_GSM_WCDMA"), "只用 3G 和 2G");
@@ -799,7 +800,9 @@ fn radio_mode_words() {
     assert!(
         net_select_is_auto("TCHGWL_5G")
             && net_select_is_auto("WL_AND_5G")
+            && net_select_is_auto("NETWORK_auto")
             && !net_select_is_auto("Only_LTE")
+            && !net_select_is_auto("WCDMA_AND_LTE")
     );
     let mut state: Value = serde_json::from_str(
         &std::fs::read_to_string(

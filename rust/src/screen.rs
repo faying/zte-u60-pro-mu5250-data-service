@@ -548,11 +548,13 @@ fn pinned_mode(sel: &str) -> Option<&'static str> {
 
 /// The radio-mode preference (`net_select`) in words: the firmware's 14 values
 /// (zte_topsw_nwinfo) are all named, anything else comes back as-is, "" as "-".
-/// B27 reports both WL_AND_5G and TCHGWL_5G for automatic.
+/// B27 reports WL_AND_5G and TCHGWL_5G for automatic, and NETWORK_auto after
+/// the lock page's 恢复默认 (nwinfo_reset_band_cell_setting, read 9-29).
 fn net_select_word(sel: &str) -> String {
     const K: &[(&str, &str)] = &[
         ("WL_AND_5G", "自动"),
         ("TCHGWL_5G", "自动"),
+        ("NETWORK_auto", "自动"),
         ("Only_5G", "只用 5G SA"),
         ("LTE_AND_5G", "只用 5G NSA"),
         ("4G_AND_5G", "4G + 5G"),
@@ -575,7 +577,7 @@ fn net_select_word(sel: &str) -> String {
 }
 
 fn net_select_is_auto(sel: &str) -> bool {
-    sel == "WL_AND_5G" || sel == "TCHGWL_5G"
+    sel == "WL_AND_5G" || sel == "TCHGWL_5G" || sel == "NETWORK_auto"
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Default)]
