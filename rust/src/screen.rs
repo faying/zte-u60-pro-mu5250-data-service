@@ -4,9 +4,11 @@
 //! 起搬到这里，屏幕只负责画（manager `docs/screen-logic-move.md`）。为了保证搬的时候
 //! 一条规则都没变，这里刻意照着 C 的读法：同样的字段长度截断、`atoi`/`atof`/`sscanf`
 //! 的前缀解析、`(int)` 向零取整、`%.0f`/`%.1f` 的写法。`tests/fixtures/screen_net_corpus.jsonl`
-//! 是 C 对 1700 多份 /state 算出的结果，测试要求这里逐字段一样
-//! （生成工具在 touch-ui tag `parity-net-v1` 的 `tests/parity/`；那之后 C 里的规则已删除，
-//! 这份样本就是固定的参照，改规则时连同样本和 `screen/tests.rs` 一起改）。
+//! 最初是 C 对 1700 多份 /state 算出的结果，测试要求这里逐字段一样
+//! （生成工具在 touch-ui tag `parity-net-v1` 的 `tests/parity/`；那之后 C 里的规则已删除）。
+//! 之后改规则时，样本用 `screen/tests.rs` 里的 bless 测试按这里重录
+//! （`SCREEN_CORPUS_BLESS=1 cargo test screen::tests::bless_corpus -- --ignored`，
+//! patch 原样保留），再逐条核对变化是不是都来自这次改的规则。
 //!
 //! 不在这里的：大字换结论前的 15 秒稳定、「已 N 分钟」无服务计时——那是「这块屏
 //! 显示过什么、什么时候」，留在屏幕上。
@@ -780,7 +782,9 @@ fn story(i: &NetIn) -> Story {
     let busy = i.rx_bps >= 125_000;
     let nr = matches!(rat, Rat::Sa | Rat::Nsa);
     let mut crowd = false;
-    if busy && i.rsrp_valid && i.rsrp >= -100 && i.rsrq_valid {
+    // 「信号够不够」只看格数（和 sig 同一把尺子）：信号弱时 RSRQ 低多半是信号本身差，
+    // 不判拥挤；以前这里用 RSRP >= -100，会出现 sig=弱 却写负载高、5 格却不判负载。
+    if busy && st >= 1 && i.rsrq_valid {
         crowd = i.rsrq < if nr { -15 } else { -12 };
         o.load = if crowd { "高" } else { "正常" }.into();
     }
@@ -885,7 +889,9 @@ fn story(i: &NetIn) -> Story {
             ),
         );
     }
-    if st == 0 || (i.rsrp_valid && i.rsrp < -110) {
+    // 「信号弱」只有一个标准：格数（= sig = 状态栏）。RSRP 只在 hint 里当说明，
+    // 不单独下结论——以前 RSRP < -110 也判弱，5 格满时会一边写「信号强」一边写「慢：信号弱」。
+    if st == 0 {
         if i.rsrp_valid {
             return say(
                 o,
@@ -1095,8 +1101,13 @@ pub struct NetView {
 
 fn carriers(d: &Data, v: &mut NetView) {
     let mut ca: Vec<Carrier> = Vec::new();
+    let rat = rat_of(&d.net_type);
+    // NR 载波只在现在用着 5G（SA/NSA）时算数：离开 5G 后 nr_* 会留着旧读数
+    // （实测 LTE 下 nr_rsrp -116、lte_rsrp -95），不能拿来排第一、当主信号。
+    let on_nr = matches!(rat, Rat::Sa | Rat::Nsa);
     // an idle NSA leg still reports nr5g_rsrp but has no band, bandwidth or channel
-    if d.nr_rsrp != 0 && (!d.nr_band.is_empty() || atoi(&d.nr_bw) > 0 || d.nr_channel > 0) {
+    if on_nr && d.nr_rsrp != 0 && (!d.nr_band.is_empty() || atoi(&d.nr_bw) > 0 || d.nr_channel > 0)
+    {
         ca.push(Carrier {
             kind: "nr",
             band: 0,
@@ -1115,10 +1126,13 @@ fn carriers(d: &Data, v: &mut NetView) {
             sinr_v: atof(if d.nr_snr.is_empty() { "0" } else { &d.nr_snr }),
         });
     }
-    let room = CA_MAX - ca.len();
-    ca.extend(parse_ca(&d.nrca, room, true));
-    let rat = rat_of(&d.net_type);
-    if ca.len() < CA_MAX {
+    if on_nr {
+        let room = CA_MAX - ca.len();
+        ca.extend(parse_ca(&d.nrca, room, true));
+    }
+    // 同理，在 3G/2G 上 lteca 里也只是上次 4G 的旧读数（这些制式没有载波聚合，
+    // summary 也按「无聚合」写），不能拿它的 SINR 判「干扰大」。
+    if ca.len() < CA_MAX && !matches!(rat, Rat::G3 | Rat::G2) {
         let mut lte = parse_ca(&d.lteca, CA_MAX - ca.len(), false);
         let lte_snr = atof(if d.lte_snr.is_empty() {
             "0"

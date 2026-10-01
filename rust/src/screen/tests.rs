@@ -1,5 +1,6 @@
 //! Parity with the screen's C (touch-ui tests/parity/gen.py): every case in
 //! tests/fixtures/screen_net_corpus.jsonl must come out field for field the same.
+//! Rule changes since then are re-recorded with `bless_corpus` below.
 
 use super::*;
 use std::path::PathBuf;
@@ -262,7 +263,13 @@ fn story_every_situation_in_priority_order() {
 
     assert_eq!(h(|x| x.bars = 2), ("慢：信号弱".into(), Tone::Warn));
     assert_eq!(h(|x| x.sinr = -2.5), ("慢：干扰大".into(), Tone::Warn));
-    assert_eq!(h(|x| x.rsrp = -115), ("慢：信号弱".into(), Tone::Warn));
+    // 信号弱只看格数：5 格满时 RSRP 再低也不说「信号弱」（以前 RSRP < -110 也判弱）
+    assert_eq!(h(|x| x.rsrp = -115), ("顺畅".into(), Tone::Ok));
+    let o = with(|x| {
+        x.bars = 2;
+        x.rsrp = -115
+    });
+    assert!(o.headline == "慢：信号弱" && o.sig == "弱" && o.hint.contains("RSRP -115"));
     assert_eq!(
         h(|x| {
             x.bars = 1;
@@ -405,6 +412,22 @@ fn story_every_situation_in_priority_order() {
     );
     assert_eq!(with(|x| x.rsrq = -18).load, "");
     assert_eq!(with(|x| x.rx_bps = 400_000).load, "正常");
+    // 判不判拥挤也看格数，不看 RSRP：5 格、RSRP -116 照样判；2 格（信号弱）、RSRP -95 不判
+    assert_eq!(
+        with(|x| {
+            x.rsrp = -116;
+            x.rx_bps = 400_000
+        })
+        .load,
+        "正常"
+    );
+    let o = with(|x| {
+        x.bars = 2;
+        x.rsrp = -95;
+        x.rsrq = -18;
+        x.rx_bps = 400_000
+    });
+    assert!(o.headline == "慢：信号弱" && o.load.is_empty());
     assert_eq!(
         h(|x| {
             x.net_type = "LTE";
@@ -814,4 +837,159 @@ fn radio_mode_words() {
     state["net"]["net_select"] = "Only_LTE".into();
     let v = net_view(&state);
     assert_eq!((v.mode_word.as_str(), v.mode_auto), ("只用 4G", false));
+}
+
+fn corpus_cases() -> (Value, Vec<String>) {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let template: Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("../tests/golden/normal.state.json")).unwrap(),
+    )
+    .unwrap();
+    let corpus =
+        std::fs::read_to_string(root.join("tests/fixtures/screen_net_corpus.jsonl")).unwrap();
+    (template, corpus.lines().map(str::to_string).collect())
+}
+
+/// 用户真机（9-30）：状态栏 5 格满、右边「信号强」，大字却是「慢：信号弱 / RSRP -116」。
+#[test]
+fn full_bars_never_say_weak_signal() {
+    let (mut state, _) = corpus_cases();
+    state["net"]["bars"] = 5.into();
+    state["net"]["nr_rsrp"] = (-116).into();
+    state["net"]["nr_bw"] = "100".into();
+    state["net"]["nr_channel"] = 627264.into();
+    state["net"]["wan_status"] = "connected".into();
+    let v = net_view(&state);
+    assert_eq!(v.carriers[0].rsrp, "-116");
+    assert_eq!(v.story.sig, "强");
+    assert!(
+        !v.story.headline.contains("信号弱") && v.story.cause != Cause::Weak,
+        "{:?}",
+        v.story
+    );
+}
+
+/// 在 LTE 上时 nr_* 留着上次 5G 的旧读数（实测 nr_rsrp -116、lte_rsrp -95）：
+/// 不能出 NR 载波，主信号要用 LTE 的。
+#[test]
+fn stale_nr_readings_ignored_off_5g() {
+    let (mut state, _) = corpus_cases();
+    let net = &mut state["net"];
+    net["type"] = "LTE".into();
+    net["band"] = "LTE BAND 3".into();
+    net["bars"] = 4.into();
+    net["nr_rsrp"] = (-116).into();
+    net["nr_snr"] = "-3.0".into();
+    net["nr_channel"] = 627264.into();
+    net["nr_bw"] = "100".into();
+    net["nrca"] = "1,78,1,627264,100,-116,-12,-3.0,0,0,0".into();
+    net["lte_rsrp"] = (-95).into();
+    net["lte_rsrq"] = (-10).into();
+    net["lte_snr"] = "12.0".into();
+    net["lte_pci"] = 101.into();
+    net["channel"] = 1850.into();
+    net["bandwidth"] = "20".into();
+    net["wan_status"] = "connected".into();
+    let v = net_view(&state);
+    assert!(
+        v.carriers.iter().all(|c| c.kind == "lte"),
+        "{:?}",
+        v.carriers
+    );
+    assert_eq!((v.act_nr, v.nr_band0, v.nr_mhz), (0, 0, 0));
+    let c0 = &v.carriers[0];
+    assert_eq!((c0.rsrp.as_str(), c0.sinr.as_str()), ("-95", "12.0"));
+    assert!(!v.story.headline.contains("信号弱") && !v.story.hint.contains("-116"));
+    assert_eq!(v.story.noise, "中");
+
+    // 到了 3G/2G，lteca 里的也是旧读数：不出载波，结论是「只有 3G」，不拿旧 SINR 判干扰
+    state["net"]["type"] = "WCDMA".into();
+    state["net"]["lteca"] = "0,3,0,1850,20,0,-118,-14,-2.5,-60,0".into();
+    let v = net_view(&state);
+    assert!(
+        v.carriers.is_empty() && v.ca_val == "无聚合",
+        "{:?}",
+        v.carriers
+    );
+    assert_eq!(v.story.headline, "只有 3G");
+    state["net"]["lteca"] = "".into();
+
+    // 同一份读数换成 5G（NSA）时 NR 载波照常排第一
+    state["net"]["type"] = "NSA".into();
+    let v = net_view(&state);
+    assert_eq!(v.carriers[0].kind, "nr");
+}
+
+/// 遍历全部对照样本：「信号弱」和右边的 sig（= 状态栏格数）不能互相矛盾。
+/// 限速、没连上网、无服务等更高优先级的结论会先返回，所以不是严格的「⇔」：
+/// (a) 大字或说明提到信号弱 ⇒ sig 是「弱」；
+/// (b) sig 是「弱」⇒ 大字不是排在「信号弱」后面的结论；
+/// (c) 信号弱时不判负载（load 为空）。
+#[test]
+fn weak_signal_agrees_with_bars_on_the_corpus() {
+    let (template, lines) = corpus_cases();
+    let later = [
+        "顺畅",
+        "慢：干扰大",
+        "慢：疑似拥挤",
+        "慢：载波窄",
+        "只有 2G",
+        "只有 3G",
+    ];
+    let (mut n, mut weak) = (0, 0);
+    for line in lines.iter().skip(1) {
+        let case: Value = serde_json::from_str(line).unwrap();
+        let mut state = template.clone();
+        merge(&mut state, &case["patch"]);
+        let s = net_view(&state).story;
+        let says_weak = s.headline.contains("信号弱") || s.hint.contains("离基站远");
+        let id = &case["id"];
+        assert!(!says_weak || s.sig == "弱", "case {id}: {s:?}");
+        if s.sig == "弱" {
+            weak += 1;
+            assert!(!later.contains(&s.headline.as_str()), "case {id}: {s:?}");
+            assert!(s.load.is_empty(), "case {id}: {s:?}");
+        }
+        n += 1;
+    }
+    assert!(n > 1000 && weak > 10, "n={n} weak={weak}");
+}
+
+/// 改规则后重录对照样本：`SCREEN_CORPUS_BLESS=1 cargo test screen::tests::bless_corpus -- --ignored`。
+/// 每条的 patch 和 parsed 原样保留，只换 view（字段顺序同原样本，不含后加的 mode_word/mode_auto）。
+#[test]
+#[ignore]
+fn bless_corpus() {
+    if std::env::var_os("SCREEN_CORPUS_BLESS").is_none() {
+        return;
+    }
+    let (template, lines) = corpus_cases();
+    let mut out = String::new();
+    for (k, line) in lines.iter().enumerate() {
+        if k == 0 || line.is_empty() {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let case: Value = serde_json::from_str(line).unwrap();
+        let mut state = template.clone();
+        merge(&mut state, &case["patch"]);
+        let v = net_view(&state);
+        // the corpus has story last (after bars_tier), the struct has it in the middle
+        let story = format!(",\"story\":{}", serde_json::to_string(&v.story).unwrap());
+        let view = serde_json::to_string(&v).unwrap().replacen(&story, "", 1);
+        let view = format!("{}{story}", &view[..view.rfind(",\"mode_word\":").unwrap()]);
+        let head = &line[..line.find(",\"view\":").unwrap()];
+        let parsed = &line[line.rfind(",\"parsed\":").unwrap()..line.len() - 2];
+        out.push_str(&format!("{head},\"view\":{view}{parsed}}}}}\n"));
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("tests/fixtures/screen_net_corpus.jsonl");
+    let old = std::fs::read_to_string(&path).unwrap();
+    let out = if old.ends_with('\n') {
+        out
+    } else {
+        out.trim_end_matches('\n').to_string()
+    };
+    std::fs::write(path, out).unwrap();
 }
