@@ -114,6 +114,12 @@ data: {"ts":1782396733,...}
     "nr_band0": 78, "nr_mhz": 100, "have_home": true, "home_mcc": 460, "home_mnc": 0 } }
 ```
 
+英文（2026-10-01 起，界面语言 L2）：原有字段一个不改，只在后面加。
+- `story.state`：结论码，每个结论一个，互不相同：`nosim airplane sos nosvc nodata limit weak noise crowd only2g only3g narrow ok`。客户端判断状态看它，不比对中文。同一结论下的不同情况由 `hint` 区分。
+- 中文里有非 ASCII 字符的文字字段，旁边多一个 `<字段>_en`：story 的 `headline hint rat link sig noise load limit`，net 的 `fine name where ca_val ca_sub mode_word`。中文为空时没有 `_en`。英文大字只写状态词（≤10 字符，如 `Slow`），原因放在 `hint_en`。
+- 措辞以 manager `docs/ui-glossary.md` 为准；4 家内地运营商的 `name_en` 是 China Mobile / China Unicom / China Telecom / China Broadnet，其余运营商的广播名原样。
+- 老客户端只读原字段，多出来的字段不影响它；`screen/tests.rs` 断言整个响应仍在老触屏的解析缓冲内。
+
 ### `GET /capabilities`
 
 返回内部协议版本、支持的控制动作和事件类型。

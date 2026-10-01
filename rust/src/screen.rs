@@ -166,6 +166,8 @@ fn upper_prefix(s: &str, n: usize) -> String {
 struct Data {
     net_type: String,
     operator_name: String,
+    /// English for operator_name: the 4 mainland carriers by name, others as broadcast.
+    operator_name_en: String,
     roaming: String,
     band: String,
     nr_band: String,
@@ -198,21 +200,27 @@ struct Data {
     cell_roam: i64,
 }
 
-fn mainland_operator_cn(mcc: i64, mnc: i64, raw: &str) -> Option<&'static str> {
+/// The 4 mainland carriers as (中文, English); the English must match zte-agent's
+/// operator table word for word (manager docs/ui-glossary.md §8).
+fn mainland_operator(mcc: i64, mnc: i64, raw: &str) -> Option<(&'static str, &'static str)> {
+    const CM: (&str, &str) = ("中国移动", "China Mobile");
+    const CU: (&str, &str) = ("中国联通", "China Unicom");
+    const CT: (&str, &str) = ("中国电信", "China Telecom");
+    const CB: (&str, &str) = ("中国广电", "China Broadnet");
     if mcc == 460 {
         match mnc {
-            0 | 2 | 4 | 7 | 8 => return Some("中国移动"),
-            1 | 6 | 9 => return Some("中国联通"),
-            3 | 5 | 11 => return Some("中国电信"),
-            15 => return Some("中国广电"),
+            0 | 2 | 4 | 7 | 8 => return Some(CM),
+            1 | 6 | 9 => return Some(CU),
+            3 | 5 | 11 => return Some(CT),
+            15 => return Some(CB),
             _ => {}
         }
     }
     match raw {
-        "China Mobile" | "CMCC" => Some("中国移动"),
-        "China Unicom" | "CUCC" => Some("中国联通"),
-        "China Telecom" | "CTCC" => Some("中国电信"),
-        "China Broadnet" | "China Broadcasting Network" => Some("中国广电"),
+        "China Mobile" | "CMCC" => Some(CM),
+        "China Unicom" | "CUCC" => Some(CU),
+        "China Telecom" | "CTCC" => Some(CT),
+        "China Broadnet" | "China Broadcasting Network" => Some(CB),
         _ => None,
     }
 }
@@ -252,8 +260,10 @@ fn parse(state: &Value) -> Data {
         if d.channel == 0 {
             d.channel = get_int(net, "lte_channel", 0);
         }
-        if let Some(cn) = mainland_operator_cn(d.mcc, d.mnc, &d.operator_name) {
+        d.operator_name_en = d.operator_name.clone();
+        if let Some((cn, en)) = mainland_operator(d.mcc, d.mnc, &d.operator_name) {
             d.operator_name = cstr(cn.to_string(), 48);
+            d.operator_name_en = cstr(en.to_string(), 48);
         }
     }
     if let Some(cell) = state.get("interfaces").and_then(|i| i.get("cellular")) {
@@ -385,12 +395,18 @@ fn rat_family(raw: &str) -> &'static str {
     ""
 }
 
-fn rat_long(raw: &str, lte_active: i64) -> String {
+/// (中文, English); only the NSA wording differs.
+fn rat_long(raw: &str, lte_active: i64) -> (String, String) {
     let fam = rat_family(raw);
     let sp = if fam.is_empty() { "" } else { " " };
     let s = match rat_of(raw) {
         Rat::Sa => "5G SA".to_string(),
-        Rat::Nsa => "5G NSA · 4G 锚点".to_string(),
+        Rat::Nsa => {
+            return (
+                cstr("5G NSA · 4G 锚点".into(), 32),
+                cstr("5G NSA · 4G anchor".into(), 32),
+            );
+        }
         Rat::G4 => if lte_active >= 2 {
             "4G LTE-A"
         } else {
@@ -401,7 +417,8 @@ fn rat_long(raw: &str, lte_active: i64) -> String {
         Rat::G2 => format!("2G{sp}{fam}"),
         Rat::None => String::new(),
     };
-    cstr(s, 32)
+    let s = cstr(s, 32);
+    (s.clone(), s)
 }
 
 /// `ui_band_short`: the last run of digits as n78 / B3; a frequency (≥ 450) or
@@ -552,30 +569,32 @@ fn pinned_mode(sel: &str) -> Option<&'static str> {
 /// (zte_topsw_nwinfo) are all named, anything else comes back as-is, "" as "-".
 /// B27 reports WL_AND_5G and TCHGWL_5G for automatic, and NETWORK_auto after
 /// the lock page's 恢复默认 (nwinfo_reset_band_cell_setting, read 9-29).
-fn net_select_word(sel: &str) -> String {
-    const K: &[(&str, &str)] = &[
-        ("WL_AND_5G", "自动"),
-        ("TCHGWL_5G", "自动"),
-        ("NETWORK_auto", "自动"),
-        ("Only_5G", "只用 5G SA"),
-        ("LTE_AND_5G", "只用 5G NSA"),
-        ("4G_AND_5G", "4G + 5G"),
-        ("WL_AND_NSA", "5G NSA + 4G + 3G"),
-        ("Only_LTE", "只用 4G"),
-        ("WCDMA_AND_LTE", "4G + 3G"),
-        ("GSM_AND_LTE", "4G + 2G"),
-        ("TDSCDMA_AND_LTE", "4G + TD-SCDMA"),
-        ("Only_WCDMA", "只用 3G"),
-        ("Only_GSM_WCDMA", "只用 3G 和 2G"),
-        ("Only_TDSCDMA", "只用 TD-SCDMA"),
-        ("Only_GSM", "只用 2G"),
+/// Returns (中文, English); English per manager docs/ui-glossary.md §7.
+fn net_select_word(sel: &str) -> (String, String) {
+    const K: &[(&str, &str, &str)] = &[
+        ("WL_AND_5G", "自动", "Auto"),
+        ("TCHGWL_5G", "自动", "Auto"),
+        ("NETWORK_auto", "自动", "Auto"),
+        ("Only_5G", "只用 5G SA", "5G SA only"),
+        ("LTE_AND_5G", "只用 5G NSA", "5G NSA only"),
+        ("4G_AND_5G", "4G + 5G", "4G + 5G"),
+        ("WL_AND_NSA", "5G NSA + 4G + 3G", "5G NSA + 4G + 3G"),
+        ("Only_LTE", "只用 4G", "4G only"),
+        ("WCDMA_AND_LTE", "4G + 3G", "4G + 3G"),
+        ("GSM_AND_LTE", "4G + 2G", "4G + 2G"),
+        ("TDSCDMA_AND_LTE", "4G + TD-SCDMA", "4G + TD-SCDMA"),
+        ("Only_WCDMA", "只用 3G", "3G only"),
+        ("Only_GSM_WCDMA", "只用 3G 和 2G", "3G & 2G only"),
+        ("Only_TDSCDMA", "只用 TD-SCDMA", "TD-SCDMA only"),
+        ("Only_GSM", "只用 2G", "2G only"),
     ];
     if sel.is_empty() {
-        return "-".into();
+        return ("-".into(), "-".into());
     }
-    K.iter()
-        .find(|k| k.0 == sel)
-        .map_or_else(|| sel.to_string(), |k| k.1.to_string())
+    K.iter().find(|k| k.0 == sel).map_or_else(
+        || (sel.to_string(), sel.to_string()),
+        |k| (k.1.to_string(), k.2.to_string()),
+    )
 }
 
 fn net_select_is_auto(sel: &str) -> bool {
@@ -601,6 +620,28 @@ pub enum Cause {
     Weak,
     Noise,
     Crowd,
+    Narrow,
+}
+
+/// `story.state`: which verdict the headline is, as a code the screen and the web
+/// can compare instead of the Chinese text. One code per headline in manager
+/// docs/DESIGN.md §4「首页结论表」; the hint variants under one headline share it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum State {
+    #[default]
+    Ok,
+    Nosim,
+    Airplane,
+    Sos,
+    Nosvc,
+    Nodata,
+    Limit,
+    Weak,
+    Noise,
+    Crowd,
+    Only2g,
+    Only3g,
     Narrow,
 }
 
@@ -661,6 +702,51 @@ pub struct Story {
     pub load: String,
     /// 无 / 有 / — (AMBR unknown).
     pub limit: String,
+    // Added for the English screen (L2). Kept after the original fields so the
+    // corpus re-recorder can cut them off; each `*_en` is present only when its
+    // Chinese field has non-ASCII text (otherwise the Chinese field is already it).
+    pub state: State,
+    /// The state word only: All good / Slow / No service … (≤ 10 chars).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub headline_en: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub hint_en: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub rat_en: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub link_en: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sig_en: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub noise_en: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub load_en: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub limit_en: String,
+}
+
+/// The English sibling of a Chinese field: kept only when the Chinese has
+/// non-ASCII text, cut like the Chinese one (`char[cap]` on the screen).
+fn en_for(zh: &str, en: &str, cap: usize) -> String {
+    if zh.is_ascii() {
+        String::new()
+    } else {
+        cstr(en.to_string(), cap)
+    }
+}
+
+impl Story {
+    fn finish_en(mut self) -> Self {
+        self.headline_en = en_for(&self.headline, &self.headline_en, 32);
+        self.hint_en = en_for(&self.hint, &self.hint_en, 128);
+        self.rat_en = en_for(&self.rat, &self.rat_en, 32);
+        self.link_en = en_for(&self.link, &self.link_en, 96);
+        self.sig_en = en_for(&self.sig, &self.sig_en, 8);
+        self.noise_en = en_for(&self.noise, &self.noise_en, 8);
+        self.load_en = en_for(&self.load, &self.load_en, 12);
+        self.limit_en = en_for(&self.limit, &self.limit_en, 8);
+        self
+    }
 }
 
 fn net_label(raw: &str) -> &'static str {
@@ -721,42 +807,54 @@ fn story(i: &NetIn) -> Story {
     let rat = rat_of(i.net_type);
     let pin = pinned_mode(i.net_select);
     let limited = has_ci(i.net_type, "LIMIT") || has_ci(i.net_type, "EMERGENCY");
+    let badge = cstr(net_badge(i), 32);
     let mut o = Story {
-        rat: cstr(net_badge(i), 32),
+        rat_en: badge.clone(),
+        rat: badge,
         ..Default::default()
     };
 
     if matches!(rat, Rat::G2 | Rat::G3) {
         o.link = "这个制式没有载波聚合".into();
+        o.link_en = "No CA on this network".into();
     } else if i.n_active > 0 {
-        let w = if i.mhz >= 200 {
-            "带宽很宽"
+        let (w, w_en) = if i.mhz >= 200 {
+            ("带宽很宽", "Very wide")
         } else if i.mhz >= 100 {
-            "带宽充足"
+            ("带宽充足", "Wide")
         } else if i.mhz >= 40 {
-            "带宽一般"
+            ("带宽一般", "Fair")
         } else if i.mhz > 0 {
-            "带宽偏窄"
+            ("带宽偏窄", "Narrow")
         } else {
-            ""
+            ("", "")
         };
-        let n = if rat == Rat::Nsa {
-            format!("4G 锚点 + 5G，{} 条载波", i.n_active)
+        let (n, n_en) = if rat == Rat::Nsa {
+            (
+                format!("4G 锚点 + 5G，{} 条载波", i.n_active),
+                format!(
+                    "4G anchor + 5G, {} carrier{}",
+                    i.n_active,
+                    if i.n_active == 1 { "" } else { "s" }
+                ),
+            )
         } else if i.n_active > 1 {
-            format!("{} 条载波聚合", i.n_active)
+            (
+                format!("{} 条载波聚合", i.n_active),
+                format!("{}-carrier CA", i.n_active),
+            )
         } else {
-            "单载波".to_string()
+            ("单载波".to_string(), "Single carrier".to_string())
         };
-        let n = cstr(n, 64);
-        o.link = cstr(
-            format!("{n}{}{w}", if w.is_empty() { "" } else { " · " }),
-            96,
-        );
+        let sep = if w.is_empty() { "" } else { " · " };
+        o.link = cstr(format!("{}{sep}{w}", cstr(n, 64)), 96);
+        o.link_en = cstr(format!("{}{sep}{w_en}", cstr(n_en, 64)), 96);
     }
 
     let st = bars_tier(i.bars);
     if st >= 0 {
         o.sig = ["弱", "中", "强"][st as usize].into();
+        o.sig_en = ["Weak", "Fair", "Strong"][st as usize].into();
         o.sig_tone = match st {
             2 => Tone::Ok,
             1 => Tone::Warn,
@@ -772,7 +870,9 @@ fn story(i: &NetIn) -> Story {
         } else {
             0
         };
+        // shown after 干扰 / Noise
         o.noise = ["大", "中", "小"][nq as usize].into();
+        o.noise_en = ["high", "mid", "low"][nq as usize].into();
         o.noise_tone = match nq {
             2 => Tone::Ok,
             1 => Tone::Warn,
@@ -786,185 +886,311 @@ fn story(i: &NetIn) -> Story {
     // 不判拥挤；以前这里用 RSRP >= -100，会出现 sig=弱 却写负载高、5 格却不判负载。
     if busy && st >= 1 && i.rsrq_valid {
         crowd = i.rsrq < if nr { -15 } else { -12 };
-        o.load = if crowd { "高" } else { "正常" }.into();
+        // shown after 负载 / Load
+        (o.load, o.load_en) = if crowd {
+            ("高".into(), "high".into())
+        } else {
+            ("正常".into(), "normal".into())
+        };
     }
     let capped = i.ambr_dl > 0.0 && i.ambr_dl < 10.0;
-    o.limit = if i.ambr_dl <= 0.0 {
-        "—"
+    let (lim, lim_en) = if i.ambr_dl <= 0.0 {
+        ("—", "—")
     } else if capped {
-        "有"
+        ("有", "capped")
     } else {
-        "无"
-    }
-    .into();
+        ("无", "none")
+    };
+    (o.limit, o.limit_en) = (lim.into(), lim_en.into());
     let narrow = i.n_active == 1 && i.mhz > 0 && i.mhz <= 20 && (rat == Rat::G4 || nr);
-    let roam_note = if i.roaming == 1 { "；漫游中" } else { "" };
+    let (roam_note, roam_en) = if i.roaming == 1 {
+        ("；漫游中", "; roaming")
+    } else {
+        ("", "")
+    };
 
-    let say = |mut o: Story, cause: Cause, tone: Tone, head: &str, hint: String| {
+    // Every verdict is written once, Chinese and English side by side.
+    let say = |mut o: Story,
+               state: State,
+               cause: Cause,
+               tone: Tone,
+               head: (&str, &str),
+               hint: (String, String)| {
+        o.state = state;
         o.cause = cause;
         o.tone = tone;
-        o.headline = cstr(head.to_string(), 32);
-        o.hint = cstr(hint, 128);
-        o
+        o.headline = cstr(head.0.to_string(), 32);
+        o.headline_en = head.1.to_string();
+        o.hint = cstr(hint.0, 128);
+        o.hint_en = hint.1;
+        o.finish_en()
     };
+    let t = |zh: &str, en: &str| (zh.to_string(), en.to_string());
     if !sim_usable(i.sim_state) {
         return say(
             o,
+            State::Nosim,
             Cause::None,
             Tone::Bad,
-            "无 SIM",
-            "插卡，或在「功能 → eSIM」启用".into(),
+            ("无 SIM", "No SIM"),
+            t(
+                "插卡，或在「蜂窝 → SIM 与 eSIM」启用",
+                "Insert a SIM, or enable an eSIM profile in SIM & eSIM",
+            ),
         );
     }
     if i.airplane {
         return say(
             o,
+            State::Airplane,
             Cause::None,
             Tone::Neutral,
-            "移动网络已关",
-            "飞行模式开着，去管理网页关掉".into(),
+            ("移动网络已关", "Airplane"),
+            t(
+                "飞行模式开着，去管理网页关掉",
+                "Turn off airplane mode in the web admin",
+            ),
         );
     }
     if limited {
         let h = if i.roaming == 1 {
-            "没注册上：卡要开漫游，或换当地卡"
+            t(
+                "没注册上：卡要开漫游，或换当地卡",
+                "Ask your carrier to enable roaming, or use a local SIM",
+            )
         } else {
-            "没注册上：欠费、停机，或这里没这家的网"
+            t(
+                "没注册上：欠费、停机，或这里没这家的网",
+                "Check your balance or line status; this carrier may have no coverage here",
+            )
         };
-        return say(o, Cause::None, Tone::Bad, "只能紧急呼叫", h.into());
+        return say(
+            o,
+            State::Sos,
+            Cause::None,
+            Tone::Bad,
+            ("只能紧急呼叫", "SOS only"),
+            h,
+        );
     }
     if i.bars <= 0 || rat == Rat::None {
         o.rat = "无服务".into();
+        o.rat_en = "No svc".into();
         let h = if pin.is_some() {
-            "正在搜网；制式被限定，去「锁频」改回自动"
+            t(
+                "正在搜网；制式被限定，去「蜂窝」改回自动",
+                "Searching; set network mode to Auto in Cellular",
+            )
         } else {
-            "正在搜网，换个位置试试"
+            t("正在搜网，换个位置试试", "Searching; try another spot")
         };
-        return say(o, Cause::None, Tone::Bad, "无服务", h.into());
+        return say(
+            o,
+            State::Nosvc,
+            Cause::None,
+            Tone::Bad,
+            ("无服务", "No service"),
+            h,
+        );
     }
     if !i.data_up {
+        let off = ("没连上网", "Offline");
         if i.data_sw == Sw::Off {
             return say(
                 o,
+                State::Nodata,
                 Cause::None,
                 Tone::Bad,
-                "没连上网",
-                "移动数据关着：去「蜂窝」打开".into(),
+                off,
+                t(
+                    "移动数据关着：去「蜂窝」打开",
+                    "Turn on mobile data in Cellular",
+                ),
             );
         }
         if i.roaming == 1 && i.roam_sw == Sw::Off {
             return say(
                 o,
+                State::Nodata,
                 Cause::None,
                 Tone::Bad,
-                "没连上网",
-                "数据漫游关着：去「蜂窝」打开，卡也要开通".into(),
+                off,
+                t(
+                    "数据漫游关着：去「蜂窝」打开，卡也要开通",
+                    "Turn on data roaming in Cellular; your plan must allow it too",
+                ),
             );
         }
         if i.roaming == 1 && i.roam_sw == Sw::On {
             return say(
                 o,
+                State::Nodata,
                 Cause::None,
                 Tone::Bad,
-                "没连上网",
-                "正在拨号，换网后要半分钟左右；一直不通多半是卡在这家网络没开漫游".into(),
+                off,
+                t(
+                    "正在拨号，换网后要半分钟左右；一直不通多半是卡在这家网络没开漫游",
+                    "Connecting, ~30 s after a network change; if stuck, your plan may not roam here",
+                ),
             );
         }
         let h = if i.roaming == 1 {
-            "数据没拨上：看「蜂窝」里数据漫游开没开，卡也要开通"
+            t(
+                "数据没拨上：看「蜂窝」里数据漫游开没开，卡也要开通",
+                "Check data roaming in Cellular; your plan must allow it too",
+            )
         } else {
-            "数据没拨上：查流量开关、APN 或欠费"
+            t(
+                "数据没拨上：查流量开关、APN 或欠费",
+                "Check mobile data, APN, or your balance",
+            )
         };
-        return say(o, Cause::None, Tone::Bad, "没连上网", h.into());
+        return say(o, State::Nodata, Cause::None, Tone::Bad, off, h);
     }
     if capped {
+        let mbps = to_int(i.ambr_dl + 0.5) as i32;
         return say(
             o,
+            State::Limit,
             Cause::Limit,
             Tone::Warn,
-            "慢：限速",
-            format!(
-                "运营商限到 {} Mbps，换位置没用",
-                to_int(i.ambr_dl + 0.5) as i32
+            ("慢：限速", "Slow"),
+            (
+                format!("运营商限到 {mbps} Mbps，换位置没用"),
+                format!("Carrier caps speed at {mbps} Mbps; moving won't help"),
             ),
         );
     }
     // 「信号弱」只有一个标准：格数（= sig = 状态栏）。RSRP 只在 hint 里当说明，
     // 不单独下结论——以前 RSRP < -110 也判弱，5 格满时会一边写「信号强」一边写「慢：信号弱」。
     if st == 0 {
-        if i.rsrp_valid {
-            return say(
-                o,
-                Cause::Weak,
-                Tone::Warn,
-                "慢：信号弱",
+        let h = if i.rsrp_valid {
+            (
                 format!("RSRP {}：离基站远，靠窗通常好些{roam_note}", i.rsrp),
-            );
-        }
+                format!(
+                    "Weak signal, RSRP {} dBm; try near a window{roam_en}",
+                    i.rsrp
+                ),
+            )
+        } else {
+            (
+                format!("离基站远，靠窗通常好些{roam_note}"),
+                format!("Weak signal; try near a window{roam_en}"),
+            )
+        };
         return say(
             o,
+            State::Weak,
             Cause::Weak,
             Tone::Warn,
-            "慢：信号弱",
-            format!("离基站远，靠窗通常好些{roam_note}"),
+            ("慢：信号弱", "Slow"),
+            h,
         );
     }
     if nq == 0 {
+        let sinr = fmt1(i.sinr);
         return say(
             o,
+            State::Noise,
             Cause::Noise,
             Tone::Warn,
-            "慢：干扰大",
-            format!(
-                "SINR {}：杂波多，挪个位置或换个朝向{roam_note}",
-                fmt1(i.sinr)
+            ("慢：干扰大", "Slow"),
+            (
+                format!("SINR {sinr}：杂波多，挪个位置或换个朝向{roam_note}"),
+                format!("Noisy signal, SINR {sinr} dB; move or rotate the device{roam_en}"),
             ),
         );
     }
     if crowd {
         return say(
             o,
+            State::Crowd,
             Cause::Crowd,
             Tone::Warn,
-            "慢：疑似拥挤",
-            format!("RSRQ {}：人多抢网，换位置帮助不大", i.rsrq),
+            ("慢：疑似拥挤", "Slow"),
+            (
+                format!("RSRQ {}：人多抢网，换位置帮助不大", i.rsrq),
+                format!("Cell busy, RSRQ {} dB; moving won't help much", i.rsrq),
+            ),
         );
     }
     if rat == Rat::G2 {
         let h = if pin.is_some() {
-            "制式被限定只用 2G，去「锁频」改回"
+            t(
+                "制式被限定只用 2G，去「蜂窝」改回",
+                "Network mode is 2G only; set it to Auto in Cellular",
+            )
         } else {
-            "上网会非常慢，附近可能没有 4G/5G"
+            t(
+                "上网会非常慢，附近可能没有 4G/5G",
+                "Very slow; probably no 4G/5G nearby",
+            )
         };
-        return say(o, Cause::None, Tone::Warn, "只有 2G", h.into());
+        return say(
+            o,
+            State::Only2g,
+            Cause::None,
+            Tone::Warn,
+            ("只有 2G", "2G only"),
+            h,
+        );
     }
     if rat == Rat::G3 {
         let h = if pin.is_some() {
-            "制式被限定只用 3G，去「锁频」改回"
+            t(
+                "制式被限定只用 3G，去「蜂窝」改回",
+                "Network mode is 3G only; set it to Auto in Cellular",
+            )
         } else {
-            "能上网但较慢，附近可能没有 4G/5G"
+            t(
+                "能上网但较慢，附近可能没有 4G/5G",
+                "Online but slow; probably no 4G/5G nearby",
+            )
         };
-        return say(o, Cause::None, Tone::Warn, "只有 3G", h.into());
+        return say(
+            o,
+            State::Only3g,
+            Cause::None,
+            Tone::Warn,
+            ("只有 3G", "3G only"),
+            h,
+        );
     }
     if narrow {
         return say(
             o,
+            State::Narrow,
             Cause::Narrow,
             Tone::Warn,
-            "慢：载波窄",
-            format!("这里只给了 1 条 {} MHz", i.mhz),
+            ("慢：载波窄", "Slow"),
+            (
+                format!("这里只给了 1 条 {} MHz", i.mhz),
+                format!("Only one {} MHz carrier here", i.mhz),
+            ),
         );
     }
+    let good = ("顺畅", "All good");
     if pin.is_some() && rat == Rat::G4 {
         return say(
             o,
+            State::Ok,
             Cause::None,
             Tone::Ok,
-            "顺畅",
-            "制式限定只用 4G，去「锁频」改回".into(),
+            good,
+            t(
+                "制式限定只用 4G，去「蜂窝」改回",
+                "Network mode is 4G only; set it to Auto in Cellular",
+            ),
         );
     }
-    say(o, Cause::None, Tone::Ok, "顺畅", String::new())
+    say(
+        o,
+        State::Ok,
+        Cause::None,
+        Tone::Ok,
+        good,
+        (String::new(), String::new()),
+    )
 }
 
 /// C `%.1f` / `%.0f` (round half to even on the exact binary value, like
@@ -1071,7 +1297,7 @@ pub struct NetView {
     pub roam: bool,
     /// The verdict for this snapshot (the screen holds a change for 15 s).
     pub story: Story,
-    /// Headline is 无服务 / 只能紧急呼叫.
+    /// Headline is 无服务 / 只能紧急呼叫 (state nosvc / sos).
     pub nosvc: bool,
     pub sim_usable: bool,
     pub have_home: bool,
@@ -1097,6 +1323,20 @@ pub struct NetView {
     pub mode_word: String,
     /// The preference is one of the automatic values.
     pub mode_auto: bool,
+    // English siblings (L2), after the original fields; present only when the
+    // Chinese field has non-ASCII text, like `Story`'s.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub fine_en: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub name_en: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub where_en: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ca_val_en: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ca_sub_en: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub mode_word_en: String,
 }
 
 fn carriers(d: &Data, v: &mut NetView) {
@@ -1263,26 +1503,41 @@ fn summary(d: &Data, v: &mut NetView) {
     }
     let list = cstr(list, 120);
     let r2 = rat_of(&d.net_type);
+    let ca_val_en;
     if v.act_n == 0 && matches!(r2, Rat::G3 | Rat::G2) {
         v.ca_val = "无聚合".into();
+        ca_val_en = "No CA".to_string();
         v.ca_sub = if d.band.is_empty() {
             String::new()
         } else {
             band_short(&d.band, false)
         };
     } else if v.act_n == 0 {
-        v.ca_val = if v.nosvc { "没连上基站" } else { "—" }.into();
+        (v.ca_val, ca_val_en) = if v.nosvc {
+            ("没连上基站".into(), "No cell".into())
+        } else {
+            ("—".into(), "—".into())
+        };
         v.ca_sub = String::new();
     } else {
-        v.ca_val = if v.cfg > v.act_n {
-            format!("激活 {}/{}", v.act_n, v.cfg)
+        (v.ca_val, ca_val_en) = if v.cfg > v.act_n {
+            (
+                format!("激活 {}/{}", v.act_n, v.cfg),
+                format!("Active {}/{}", v.act_n, v.cfg),
+            )
         } else if v.act_n > 1 {
-            format!("{} 载波聚合", v.act_n)
+            (
+                format!("{} 载波聚合", v.act_n),
+                format!("{}-carrier CA", v.act_n),
+            )
         } else {
-            "单载波".into()
+            ("单载波".into(), "Single carrier".into())
         };
         v.ca_sub = cstr(format!("↓ {list}   ↑ {first}"), 160);
     }
+    v.ca_val_en = en_for(&v.ca_val, &ca_val_en, 48);
+    // arrows, band labels and numbers: the same in both languages
+    v.ca_sub_en = en_for(&v.ca_sub, &v.ca_sub, 160);
 }
 
 pub fn net_view(state: &Value) -> NetView {
@@ -1336,7 +1591,7 @@ pub fn net_view(state: &Value) -> NetView {
         },
     };
     v.story = story(&nin);
-    v.nosvc = v.story.headline == "无服务" || v.story.headline == "只能紧急呼叫";
+    v.nosvc = matches!(v.story.state, State::Nosvc | State::Sos);
 
     let home = imsi_plmn(&d.sim_imsi);
     v.have_home = home.is_some();
@@ -1350,26 +1605,38 @@ pub fn net_view(state: &Value) -> NetView {
     }
     .into();
 
-    v.fine = rat_long(&d.net_type, v.act_lte);
-    v.name = if d.operator_name.is_empty() {
-        "未注册".into()
+    let fine_en;
+    (v.fine, fine_en) = rat_long(&d.net_type, v.act_lte);
+    let name_en;
+    (v.name, name_en) = if d.operator_name.is_empty() {
+        ("未注册".into(), "Not registered".into())
     } else {
-        d.operator_name.clone()
+        (d.operator_name.clone(), d.operator_name_en.clone())
     };
-    v.r#where = if v.nosvc || d.roaming.is_empty() {
-        String::new()
+    let (wh, where_en) = if v.nosvc || d.roaming.is_empty() {
+        (String::new(), String::new())
     } else if v.other {
-        cstr(format!("漫游到{}", v.name), 64)
+        (
+            cstr(format!("漫游到{}", v.name), 64),
+            cstr(format!("Roaming on {name_en}"), 64),
+        )
     } else if v.roam {
-        "漫游".into()
+        ("漫游".into(), "Roaming".into())
     } else {
-        "本地".into()
+        ("本地".into(), "Local".into())
     };
+    v.r#where = wh;
 
     summary(&d, &mut v);
     v.bars_tier = bars_tier(d.bars);
-    v.mode_word = net_select_word(&d.net_select);
+    let mode_en;
+    (v.mode_word, mode_en) = net_select_word(&d.net_select);
     v.mode_auto = net_select_is_auto(&d.net_select);
+
+    v.fine_en = en_for(&v.fine, &fine_en, 32);
+    v.name_en = en_for(&v.name, &name_en, 48);
+    v.where_en = en_for(&v.r#where, &where_en, 64);
+    v.mode_word_en = en_for(&v.mode_word, &mode_en, 32);
     v
 }
 

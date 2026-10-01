@@ -39,10 +39,7 @@ fn matches_the_screens_c_on_the_corpus() {
         let mut want = case["view"].clone();
         want.as_object_mut().unwrap().remove("parsed");
         // fields added after the corpus was frozen: tested on their own below
-        let mut got = got;
-        for k in ["mode_word", "mode_auto"] {
-            got.as_object_mut().unwrap().remove(k);
-        }
+        let got = strip_added_fields(got);
         n += 1;
         if got != want {
             let (g, w) = (got.as_object().unwrap(), want.as_object().unwrap());
@@ -71,6 +68,16 @@ fn matches_the_screens_c_on_the_corpus() {
         bad.len(),
         bad.iter().take(15).cloned().collect::<Vec<_>>().join("\n")
     );
+}
+
+/// Drop what was added after the corpus was frozen (mode_word/mode_auto, and the
+/// L2 English siblings + story.state), so the Chinese still compares field by field.
+fn strip_added_fields(mut got: Value) -> Value {
+    let o = got.as_object_mut().unwrap();
+    o.retain(|k, _| !k.ends_with("_en") && k != "mode_word" && k != "mode_auto");
+    let st = o.get_mut("story").unwrap().as_object_mut().unwrap();
+    st.retain(|k, _| !k.ends_with("_en") && k != "state");
+    got
 }
 
 #[test]
@@ -156,7 +163,7 @@ fn radio_names_and_bands() {
         ("WCDMA", 1, "3G WCDMA"),
         ("GSM", 1, "2G GSM"),
     ] {
-        assert_eq!(rat_long(raw, lte), want, "{raw}");
+        assert_eq!(rat_long(raw, lte).0, want, "{raw}");
     }
     for (raw, nr, want) in [
         ("LTE BAND 3", false, "B3"),
@@ -812,14 +819,15 @@ fn phone_style_labels_and_families() {
 
 #[test]
 fn radio_mode_words() {
-    assert_eq!(net_select_word("TCHGWL_5G"), "自动");
-    assert_eq!(net_select_word("WL_AND_5G"), "自动");
-    assert_eq!(net_select_word("NETWORK_auto"), "自动");
-    assert_eq!(net_select_word("Only_5G"), "只用 5G SA");
-    assert_eq!(net_select_word("LTE_AND_5G"), "只用 5G NSA");
-    assert_eq!(net_select_word("Only_GSM_WCDMA"), "只用 3G 和 2G");
-    assert_eq!(net_select_word(""), "-");
-    assert_eq!(net_select_word("SOMETHING_NEW"), "SOMETHING_NEW");
+    let w = |s: &str| net_select_word(s).0;
+    assert_eq!(w("TCHGWL_5G"), "自动");
+    assert_eq!(w("WL_AND_5G"), "自动");
+    assert_eq!(w("NETWORK_auto"), "自动");
+    assert_eq!(w("Only_5G"), "只用 5G SA");
+    assert_eq!(w("LTE_AND_5G"), "只用 5G NSA");
+    assert_eq!(w("Only_GSM_WCDMA"), "只用 3G 和 2G");
+    assert_eq!(w(""), "-");
+    assert_eq!(w("SOMETHING_NEW"), "SOMETHING_NEW");
     assert!(
         net_select_is_auto("TCHGWL_5G")
             && net_select_is_auto("WL_AND_5G")
@@ -966,7 +974,8 @@ fn weak_signal_agrees_with_bars_on_the_corpus() {
 }
 
 /// 改规则后重录对照样本：`SCREEN_CORPUS_BLESS=1 cargo test screen::tests::bless_corpus -- --ignored`。
-/// 每条的 patch 和 parsed 原样保留，只换 view（字段顺序同原样本，不含后加的 mode_word/mode_auto）。
+/// 每条的 patch 和 parsed 原样保留，只换 view（字段顺序同原样本，不含后加的 mode_word/mode_auto、
+/// `*_en` 和 story.state）。
 #[test]
 #[ignore]
 fn bless_corpus() {
@@ -985,10 +994,15 @@ fn bless_corpus() {
         let mut state = template.clone();
         merge(&mut state, &case["patch"]);
         let v = net_view(&state);
-        // the corpus has story last (after bars_tier), the struct has it in the middle
+        // the corpus has story last (after bars_tier), the struct has it in the middle;
+        // story's L2 fields (from `state` on) and net's (after mode_word) are cut off
         let story = format!(",\"story\":{}", serde_json::to_string(&v.story).unwrap());
         let view = serde_json::to_string(&v).unwrap().replacen(&story, "", 1);
-        let view = format!("{}{story}", &view[..view.rfind(",\"mode_word\":").unwrap()]);
+        let legacy = format!("{}}}", &story[..story.find(",\"state\":").unwrap()]);
+        let view = format!(
+            "{}{legacy}",
+            &view[..view.rfind(",\"mode_word\":").unwrap()]
+        );
         let head = &line[..line.find(",\"view\":").unwrap()];
         let parsed = &line[line.rfind(",\"parsed\":").unwrap()..line.len() - 2];
         out.push_str(&format!("{head},\"view\":{view}{parsed}}}}}\n"));
@@ -1002,4 +1016,614 @@ fn bless_corpus() {
         out.trim_end_matches('\n').to_string()
     };
     std::fs::write(path, out).unwrap();
+}
+
+// ---- L2: English siblings and story.state ----------------------------------
+
+/// The headline table, hard-coded from manager docs/DESIGN.md §4「首页结论表」and
+/// docs/ui-glossary.md §4 (this repo can't read them; touch-ui's cross-repo test
+/// compares the docs with screen.rs). (state, 中文大字, English state word, tone)
+const HEADLINES: [(&str, &str, &str, Tone); 13] = [
+    ("nosim", "无 SIM", "No SIM", Tone::Bad),
+    ("airplane", "移动网络已关", "Airplane", Tone::Neutral),
+    ("sos", "只能紧急呼叫", "SOS only", Tone::Bad),
+    ("nosvc", "无服务", "No service", Tone::Bad),
+    ("nodata", "没连上网", "Offline", Tone::Bad),
+    ("limit", "慢：限速", "Slow", Tone::Warn),
+    ("weak", "慢：信号弱", "Slow", Tone::Warn),
+    ("noise", "慢：干扰大", "Slow", Tone::Warn),
+    ("crowd", "慢：疑似拥挤", "Slow", Tone::Warn),
+    ("only2g", "只有 2G", "2G only", Tone::Warn),
+    ("only3g", "只有 3G", "3G only", Tone::Warn),
+    ("narrow", "慢：载波窄", "Slow", Tone::Warn),
+    ("ok", "顺畅", "All good", Tone::Ok),
+];
+
+fn state_name(s: State) -> String {
+    serde_json::to_value(s)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// English text may only be ASCII plus the few symbols both languages share.
+fn english_ok(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_ascii() || matches!(c, '·' | '—' | '↓' | '↑'))
+}
+
+/// The rules every English string follows (glossary + DESIGN.md §1).
+fn check_en(what: &str, en: &str) {
+    assert!(english_ok(en), "{what}: non-English text in {en:?}");
+    assert!(!en.ends_with('.'), "{what}: trailing period in {en:?}");
+    assert!(
+        !en.to_ascii_lowercase().contains("please"),
+        "{what}: \"Please\" in {en:?}"
+    );
+}
+
+/// (zh, en, C buffer of the zh field on the screen) for every text field the
+/// touch screen reads (touch-ui src/net_view.c, include/net_view.h, ui_logic.h).
+fn story_pairs(s: &Story) -> Vec<(&'static str, &str, &str, usize)> {
+    vec![
+        ("headline", s.headline.as_str(), s.headline_en.as_str(), 32),
+        ("hint", s.hint.as_str(), s.hint_en.as_str(), 128),
+        ("rat", s.rat.as_str(), s.rat_en.as_str(), 32),
+        ("link", s.link.as_str(), s.link_en.as_str(), 96),
+        ("sig", s.sig.as_str(), s.sig_en.as_str(), 8),
+        ("noise", s.noise.as_str(), s.noise_en.as_str(), 8),
+        ("load", s.load.as_str(), s.load_en.as_str(), 12),
+        ("limit", s.limit.as_str(), s.limit_en.as_str(), 8),
+    ]
+}
+
+fn net_pairs(v: &NetView) -> Vec<(&'static str, &str, &str, usize)> {
+    vec![
+        ("fine", v.fine.as_str(), v.fine_en.as_str(), 32),
+        ("name", v.name.as_str(), v.name_en.as_str(), 48),
+        ("where", v.r#where.as_str(), v.where_en.as_str(), 64),
+        ("ca_val", v.ca_val.as_str(), v.ca_val_en.as_str(), 48),
+        ("ca_sub", v.ca_sub.as_str(), v.ca_sub_en.as_str(), 160),
+        (
+            "mode_word",
+            v.mode_word.as_str(),
+            v.mode_word_en.as_str(),
+            32,
+        ),
+    ]
+}
+
+/// `*_en` present ⇔ the Chinese has non-ASCII; fits the same C buffer; English rules.
+/// `passthrough` = fields allowed to carry a non-English broadcast name as-is.
+fn check_pairs(ctx: &str, pairs: &[(&'static str, &str, &str, usize)], passthrough: &[&str]) {
+    for &(k, zh, en, cap) in pairs {
+        if zh.is_ascii() {
+            assert!(en.is_empty(), "{ctx}: {k}_en {en:?} for ASCII {zh:?}");
+            continue;
+        }
+        assert!(!en.is_empty(), "{ctx}: {k}_en missing for {zh:?}");
+        assert!(
+            en.len() < cap,
+            "{ctx}: {k}_en {en:?} over char[{cap}] on the screen"
+        );
+        if !passthrough.contains(&k) {
+            check_en(&format!("{ctx}: {k}_en"), en);
+        }
+    }
+}
+
+fn check_story(ctx: &str, s: &Story) {
+    let name = state_name(s.state);
+    let row = HEADLINES
+        .iter()
+        .find(|r| r.0 == name)
+        .unwrap_or_else(|| panic!("{ctx}: state {name} not in the table"));
+    assert_eq!(
+        (s.headline.as_str(), s.headline_en.as_str(), s.tone),
+        (row.1, row.2, row.3),
+        "{ctx}: state {name}"
+    );
+    assert!(s.headline_en.chars().count() <= 10, "{ctx}: {s:?}");
+    check_pairs(ctx, &story_pairs(s), &[]);
+}
+
+/// One case per say() call, plus the hint variants inside a call; the English
+/// hint is the glossary §5 text with the numbers filled in.
+#[test]
+fn every_branch_has_its_state_and_english() {
+    type Case = (fn(&mut NetIn<'static>), &'static str, &'static str);
+    let cases: &[Case] = &[
+        (
+            |x| {
+                x.sim_state = "sim absent";
+                x.bars = 0
+            },
+            "nosim",
+            "Insert a SIM, or enable an eSIM profile in SIM & eSIM",
+        ),
+        (
+            |x| {
+                x.airplane = true;
+                x.bars = 0
+            },
+            "airplane",
+            "Turn off airplane mode in the web admin",
+        ),
+        (
+            |x| {
+                x.net_type = "LIMITED_SERVICE";
+                x.bars = 0;
+                x.roaming = 1
+            },
+            "sos",
+            "Ask your carrier to enable roaming, or use a local SIM",
+        ),
+        (
+            |x| {
+                x.net_type = "LIMITED_SERVICE";
+                x.bars = 0
+            },
+            "sos",
+            "Check your balance or line status; this carrier may have no coverage here",
+        ),
+        (
+            |x| {
+                x.net_type = "";
+                x.bars = 0;
+                x.net_select = "Only_LTE"
+            },
+            "nosvc",
+            "Searching; set network mode to Auto in Cellular",
+        ),
+        (
+            |x| {
+                x.net_type = "";
+                x.bars = 0
+            },
+            "nosvc",
+            "Searching; try another spot",
+        ),
+        (
+            |x| {
+                x.data_up = false;
+                x.data_sw = Sw::Off
+            },
+            "nodata",
+            "Turn on mobile data in Cellular",
+        ),
+        (
+            |x| {
+                x.data_up = false;
+                x.roaming = 1;
+                x.roam_sw = Sw::Off
+            },
+            "nodata",
+            "Turn on data roaming in Cellular; your plan must allow it too",
+        ),
+        (
+            |x| {
+                x.data_up = false;
+                x.roaming = 1;
+                x.roam_sw = Sw::On
+            },
+            "nodata",
+            "Connecting, ~30 s after a network change; if stuck, your plan may not roam here",
+        ),
+        (
+            |x| {
+                x.data_up = false;
+                x.roaming = 1
+            },
+            "nodata",
+            "Check data roaming in Cellular; your plan must allow it too",
+        ),
+        (
+            |x| x.data_up = false,
+            "nodata",
+            "Check mobile data, APN, or your balance",
+        ),
+        (
+            |x| x.ambr_dl = 4.6,
+            "limit",
+            "Carrier caps speed at 5 Mbps; moving won't help",
+        ),
+        (
+            |x| {
+                x.bars = 1;
+                x.rsrp = -118
+            },
+            "weak",
+            "Weak signal, RSRP -118 dBm; try near a window",
+        ),
+        (
+            |x| {
+                x.bars = 1;
+                x.rsrp = -118;
+                x.roaming = 1
+            },
+            "weak",
+            "Weak signal, RSRP -118 dBm; try near a window; roaming",
+        ),
+        (
+            |x| {
+                x.bars = 2;
+                x.rsrp_valid = false
+            },
+            "weak",
+            "Weak signal; try near a window",
+        ),
+        (
+            |x| x.sinr = -3.4,
+            "noise",
+            "Noisy signal, SINR -3.4 dB; move or rotate the device",
+        ),
+        (
+            |x| {
+                x.sinr = -3.4;
+                x.roaming = 1
+            },
+            "noise",
+            "Noisy signal, SINR -3.4 dB; move or rotate the device; roaming",
+        ),
+        (
+            |x| {
+                x.rx_bps = 200_000;
+                x.rsrq = -19
+            },
+            "crowd",
+            "Cell busy, RSRQ -19 dB; moving won't help much",
+        ),
+        (
+            |x| {
+                x.net_type = "GSM";
+                x.net_select = "Only_GSM"
+            },
+            "only2g",
+            "Network mode is 2G only; set it to Auto in Cellular",
+        ),
+        (
+            |x| x.net_type = "GSM",
+            "only2g",
+            "Very slow; probably no 4G/5G nearby",
+        ),
+        (
+            |x| {
+                x.net_type = "WCDMA";
+                x.net_select = "Only_WCDMA"
+            },
+            "only3g",
+            "Network mode is 3G only; set it to Auto in Cellular",
+        ),
+        (
+            |x| x.net_type = "WCDMA",
+            "only3g",
+            "Online but slow; probably no 4G/5G nearby",
+        ),
+        (
+            |x| {
+                x.n_active = 1;
+                x.nr_active = 1;
+                x.mhz = 20
+            },
+            "narrow",
+            "Only one 20 MHz carrier here",
+        ),
+        (
+            |x| {
+                x.net_type = "LTE";
+                x.net_select = "Only_LTE"
+            },
+            "ok",
+            "Network mode is 4G only; set it to Auto in Cellular",
+        ),
+        (|_| {}, "ok", ""),
+    ];
+    let mut seen = std::collections::BTreeMap::new();
+    for (k, (f, want_state, want_hint)) in cases.iter().enumerate() {
+        let o = with(*f);
+        let ctx = format!("case {k} ({want_state})");
+        assert_eq!(state_name(o.state), *want_state, "{ctx}: {o:?}");
+        assert_eq!(o.hint_en, *want_hint, "{ctx}: {o:?}");
+        check_story(&ctx, &o);
+        // a state always means the same headline
+        let head = (o.headline.clone(), o.headline_en.clone(), o.tone);
+        assert_eq!(
+            seen.entry(*want_state).or_insert_with(|| head.clone()),
+            &head,
+            "{ctx}"
+        );
+    }
+    // every code in the table is reachable, and no two codes share a headline
+    let codes: Vec<&str> = HEADLINES.iter().map(|r| r.0).collect();
+    assert_eq!(
+        seen.keys().copied().collect::<Vec<_>>(),
+        {
+            let mut c = codes.clone();
+            c.sort();
+            c
+        },
+        "state codes"
+    );
+    let heads: std::collections::BTreeSet<&str> = HEADLINES.iter().map(|r| r.1).collect();
+    assert_eq!(heads.len(), HEADLINES.len(), "headline per code is unique");
+    let codes_set: std::collections::BTreeSet<&str> = codes.iter().copied().collect();
+    assert_eq!(codes_set.len(), HEADLINES.len(), "codes are unique");
+
+    // the hints that point at a page name it as it is now (蜂窝 / Cellular)
+    let o = with(|x| {
+        x.net_type = "";
+        x.bars = 0;
+        x.net_select = "Only_LTE"
+    });
+    assert_eq!(o.hint, "正在搜网；制式被限定，去「蜂窝」改回自动");
+    assert_eq!(o.rat_en, "No svc");
+    let o = with(|x| x.sim_state = "sim absent");
+    assert_eq!(o.hint, "插卡，或在「蜂窝 → SIM 与 eSIM」启用");
+}
+
+#[test]
+fn right_column_words_in_english() {
+    let o = with(|_| {});
+    assert_eq!(
+        (o.sig_en.as_str(), o.noise_en.as_str(), o.limit_en.as_str()),
+        ("Strong", "low", "none")
+    );
+    assert_eq!(o.link_en, "3-carrier CA · Very wide");
+    assert_eq!(o.load_en, "", "idle: no load word");
+    let o = with(|x| {
+        x.bars = 3;
+        x.sinr = 5.0;
+        x.rx_bps = 200_000;
+        x.rsrq = -10;
+        x.mhz = 100;
+        x.ambr_dl = 0.0
+    });
+    assert_eq!(
+        (
+            o.sig_en.as_str(),
+            o.noise_en.as_str(),
+            o.load_en.as_str(),
+            o.limit_en.as_str(),
+            o.link_en.as_str()
+        ),
+        ("Fair", "mid", "normal", "—", "3-carrier CA · Wide")
+    );
+    let o = with(|x| {
+        x.net_type = "NSA";
+        x.n_active = 2;
+        x.mhz = 60
+    });
+    assert_eq!(o.link_en, "4G anchor + 5G, 2 carriers · Fair");
+    let o = with(|x| {
+        x.net_type = "LTE";
+        x.n_active = 1;
+        x.mhz = 30
+    });
+    assert_eq!(o.link_en, "Single carrier · Narrow");
+    let o = with(|x| x.net_type = "WCDMA");
+    assert_eq!(o.link_en, "No CA on this network");
+    // the badge is ASCII except 无服务: no rat_en then
+    assert_eq!((o.rat.as_str(), o.rat_en.as_str()), ("3G", ""));
+}
+
+#[test]
+fn net_fields_in_english() {
+    let (mut state, _) = corpus_cases();
+    state["net"]["type"] = "NSA".into();
+    state["net"]["mcc"] = 460.into();
+    state["net"]["mnc"] = 1.into();
+    state["net"]["net_select"] = "Only_GSM_WCDMA".into();
+    let v = net_view(&state);
+    assert_eq!(
+        (
+            v.fine_en.as_str(),
+            v.name.as_str(),
+            v.name_en.as_str(),
+            v.where_en.as_str()
+        ),
+        ("5G NSA · 4G anchor", "中国联通", "China Unicom", "Local")
+    );
+    assert_eq!(v.mode_word_en, "3G & 2G only");
+    for (sel, en) in [
+        ("WL_AND_5G", "Auto"),
+        ("Only_5G", "5G SA only"),
+        ("LTE_AND_5G", "5G NSA only"),
+        ("Only_LTE", "4G only"),
+        ("Only_WCDMA", "3G only"),
+        ("Only_TDSCDMA", "TD-SCDMA only"),
+        ("Only_GSM", "2G only"),
+    ] {
+        assert_eq!(net_select_word(sel).1, en, "{sel}");
+    }
+    for (mnc, en) in [
+        (0, "China Mobile"),
+        (1, "China Unicom"),
+        (3, "China Telecom"),
+        (15, "China Broadnet"),
+    ] {
+        assert_eq!(mainland_operator(460, mnc, "").unwrap().1, en);
+    }
+
+    // roaming on someone else's network, unregistered, carrier counts
+    state["net"]["type"] = "SA".into();
+    state["net"]["mcc"] = 440.into();
+    state["net"]["mnc"] = 20.into();
+    state["net"]["operator"] = "SoftBank".into();
+    state["net"]["roaming"] = "Roaming".into();
+    state["net"]["nrca"] =
+        "1,17,1,78,627264,100,0,-90,-10,15.5,-60;2,18,1,78,627300,100,0,-140,-10,15.5,-60".into();
+    let v = net_view(&state);
+    assert_eq!(
+        (v.r#where.as_str(), v.where_en.as_str(), v.name_en.as_str()),
+        ("漫游到SoftBank", "Roaming on SoftBank", "")
+    );
+    assert!(v.ca_val_en.starts_with("Active "), "{}", v.ca_val_en);
+    assert_eq!(v.ca_sub_en, v.ca_sub);
+    state["net"]["operator"] = "".into();
+    state["net"]["type"] = "".into();
+    state["net"]["bars"] = 0.into();
+    state["net"]["nrca"] = "".into();
+    state["net"]["nr_rsrp"] = 0.into();
+    let v = net_view(&state);
+    assert_eq!(
+        (
+            v.name_en.as_str(),
+            v.ca_val_en.as_str(),
+            v.where_en.as_str()
+        ),
+        ("Not registered", "No cell", "")
+    );
+}
+
+/// nosvc now comes from story.state; on every corpus case it must be what the
+/// old rule (comparing the Chinese headline) gave.
+#[test]
+fn nosvc_from_state_matches_the_old_headline_rule() {
+    let (template, lines) = corpus_cases();
+    let mut n = (0, 0);
+    for line in lines.iter().skip(1) {
+        let case: Value = serde_json::from_str(line).unwrap();
+        let mut state = template.clone();
+        merge(&mut state, &case["patch"]);
+        let v = net_view(&state);
+        let old = v.story.headline == "无服务" || v.story.headline == "只能紧急呼叫";
+        assert_eq!(v.nosvc, old, "case {}", case["id"]);
+        assert_eq!(
+            Value::Bool(v.nosvc),
+            case["view"]["nosvc"],
+            "case {}",
+            case["id"]
+        );
+        n.0 += 1;
+        n.1 += usize::from(v.nosvc);
+    }
+    assert!(n.0 > 1000 && n.1 > 100, "{n:?}");
+}
+
+/// Every corpus case: the English follows the rules and the headline table.
+#[test]
+fn english_on_the_corpus() {
+    let (template, lines) = corpus_cases();
+    let mut states = std::collections::BTreeSet::new();
+    for line in lines.iter().skip(1) {
+        let case: Value = serde_json::from_str(line).unwrap();
+        let mut state = template.clone();
+        merge(&mut state, &case["patch"]);
+        let v = net_view(&state);
+        let ctx = format!("case {}", case["id"]);
+        check_story(&ctx, &v.story);
+        // a broadcast name outside the 4 mainland carriers passes through as-is
+        let pass: &[&str] = if v.name_en == v.name {
+            &["name", "where"]
+        } else {
+            &[]
+        };
+        check_pairs(&ctx, &net_pairs(&v), pass);
+        states.insert(state_name(v.story.state));
+    }
+    assert!(states.len() >= 10, "{states:?}");
+}
+
+// ---- size: the old touch screen must still read the bigger /v2/screen ------
+
+/// touch-ui's buffers: src/screen_feed.c fetch() `resp[16384]` (whole HTTP reply,
+/// `truncated` → the fetch fails) and `net[8192]`; src/net_view.c
+/// net_view_parse() `st[1024]` (story), `arr[4096]` (carriers), `item[768]`
+/// (one carrier). json_get() copies at most cap-1 bytes and still says found,
+/// so a value must be < cap or its tail fields silently go missing.
+const RESP_BUF: usize = 16384;
+const HTTP_HEADROOM: usize = 512;
+const NET_BUF: usize = 8192;
+const NET_BUDGET: usize = 6 * 1024;
+const STORY_BUF: usize = 1024;
+const CARRIERS_BUF: usize = 4096;
+const CARRIER_BUF: usize = 768;
+
+fn check_sizes(ctx: &str, v: &NetView) -> (usize, usize) {
+    let net = serde_json::to_string(v).unwrap();
+    let story = serde_json::to_string(&v.story).unwrap();
+    let carriers = serde_json::to_string(&v.carriers).unwrap();
+    // what server.rs v2_screen sends
+    let resp = serde_json::to_string(&serde_json::json!({
+        "v": SCREEN_VERSION,
+        "ts": 1_759_300_000_000u64,
+        "net": serde_json::to_value(v).unwrap(),
+    }))
+    .unwrap();
+    assert!(
+        net.len() < NET_BUDGET && net.len() < NET_BUF,
+        "{ctx}: net {}",
+        net.len()
+    );
+    assert!(
+        story.len() < STORY_BUF,
+        "{ctx}: story {} {story}",
+        story.len()
+    );
+    assert!(
+        carriers.len() < CARRIERS_BUF,
+        "{ctx}: carriers {}",
+        carriers.len()
+    );
+    for c in &v.carriers {
+        let c = serde_json::to_string(c).unwrap();
+        assert!(c.len() < CARRIER_BUF, "{ctx}: carrier {}", c.len());
+    }
+    assert!(
+        resp.len() + HTTP_HEADROOM <= RESP_BUF,
+        "{ctx}: response {}",
+        resp.len()
+    );
+    (net.len(), story.len())
+}
+
+/// The longest fields at once: NSA, 5 carriers, a 47-byte non-ASCII broadcast
+/// name roamed onto, the longest hint (dialing while roaming), load and limit set.
+fn worst_case_state() -> Value {
+    let (mut state, _) = corpus_cases();
+    let name = "テストモバイル株式会社テストモバイル"; // 3-byte chars, cut to 47 bytes
+    let p = serde_json::json!({
+        "net": {
+            "type": "NSA 5G-A", "bars": 4, "operator": name, "mcc": 440, "mnc": 99,
+            "roaming": "Roaming", "wan_status": "disconnected",
+            "nr_rsrp": -139, "nr_rsrq": -43, "nr_snr": "-19.75", "nr_band": "NR5G BAND 78",
+            "nr_bw": "100", "nr_channel": 2_016_667, "nr_pci": 1007,
+            "nrca": "1,1007,1,258,2016667,400,0,-139.5,-43.5,-19.75,-120;2,1006,1,257,2016666,400,0,-139.5,-43.5,-19.75,-120;3,1005,1,261,2016665,400,0,-139.5,-43.5,-19.75,-120",
+            "lteca": "1,503,1,66,66986,20,0,-139.5,-43.5,-19.75,-120;2,502,1,66,66987,20,0,-139.5,-43.5,-19.75,-120",
+            "net_select": "WL_AND_NSA", "lte_rsrp": -139, "lte_pci": 503
+        },
+        "interfaces": {"cellular": {"enable": 1, "roam_enable": 1}},
+        "traffic": {"rx_speed": 999_999_999},
+        "qos": {"ambr_dl": "4.4"},
+        "sim": {"imsi": "460001234567890", "spn": "CMLink Worldwide Roaming SPN 01"}
+    });
+    merge(&mut state, &p);
+    state
+}
+
+#[test]
+fn response_fits_the_old_screens_buffers() {
+    let state = worst_case_state();
+    let v = net_view(&state);
+    assert_eq!(v.carriers.len(), CA_MAX, "{:?}", v.carriers);
+    assert!(v.other && v.where_en.starts_with("Roaming on "), "{v:?}");
+    assert_eq!(state_name(v.story.state), "nodata");
+    assert!(v.story.hint_en.starts_with("Connecting"));
+    check_story("worst", &v.story);
+    let (worst, worst_story) = check_sizes("worst", &v);
+
+    let (template, lines) = corpus_cases();
+    let (mut max, mut max_story) = (0, 0);
+    for line in lines.iter().skip(1) {
+        let case: Value = serde_json::from_str(line).unwrap();
+        let mut state = template.clone();
+        merge(&mut state, &case["patch"]);
+        let (n, s) = check_sizes(&format!("case {}", case["id"]), &net_view(&state));
+        (max, max_story) = (max.max(n), max_story.max(s));
+    }
+    eprintln!(
+        "net bytes: worst case {worst} (story {worst_story}), corpus max {max} (story {max_story})"
+    );
+    assert!(max <= worst, "corpus max {max} vs worst {worst}");
 }
