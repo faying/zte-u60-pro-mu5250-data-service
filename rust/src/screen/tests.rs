@@ -850,7 +850,7 @@ fn corpus_cases() -> (Value, Vec<String>) {
     (template, corpus.lines().map(str::to_string).collect())
 }
 
-/// 用户真机（9-30）：状态栏 5 格满、右边「信号强」，大字却是「慢：信号弱 / RSRP -116」。
+/// 用户真机截图：状态栏 5 格满、右边「信号强」，大字却是「慢：信号弱 / RSRP -116」。
 #[test]
 fn full_bars_never_say_weak_signal() {
     let (mut state, _) = corpus_cases();
@@ -901,6 +901,16 @@ fn stale_nr_readings_ignored_off_5g() {
     assert_eq!((c0.rsrp.as_str(), c0.sinr.as_str()), ("-95", "12.0"));
     assert!(!v.story.headline.contains("信号弱") && !v.story.hint.contains("-116"));
     assert_eq!(v.story.noise, "中");
+
+    // B27 固件的 5 段 lteca（没有信号值）：PCI 对上 lte_pci 时主信号取 lte_*
+    state["net"]["lteca"] = "101,3,0,1850,20".into();
+    let v = net_view(&state);
+    let c0 = &v.carriers[0];
+    assert_eq!(
+        (c0.kind, c0.rsrp.as_str(), c0.sinr.as_str()),
+        ("lte", "-95", "12.0")
+    );
+    state["net"]["lteca"] = "".into();
 
     // 到了 3G/2G，lteca 里的也是旧读数：不出载波，结论是「只有 3G」，不拿旧 SINR 判干扰
     state["net"]["type"] = "WCDMA".into();
