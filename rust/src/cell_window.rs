@@ -5,21 +5,19 @@
 //! `screen::story()`，`story()` 仍是「给什么数据出什么结论」。门槛（≥ 20 包发、0 包收）
 //! 在 screen.rs，这里只数。
 //!
-//! 计数来源：`rmnet_data0` 的 `statistics/{rx,tx}_packets`（和 /proc/net/dev 同一个计数）。
-//! **未核对（ER1）**：IPA 硬件转发下，手机等客户端的流量可能不计入这张网卡。核对前这版
-//! datad 不上机；核对不过就只改 `read()` 一处，换成厂商 `real_rx_bytes/real_tx_bytes`
-//! （`zwrt_data get_wwandst`）或加上 `rmnet_ipa0`。
+//! 计数来源：厂商的 `real_rx_packets/real_tx_packets`（`zwrt_data get_wwandst`，每轮
+//! `collect` 本来就读，TTL 0），由 `collect` 传进来。不用 `rmnet_data0` 网卡计数：
+//! 2026-10-02 真机核对（ER1），客户端大流量走 IPA 硬件转发，6 分钟里厂商计数收了
+//! 37062 个包，`rmnet_data0` 只有 8805、`br-lan` 发往客户端 10931；只有设备自己的
+//! 流量时两边一致（一分钟 649 对 595），所以厂商计数也包括设备本机的流量。
 
 use std::collections::VecDeque;
-use std::fs;
-use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 /// The window the screen judges: at least this long between baseline and latest.
 pub const SPAN_MS: u64 = 30_000;
 /// Longer than this between two samples = the rounds stopped; the window says nothing.
 const GAP_MS: u64 = 60_000;
-const CELL_IF: &str = "rmnet_data0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Sample {
@@ -93,18 +91,20 @@ fn ring() -> std::sync::MutexGuard<'static, Ring> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// The one place the counter is read (see the module note on ER1).
-fn read() -> Option<(u64, u64)> {
-    let root =
-        std::env::var("ZWRT_DATAD_NET_CLASS_ROOT").unwrap_or_else(|_| "/sys/class/net".into());
-    let path = Path::new(&root).join(CELL_IF).join("statistics");
-    let n = |f: &str| -> Option<u64> { fs::read_to_string(path.join(f)).ok()?.trim().parse().ok() };
-    Some((n("rx_packets")?, n("tx_packets")?))
+/// The vendor counters out of one `get_wwandst` reply; None when either is
+/// missing or not a number.
+pub fn counts(traffic: &serde_json::Value) -> Option<(u64, u64)> {
+    let n = |k: &str| match traffic.get(k)? {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    };
+    Some((n("real_rx_packets")?, n("real_tx_packets")?))
 }
 
-/// Called once per sampling round.
-pub fn sample(now_ms: u64) {
-    match read() {
+/// Called once per sampling round with (rx, tx) packets; None = not read.
+pub fn sample(now_ms: u64, counts: Option<(u64, u64)>) {
+    match counts {
         Some((rx, tx)) => ring().push(Sample {
             rx,
             tx,
@@ -189,6 +189,17 @@ mod tests {
         assert_eq!(r.window(), None);
         feed(&mut r, &[(91_000, 50, 0)]);
         assert_eq!(r.window().unwrap().tx_packets, 20);
+    }
+
+    #[test]
+    fn vendor_counts() {
+        let v = serde_json::json!({"real_rx_packets": 318245, "real_tx_packets": "223291", "real_rx_bytes": 1});
+        assert_eq!(counts(&v), Some((318245, 223291)));
+        assert_eq!(counts(&serde_json::json!({"real_rx_packets": 1})), None);
+        assert_eq!(
+            counts(&serde_json::json!({"real_rx_packets": "--", "real_tx_packets": 2})),
+            None
+        );
     }
 
     #[test]

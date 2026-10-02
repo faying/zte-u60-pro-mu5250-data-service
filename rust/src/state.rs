@@ -1101,7 +1101,6 @@ fn runtime(runtime_zones: Value) -> (i64, Value) {
     let tcp4 = count_lines(&host_path("/proc/net/tcp"), true);
     let connections = json!({"tcp_active":active,"tcp_other":tcp4.saturating_sub(active),"tcp4":tcp4,"tcp6":count_lines(&host_path("/proc/net/tcp6"),true),"udp4":count_lines(&host_path("/proc/net/udp"),true),"udp6":count_lines(&host_path("/proc/net/udp6"),true),"unix":count_lines(&host_path("/proc/net/unix"),true)});
     let now = now_ms();
-    crate::cell_window::sample(now);
     (
         total_usage,
         json!({"cpu_usage_tenths":total_usage,"cpu_cores":usage,"cpu_freq_mhz":freqs,"thermal_zones":runtime_zones,"memory_kb":meminfo(),"storage":storage(),"connections":connections,"link_rates":link_rates(now),"throughput":throughput(now)}),
@@ -1198,6 +1197,11 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     // `/v2` 派生块的健康：信号块看 nwinfo，live 块看 system info 和实时流量。
     let signal_ok = net.is_ok();
     let live_ok = info.is_ok() && traffic.is_ok();
+    // stall 的 30 秒窗口：厂商收发包数（cell_window.rs；没读到就作废窗口）
+    crate::cell_window::sample(
+        now_ms(),
+        traffic.as_ref().ok().and_then(crate::cell_window::counts),
+    );
     let common = object(common);
     let board = object(board);
     let info = object(info);
