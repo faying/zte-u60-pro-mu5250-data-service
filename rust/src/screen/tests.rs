@@ -29,13 +29,24 @@ fn matches_the_screens_c_on_the_corpus() {
     .unwrap();
     let corpus =
         std::fs::read_to_string(root.join("tests/fixtures/screen_net_corpus.jsonl")).unwrap();
+    // the stall window must not change any old verdict: unknown (what `net_view`
+    // gives) and a healthy one (traffic both ways) both match the fixture
+    let healthy = CellWindow {
+        tx_packets: 50,
+        rx_packets: 40,
+        span_ms: 30_000,
+    };
     let mut n = 0;
     let mut bad = Vec::new();
-    for line in corpus.lines().skip(1) {
+    for (line, win) in corpus
+        .lines()
+        .skip(1)
+        .flat_map(|l| [(l, None), (l, Some(healthy))])
+    {
         let case: Value = serde_json::from_str(line).unwrap();
         let mut state = template.clone();
         merge(&mut state, &case["patch"]);
-        let got = serde_json::to_value(net_view(&state)).unwrap();
+        let got = serde_json::to_value(net_view_with(&state, win)).unwrap();
         let mut want = case["view"].clone();
         want.as_object_mut().unwrap().remove("parsed");
         // fields added after the corpus was frozen: tested on their own below
@@ -58,10 +69,15 @@ fn matches_the_screens_c_on_the_corpus() {
                     .filter(|k| !w.contains_key(*k))
                     .map(|k| format!("{k}: extra")),
             );
-            bad.push(format!("case {}: {}", case["id"], diff.join("; ")));
+            let w = if win.is_some() {
+                " (healthy window)"
+            } else {
+                ""
+            };
+            bad.push(format!("case {}{w}: {}", case["id"], diff.join("; ")));
         }
     }
-    assert!(n > 1000, "corpus too small: {n}");
+    assert!(n > 2000, "corpus too small: {n}");
     assert!(
         bad.is_empty(),
         "{} of {n} cases differ:\n{}",
@@ -113,6 +129,8 @@ fn base() -> NetIn<'static> {
         net_type: "SA",
         bars: 5,
         data_up: true,
+        connected: true,
+        win: None,
         roaming: 0,
         n_active: 3,
         nr_active: 3,
@@ -1023,12 +1041,13 @@ fn bless_corpus() {
 /// The headline table, hard-coded from manager docs/DESIGN.md §4「首页结论表」and
 /// docs/ui-glossary.md §4 (this repo can't read them; touch-ui's cross-repo test
 /// compares the docs with screen.rs). (state, 中文大字, English state word, tone)
-const HEADLINES: [(&str, &str, &str, Tone); 13] = [
+const HEADLINES: [(&str, &str, &str, Tone); 14] = [
     ("nosim", "无 SIM", "No SIM", Tone::Bad),
     ("airplane", "移动网络已关", "Airplane", Tone::Neutral),
     ("sos", "只能紧急呼叫", "SOS only", Tone::Bad),
     ("nosvc", "无服务", "No service", Tone::Bad),
     ("nodata", "没连上网", "Offline", Tone::Bad),
+    ("stall", "连上了但不通", "No traffic", Tone::Bad),
     ("limit", "慢：限速", "Slow", Tone::Warn),
     ("weak", "慢：信号弱", "Slow", Tone::Warn),
     ("noise", "慢：干扰大", "Slow", Tone::Warn),
@@ -1222,6 +1241,11 @@ fn every_branch_has_its_state_and_english() {
             |x| x.data_up = false,
             "nodata",
             "Check mobile data, APN, or your balance",
+        ),
+        (
+            |x| x.win = Some(win(20, 0)),
+            "stall",
+            "Signal and data are up, but nothing came back for 30 s",
         ),
         (
             |x| x.ambr_dl = 4.6,
@@ -1626,4 +1650,132 @@ fn response_fits_the_old_screens_buffers() {
         "net bytes: worst case {worst} (story {worst_story}), corpus max {max} (story {max_story})"
     );
     assert!(max <= worst, "corpus max {max} vs worst {worst}");
+}
+
+// ---- stall: sending for 30 s, nothing back (slow-diagnosis §4.1, eng review D5) ----
+
+fn win(tx_packets: u64, rx_packets: u64) -> CellWindow {
+    CellWindow {
+        tx_packets,
+        rx_packets,
+        span_ms: 30_000,
+    }
+}
+
+#[test]
+fn stall_needs_twenty_sent_and_nothing_back() {
+    let st = |f: fn(&mut NetIn<'static>)| state_name(with(f).state);
+    let o = with(|x| x.win = Some(win(20, 0)));
+    assert_eq!(
+        (o.headline.as_str(), o.headline_en.as_str(), o.tone, o.cause),
+        ("连上了但不通", "No traffic", Tone::Bad, Cause::None)
+    );
+    assert_eq!(o.hint, "有信号、已拨号，但 30 秒没收到任何数据");
+    // the right column still reads as usual
+    assert_eq!((o.sig.as_str(), o.noise.as_str()), ("强", "小"));
+    assert_eq!(st(|x| x.win = Some(win(19, 0))), "ok");
+    assert_eq!(st(|x| x.win = Some(win(20, 1))), "ok");
+    assert_eq!(st(|x| x.win = Some(win(0, 0))), "ok");
+    assert_eq!(st(|x| x.win = None), "ok");
+    // wan_status empty counts as up for nodata, but stall wants it said connected
+    assert_eq!(
+        st(|x| {
+            x.connected = false;
+            x.win = Some(win(500, 0))
+        }),
+        "ok"
+    );
+}
+
+#[test]
+fn stall_sits_after_nodata_and_before_the_slow_ones() {
+    let st = |f: fn(&mut NetIn<'static>)| state_name(with(f).state);
+    // before it
+    assert_eq!(
+        st(|x| {
+            x.win = Some(win(300, 0));
+            x.sim_state = "sim absent"
+        }),
+        "nosim"
+    );
+    assert_eq!(
+        st(|x| {
+            x.win = Some(win(300, 0));
+            x.airplane = true
+        }),
+        "airplane"
+    );
+    assert_eq!(
+        st(|x| {
+            x.win = Some(win(300, 0));
+            x.net_type = "";
+            x.bars = 0
+        }),
+        "nosvc"
+    );
+    assert_eq!(
+        st(|x| {
+            x.win = Some(win(300, 0));
+            x.data_up = false
+        }),
+        "nodata"
+    );
+    // after it
+    assert_eq!(
+        st(|x| {
+            x.win = Some(win(300, 0));
+            x.ambr_dl = 4.6
+        }),
+        "stall"
+    );
+    assert_eq!(
+        st(|x| {
+            x.win = Some(win(300, 0));
+            x.bars = 1
+        }),
+        "stall"
+    );
+    assert_eq!(
+        st(|x| {
+            x.win = Some(win(300, 0));
+            x.rx_bps = 200_000;
+            x.rsrq = -18
+        }),
+        "stall"
+    );
+    assert_eq!(
+        st(|x| {
+            x.win = Some(win(300, 0));
+            x.net_type = "WCDMA"
+        }),
+        "stall"
+    );
+}
+
+#[test]
+fn stall_through_net_view_with() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("../tests/golden/normal.state.json")).unwrap(),
+    )
+    .unwrap();
+    let mut state = state;
+    // the fixture leaves wan_status empty: up for nodata, not said connected
+    assert_eq!(state["net"]["wan_status"], "");
+    let quiet = Some(win(40, 0));
+    assert_ne!(
+        state_name(net_view_with(&state, quiet).story.state),
+        "stall"
+    );
+    state["net"]["wan_status"] = "ipv4_ipv6_connected".into();
+    assert_eq!(
+        state_name(net_view_with(&state, quiet).story.state),
+        "stall"
+    );
+    assert_ne!(state_name(net_view(&state).story.state), "stall");
+    state["net"]["wan_status"] = "ipv4_ipv6_disconnected".into();
+    assert_eq!(
+        state_name(net_view_with(&state, quiet).story.state),
+        "nodata"
+    );
 }

@@ -12,7 +12,11 @@
 //!
 //! 不在这里的：大字换结论前的 15 秒稳定、「已 N 分钟」无服务计时——那是「这块屏
 //! 显示过什么、什么时候」，留在屏幕上。
+//!
+//! 唯一不从 /state 来的输入是 stall 的 30 秒收发包数（`cell_window.rs`，采样循环里记），
+//! 由 `net_view_with` 传进来；`net_view` 不给（= 不知道），结论和以前一样。
 
+use crate::cell_window::CellWindow;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -636,6 +640,7 @@ pub enum State {
     Sos,
     Nosvc,
     Nodata,
+    Stall,
     Limit,
     Weak,
     Noise,
@@ -658,6 +663,10 @@ struct NetIn<'a> {
     net_type: &'a str,
     bars: i64,
     data_up: bool,
+    /// wan_status says connected (data_up also counts an empty status as up).
+    connected: bool,
+    /// Packets on the cellular interface over the last ≥ 30 s; None = not known.
+    win: Option<CellWindow>,
     roaming: i64,
     n_active: i64,
     nr_active: i64,
@@ -1046,6 +1055,24 @@ fn story(i: &NetIn) -> Story {
             )
         };
         return say(o, State::Nodata, Cause::None, Tone::Bad, off, h);
+    }
+    // 拨上了、30 秒里一直在发（≥ 20 包，Tailscale 空闲保活远少于这个数且有回包）却一个包
+    // 都没收到（slow-diagnosis §4.1，工程复核 D5）。首页不发包，DNS 确认放深查。
+    if i.connected
+        && i.win
+            .is_some_and(|w| w.tx_packets >= 20 && w.rx_packets == 0)
+    {
+        return say(
+            o,
+            State::Stall,
+            Cause::None,
+            Tone::Bad,
+            ("连上了但不通", "No traffic"),
+            t(
+                "有信号、已拨号，但 30 秒没收到任何数据",
+                "Signal and data are up, but nothing came back for 30 s",
+            ),
+        );
     }
     if capped {
         let mbps = to_int(i.ambr_dl + 0.5) as i32;
@@ -1540,7 +1567,13 @@ fn summary(d: &Data, v: &mut NetView) {
     v.ca_sub_en = en_for(&v.ca_sub, &v.ca_sub, 160);
 }
 
+/// The view from /state alone: the stall window unknown, so never stall.
+#[cfg(test)]
 pub fn net_view(state: &Value) -> NetView {
+    net_view_with(state, None)
+}
+
+pub fn net_view_with(state: &Value, win: Option<CellWindow>) -> NetView {
     let d = parse(state);
     let mut v = NetView::default();
     carriers(&d, &mut v);
@@ -1557,6 +1590,8 @@ pub fn net_view(state: &Value) -> NetView {
         net_type: &d.net_type,
         bars: d.bars,
         data_up: ws.is_empty() || (ws.contains("connected") && !ws.contains("disconnect")),
+        connected: ws.contains("connected") && !ws.contains("disconnect"),
+        win,
         roaming: if d.roaming.is_empty() {
             -1
         } else {

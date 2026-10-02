@@ -443,7 +443,8 @@ async fn v2_state(State(app): State<App>) -> Response {
     v2::state_response(app.inner.exec.hub(), &app.inner.feed)
 }
 
-/// `/v2/screen`：触屏首页信号卡和状态栏的结论（screen.rs），从当前这份 /state 算。
+/// `/v2/screen`：触屏首页信号卡和状态栏的结论（screen.rs），从当前这份 /state 算，
+/// 另加采样循环记的 30 秒收发包数（cell_window.rs，判 stall 用；不进 /state）。
 /// 不冻结（不是旧接口），靠 `v` 区分版本；`ts` 就是算它用的那份快照的 `ts`。
 async fn v2_screen(State(app): State<App>) -> Json<Value> {
     let snap = app.snapshot().await;
@@ -452,7 +453,7 @@ async fn v2_screen(State(app): State<App>) -> Json<Value> {
     Json(serde_json::json!({
         "v": crate::screen::SCREEN_VERSION,
         "ts": ts,
-        "net": crate::screen::net_view(&state),
+        "net": crate::screen::net_view_with(&state, crate::cell_window::current()),
     }))
 }
 

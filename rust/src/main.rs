@@ -1,5 +1,6 @@
 mod auth;
 mod block;
+mod cell_window;
 mod command;
 mod control;
 mod cooling;
