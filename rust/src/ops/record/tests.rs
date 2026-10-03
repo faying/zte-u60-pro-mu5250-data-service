@@ -100,10 +100,24 @@ async fn secrets_never_reach_the_disk() {
     }
     // journal.append 的内容也过一遍
     r.append(redact("esim.download", &json!({"source":"web","action":"esim.download","activation_code":"LPA:1$x","confirm_code":secret,"pin":"1234"})));
+    // eSIM 任务结果里的完整 SIM 身份只留后 4 位
+    r.append(redact(
+        "esim.switch",
+        &json!({"source":"web","action":"esim.switch","result":{"iccid":"89860098765432105678","eid":"89049032000001000000123456789012","profile":{"imsi":460001234567890u64,"msisdn":"+8613912345678"}}}),
+    ));
     r.flush().await;
     let all = raw(&dir);
     let text = String::from_utf8_lossy(&all);
     assert!(!text.contains(secret), "{text}");
+    for full in [
+        "8986009876543210",
+        "890490320000010000001234",
+        "46000123456",
+        "13912345678",
+    ] {
+        assert!(!text.contains(full), "{full} in {text}");
+    }
+    assert!(text.contains("\"iccid\":\"5678\"") && text.contains("\"imsi\":\"7890\""));
     assert!(!text.contains("8613800000000"));
     assert!(!text.contains("\"1234\""));
     assert!(!text.contains("LPA:1$x"));

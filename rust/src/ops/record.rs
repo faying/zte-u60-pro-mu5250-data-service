@@ -389,7 +389,7 @@ fn civil(secs: u64) -> String {
     )
 }
 
-/// 密码类字段只写 `(changed)`；短信动作不记参数（号码、内容）。
+/// 密码类字段只写 `(changed)`，SIM 身份类字段只留后 4 位；短信动作不记参数（号码、内容）。
 pub fn redact(action: &str, params: &Value) -> Value {
     if action.starts_with("sms.") {
         return Value::Null;
@@ -416,6 +416,19 @@ fn secret(key: &str) -> bool {
         .any(|w| k.contains(w))
 }
 
+/// SIM 身份类字段（ICCID、EID、IMSI、号码）只留后 4 位（D32：流水账只显示后 4 位）。
+fn sim_id_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    ["iccid", "eid", "imsi", "msisdn"]
+        .iter()
+        .any(|w| k == *w || k.ends_with(&format!("_{w}")) || k.starts_with(&format!("{w}_")))
+}
+
+fn tail4(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    chars[chars.len().saturating_sub(4)..].iter().collect()
+}
+
 fn redact_value(v: &Value) -> Value {
     match v {
         Value::Object(m) => Value::Object(
@@ -423,6 +436,11 @@ fn redact_value(v: &Value) -> Value {
                 .map(|(k, v)| {
                     let v = if secret(k) && !v.is_null() {
                         json!(REDACTED)
+                    } else if sim_id_key(k) && !v.is_null() {
+                        json!(tail4(&match v {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        }))
                     } else {
                         redact_value(v)
                     };
@@ -437,16 +455,7 @@ fn redact_value(v: &Value) -> Value {
 
 /// 事务结束的一行。SIM 只记 ICCID 后 4 位 + 卡槽（D32）；退回目标和旧值都记（D35）。
 pub fn txn_line(t: &Txn) -> Value {
-    let tail: String = t
-        .sim
-        .iccid
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let tail = tail4(&t.sim.iccid);
     json!({
         "op_id": t.op_id,
         "action": t.action,

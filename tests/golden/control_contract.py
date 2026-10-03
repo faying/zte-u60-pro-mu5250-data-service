@@ -267,6 +267,10 @@ def set_interval_applies() -> None:
 
 
 def journal() -> None:
+    # 前面用例的事务都结束了再看，免得中途插进一行事务结束
+    s = json.loads(post({"action": "op.status"})[1])["result"]
+    if s and s.get("phase") in ("accepted", "applying", "verifying", "rolling_back"):
+        wait_final(s["op_id"])
     secret = "Contract-Secret-9917"
     status, _ = post({"action": "wifi.configure", "params": {"section": "main_2g", "ssid": "Golden", "key": secret}})
     if status != b"HTTP/1.1 200 OK":
