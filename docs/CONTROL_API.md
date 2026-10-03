@@ -61,12 +61,15 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 - 同一时刻只有一个进行中的事务。别的写回 **409** `{"error":{"code":"busy"},"doing":{op_id,action,source,phase,age_ms}}`。能插队的：同一项的用户写（screen/web/legacy）和 guard（旧事务记 `superseded`，新事务的退回目标继承旧事务的）、关数据/关漫游（`cellular.set` 只含 `enabled`/`roaming` 且都为关，旧事务记 `preempted`）。
 - 到点没确认：自动退回默认关（`ZWRT_DATAD_ROLLBACK=1` 才开），关着时以 `unverified/no_rollback` 结束；读回从没变成目标值以 `not_applied/ignored` 结束（不退回）。
 - 状态（`op`）：`phase` 为 `accepted`、`applying`、`verifying`、`rolling_back` 或终态 `confirmed`、`unverified`、`rolled_back`、`not_applied`、`rollback_failed`、`cancelled`；`reason` 见设计稿「状态表」，另有 `sim_changed`（D32）、`reboot_loop`（D13）。`ever_matched` = 读回对上过目标值（对上过、数据一直不通，到点按没通处理，不算 `not_applied`），`data_ok` = 数据这一关过了。
+- 界面用的字段（`say_zh/_en`、`steps`、`undo`、`next_zh/_en` …）、`/v2` 的 `op` 块和首页「进行中」档见 STATE_V2.md 第 12 节（E4 T13）。busy 的 `doing` 也带 `say_zh/_en`。
+- `op.*`、`journal.*` 和会话、E4 新动作不进 `/capabilities`：它属于冻结的旧接口（回复要逐字节不变）。新客户端看 `/v2/screen` 有没有 `op` 判断 datad 支不支持。
 
 | action | params | 说明 |
 |---|---|---|
 | `op.status` | `op_id?` | 指定的，或当前/最近结束的事务；没有为 `null` |
 | `op.revert` | `op_id` | 立即退回（自动退回关着也能用）；不在等确认时回 409 `invalid_state` |
 | `op.keep` | `op_id` | 保留现状，取消退回，记 `confirmed/user_keep` |
+| `op.ack` | `op_id` | 「知道了」：只记账，要顶层 `source`（screen/web）；只能点最近结束的那个（`op` 块的 `last`），点过再点照样成功。别的 op_id 回 409 `invalid_state`（STATE_V2.md V2-37） |
 
 | `journal.append` | `item` 或 `action`、`result`，可选 `reason`、`old`、`new`、`detail` 等 | 只记账（eSIM、CHILL 这类不经 `/control` 的改动由 agent 补记）；要顶层 `source`；`result` 为 `skipped` 时按下面的规则合并。不受事务锁、不进执行者队列 |
 | `journal.list` | `limit?`（默认 50，最多 500） | `{"entries":[…新的在前],"owners":{项:{source,user,undo,value,op_id,ts,t}}}` |

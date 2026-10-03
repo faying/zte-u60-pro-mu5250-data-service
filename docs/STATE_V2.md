@@ -93,6 +93,7 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
 | `live` | `{ "system", "runtime", "traffic" }`，三个值分别是旧 `/state` 的同名对象 | 旧采集算好的结果（不另调 ubus） |
 | `sms` | `{ "unread", "max_id", "count" }`：`unread` 同旧 `/state` 的 `sms.unread`；`max_id`、`count` 是 `/v2` 新加的（V2-30）；不带 `list` | 旧采集读好的容量和两库第一页（不另调 ubus） |
 | `sim` | 旧 `/state` 的 `sim` 对象（`iccid`、`imsi`、`spn`、`state`、`current_slot` …），2026-10-03 加；变了才发 | 旧采集读好的 `zwrt_zte_mdm.api get_sim_info`（不另调 ubus） |
+| `op` | 写操作的界面数据（第 12 节，E4 T13）：`{ "rollback_enabled", "active", "last" }` | 事务引擎（不调 ubus） |
 
 stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 `signal` 在 `nwinfo_get_netinfo` 失败时读失败；`live` 在 `system info` 或实时流量 `get_wwandst` 失败时读失败。
@@ -259,3 +260,49 @@ datad 启动时把 pid 写进 `ZWRT_DATAD_PID_FILE`（默认 `/var/run/zwrt-data
 跨进程写锁 `ZWRT_DATAD_WRITE_LOCK`（默认 `/var/run/u60-write.lock`，flock，D29）：datad 的每个写和启动时处理 takeover/pending 的全过程都拿着它，
 和应急直写脚本互斥；拿不到就等，满 15 秒还拿不到就记一行照做（小于订阅方判卡死的 20 秒）。
 测试（E4 T3）：`timeout_holds_next_call_until_object_answers`、`gate_opens_after_four_failed_probes`、`round_timeouts_do_not_close_the_gate`、`read_timeouts_do_not_close_the_gate`、`probe_uses_the_vendor_read_for_written_objects`、`timed_out_write_is_unknown_and_confirmed_by_readback`
+
+## 12. 写操作的界面数据（E4 T13）
+
+设计见 manager `docs/designs/write-op-layer.md` 的设计评审（DD3、DD6、DD7、DD10、DD12、DD16）。文字由 datad 按「状态文案表」发，触屏和网页照着显示，不自己拼结论。
+本节说的「事务视图」就是 `op.status` 回复、提交回复里的 `op`、`op` 块的 `active`/`last`：在原来的状态字段上加下面这些。
+
+**V2-34** `/v2` 加一块 `op`（派生块，不调 ubus）：`{"rollback_enabled": 布尔, "active": 事务视图或 null, "last": 事务视图或 null}`。
+`active` 是进行中的事务；`last` 是最近一个结束的事务，另带 `acked`（有人点过「知道了」）和 `needs_ack`（常驻类结果且还没点）。
+每轮采集交一次，事务引擎每次状态变化（新事务、读数、终态、退回/保留、「知道了」）也马上交一次；两条路都在引擎的锁里算好再交，旧的不会盖掉新的。
+进行中时 `remaining_ms` 每轮都变，所以这块每轮都发一次（新订阅的也拿到准的倒计时）；没有进行中的事务时数据不变、不发。datad 卡住时它和别的块一样变 stale。
+`/v2/screen` 顶层也带同一份 `op`（按请求那一刻算），触屏不用订阅 `/v2/events`。
+测试：`op_block_follows_the_engine`、`op_block_is_quiet_without_a_change`
+
+**V2-35** 事务视图加的字段（文字都有 `_zh`/`_en` 两份；值的显示名按项转，网络模式用首页同一张表）：
+- `source_zh/_en`：来源显示名（DD14：screen 触屏/Screen、web 网页/Web、scenario 情景/Scene、scheduler 定时任务/Schedule、auto 自动/Auto、guard 自动恢复/Auto-recovery、legacy 触屏/Screen）。
+- `what_zh/_en`：改的是哪一项（制式/Network mode）；`old_zh/_en`、`target_zh/_en`、`rollback_to_zh/_en`、`readback_zh/_en`（没有读回为 null）。
+- `say_zh/_en`：一句结论（进行中：正在换制式 / 正在确认 / 正在退回；终态按文案表，不带 ●▲■）；`mark`：`ok`/`warn`/`bad`（进行中为 null），客户端自己画符号。
+- `stay`：`live`（进行中）、`brief`（显示 3 秒）、`sticky`（常驻到「知道了」）、`alert`（退回也没通，常驻并占首页状态块，DD9）、`none`（被覆盖，不单独提示）。
+- `next_zh/_en`：倒计时那行，`{t}` 是占位，客户端按 `remaining_ms` 换成 `m:ss`（自动退回开：「{t} 后没通就退回到 X」；关：「还剩 {t} · 自动退回没开」；退回中：「退回到 X · 还剩 {t}」）；没有为 null。
+- `note_zh/_en`：「重启过 · 重新确认」（写之后整机重启过、还在等），否则 null。
+- `steps`：三行进度 `[{"key":"applied"|"registered"|"data","zh","en","done"}]`（设置已生效 / 已注册 / 数据）；退回中看的是退回目标。
+- `can_revert`、`can_keep`：现在点「退回 X」「保留 Y」有没有用（在等确认、没有在途的写）。
+- `undo`：进行中为 null；结束了是 `{"ok", "label_zh/_en"（撤销/重做）, "why_zh/_en"（不能撤时的原因）, "value"}`（V2-36）。
+英文都是 ASCII、没有句号；首页大字 ≤ 10 个字符，所以进行中的英文不带省略号（Switching / Checking / Reverting）。
+测试：`every_text_row_has_zh_and_en_within_budget`、`steps_follow_readings`
+
+**V2-36** 能不能撤销（DD10，按动作 + 终态）：confirmed、unverified 能撤；rolled_back、not_applied 不能（「设置没变 · 不用撤销」）；rollback_failed 不能（用「再试一次退回」）；
+cancelled 里 sim_changed 不能（「换过卡」）、superseded 不能（「之后又改过」），其余在读回还是目标值时能撤，否则「之后又改过」。同一项后来又有别的事务的，旧的一律「之后又改过」。
+撤销就是用 `value` 发一个带 `undo: true` 的新写；撤销过的再点叫「重做」。
+测试：`undo_by_phase_and_reason`、`later_change_blocks_undo`
+
+**V2-37** `op.ack`（「知道了」，DD16）：只记账，两边共享。要顶层 `source`（screen 或 web）和 `params.op_id`；只能点 `last`，点过再点照样回成功（不重复记账）。
+`last` 和 `acked` 落盘在 `ZWRT_DATAD_OPS_DIR` 的 `last.json`，datad 重启后结果还在、点过的不再出现。同一项下一次结束的事务自然接替 `last`。不受事务锁、不进执行者。
+测试：`ack_is_shared_and_journaled`、`last_result_survives_restart`
+
+**V2-38** 首页结论（`/v2/screen` 的 `story`）加两档，排在「无 SIM」「移动网络已关」之后、「只能紧急呼叫」「无服务」「没连上网」之前
+（换制式时常会先经过无服务，DD3 和用户旅程第 3 步要的是不出红色）：
+- `changing`：有进行中的事务。中性色；大字是 `say`（正在换制式 / 正在确认 / 正在退回），提示是倒计时那行（`{t}` 已换好）。
+- `revert_fail`：`last` 是退回也没通、还没点「知道了」。红色；大字「退回也没通」/`Failed`，提示写现在的值（读不到写「当前设置未知」）、上次确认的值和下一步。
+其他常驻类结果还没点「知道了」时，大字照旧是网络结论，提示末尾加一句结果（DD16）。没有事务时和以前逐字段一样（对照样本不变）。
+测试：`story_changing_beats_no_service_and_offline`、`story_revert_fail_takes_the_card`、`story_sticky_result_rides_on_the_hint`
+
+**V2-39** busy 回复的 `doing` 加 `say_zh/_en`：「正在换制式（触屏发起，32 秒），稍等」/「Busy: network mode (Screen)」；搜网会话是「正在搜网」/「network search」。
+测试：`busy_reply_says_who_and_what`
+
+不在 datad 的几行（客户端自己判断的）：「数据服务没响应」（心跳 `exec_age_ms`，V2-32）、「和设备断开了 · 操作结果未知」（网页）、改动记录的空和读不到，归触屏 T8、网页 T9 和术语表 T14。
