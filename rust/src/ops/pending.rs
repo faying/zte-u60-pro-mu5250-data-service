@@ -3,6 +3,7 @@
 //! 目录写不了时只记一行日志，datad 照常服务（不落盘就没有重启续退）。
 
 use super::txn::Txn;
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
     io::{self, Write},
@@ -10,7 +11,15 @@ use std::{
 };
 
 const PENDING: &str = "pending.json";
+const LAST: &str = "last.json";
 const TAKEOVER: &str = "takeover";
+
+/// 最近结束的事务和有没有人点过「知道了」（E4 T13，V2-37）：datad 重启后结果还在。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Last {
+    pub txn: Txn,
+    pub acked: bool,
+}
 
 pub struct Store {
     dir: Option<PathBuf>,
@@ -65,6 +74,23 @@ impl Store {
                 None
             }
         }
+    }
+
+    pub fn save_last(&self, last: &Last) {
+        let Some(dir) = &self.dir else { return };
+        if let Err(e) = write_atomic(
+            dir,
+            LAST,
+            &serde_json::to_vec(last).expect("last serializes"),
+        ) {
+            eprintln!("ops: cannot save {LAST}: {e}");
+        }
+    }
+
+    /// 读不懂就当没有（只是界面上的一行结果）。
+    pub fn load_last(&self) -> Option<Last> {
+        let bytes = fs::read(self.dir.as_ref()?.join(LAST)).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     /// 有 `takeover` 标记就删掉并返回 true（D18：应急直写过，落盘的事务要放弃）。

@@ -148,6 +148,13 @@ impl App {
             }));
         // 有落盘的事务就接着确认（没有就不读设备）。
         app.inner.ops.start().await;
+        // V2-34：引擎每次状态变化都交 op 块（在引擎的锁里），接上时先交一次。
+        let hub_exec = app.inner.exec.clone();
+        app.inner.ops.set_observer(Arc::new(move |v| {
+            hub_exec
+                .hub()
+                .record("op", Ok(v), tokio::time::Instant::now());
+        }));
         // V2-31：监听短信事件，收到后短信读取立即重读、执行者立即开一轮（只订阅，不发请求）。
         let exec = app.inner.exec.clone();
         crate::ubus::listen::spawn_if_enabled(
@@ -177,6 +184,8 @@ impl App {
             .await;
         next.fields.insert("neighbor".into(), neighbor.status());
         drop(neighbor);
+        // V2-34：op 块每轮交一次（进行中时倒计时跟着走）。
+        self.inner.ops.publish_now();
         let mut old = self.inner.snapshot.write().await;
         let mut comparable = next.clone();
         comparable.ts = old.ts;
@@ -500,7 +509,13 @@ async fn v2_screen(State(app): State<App>) -> Json<Value> {
     Json(serde_json::json!({
         "v": crate::screen::SCREEN_VERSION,
         "ts": ts,
-        "net": crate::screen::net_view_with(&state, crate::cell_window::current()),
+        "net": crate::screen::net_view_op(
+            &state,
+            crate::cell_window::current(),
+            app.inner.ops.screen_op().as_ref(),
+        ),
+        // E4 T13（V2-34）：和 /v2 的 op 块同一份，按这一刻算。
+        "op": app.inner.ops.block(),
     }))
 }
 
@@ -748,6 +763,27 @@ async fn ops_route(app: &App, action: &str, body: &Value) -> Option<Response> {
                 action,
                 json!({"entries": ops.record().list(limit), "owners": ops.record().owners()}),
             ));
+        }
+        "op.ack" => {
+            let Some(op_id) = op_id else {
+                return Some(invalid_parameter(action, "missing parameter: op_id"));
+            };
+            // 「知道了」是用户点的：只认触屏和网页（V2-37）。
+            let source = body
+                .get("source")
+                .and_then(Value::as_str)
+                .and_then(crate::ops::Source::parse)
+                .filter(|s| matches!(s, crate::ops::Source::Screen | crate::ops::Source::Web));
+            let Some(source) = source else {
+                return Some(invalid_parameter(
+                    action,
+                    "op.ack needs source screen or web",
+                ));
+            };
+            return Some(match ops.ack(op_id, source) {
+                Ok(v) => control_ok(action, v),
+                Err(e) => op_error(action, StatusCode::CONFLICT, "invalid_state", &e, None),
+            });
         }
         "op.revert" | "op.keep" => {
             let Some(op_id) = op_id else {

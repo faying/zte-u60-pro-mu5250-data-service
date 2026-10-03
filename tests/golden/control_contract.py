@@ -15,6 +15,7 @@ E4 有意改变的行为（write-op-layer.md「旧客户端」、D14，T2），�
 7. 「立即退回」：退回写下去并确认，终态 rolled_back/user_revert；数据开着、蜂窝接口探测不通时不确认（T4）。
 8. 跨进程写锁（D29）：别人（应急直写脚本）拿着 flock 时，datad 的写等它放；只读的不等。
 9. 流水账（T5）：旧请求直接执行的写记一行、密码不落盘；journal.append 的 skipped 合并；journal.list 新的在前。
+10. 界面数据（T13）：/v2/screen 带 op、首页「进行中」档；/v2/state 有 op 块；op.ack 两边共享、只记一次账。
 SPDX-License-Identifier: MIT
 """
 import fcntl
@@ -361,6 +362,54 @@ def wifi_apply() -> None:
             fail("wifi.apply 的密码写进了流水账")
 
 
+def get(path: str) -> dict:
+    with urllib.request.urlopen("http://127.0.0.1:%d%s" % (PORT, path), timeout=5) as r:
+        return json.load(r)
+
+
+def op_ack_and_screen() -> None:
+    """E4 T13（STATE_V2.md V2-34～V2-38）。"""
+    s = json.loads(post({"action": "op.status"})[1])["result"]
+    if s and s.get("phase") in ("accepted", "applying", "verifying", "rolling_back"):
+        wait_final(s["op_id"])
+    op_id = take_lock()
+    scr = get("/v2/screen")
+    story = scr["net"]["story"]
+    if scr["op"]["active"]["op_id"] != op_id or story["state"] != "changing" or story["tone"] != "neutral":
+        fail("进行中时 /v2/screen 不对：%r" % scr)
+    if story["headline"] != "正在确认" or "后没通就退回到" not in story["hint"] and "还剩" not in story["hint"]:
+        fail("进行中的首页文字不对：%r" % story)
+    blocks = get("/v2/state")["blocks"]
+    if blocks["op"]["data"]["active"]["op_id"] != op_id:
+        fail("/v2/state 的 op 块不对：%r" % blocks.get("op"))
+    status, raw = post({"action": "op.keep", "params": {"op_id": op_id}})
+    if status != b"HTTP/1.1 200 OK":
+        fail("op.keep 没成功：%r %r" % (status, raw))
+    scr = get("/v2/screen")
+    last = scr["op"]["last"]
+    if last["op_id"] != op_id or last["needs_ack"] is not True or last["say_zh"] != "保留只用 4G · 没确认通":
+        fail("保留之后的结果行不对：%r" % last)
+    if not scr["net"]["story"]["hint"].endswith("保留只用 4G · 没确认通"):
+        fail("常驻结果没接在首页提示后面：%r" % scr["net"]["story"])
+    status, raw = post({"action": "op.ack", "params": {"op_id": op_id}})
+    if status != b"HTTP/1.1 400 Bad Request":
+        fail("没有 source 的 op.ack 应该 400：%r %r" % (status, raw))
+    status, raw = post({"action": "op.ack", "source": "web", "params": {"op_id": "nope"}})
+    if status != b"HTTP/1.1 409 Conflict":
+        fail("不是最近结束的 op.ack 应该 409：%r %r" % (status, raw))
+    for src in ("web", "screen"):
+        status, raw = post({"action": "op.ack", "source": src, "params": {"op_id": op_id}})
+        if status != b"HTTP/1.1 200 OK" or json.loads(raw)["result"]["acked"] is not True:
+            fail("op.ack 回复不对：%r %r" % (status, raw))
+    scr = get("/v2/screen")
+    if scr["op"]["last"]["needs_ack"] is not False or scr["net"]["story"]["hint"].endswith("没确认通"):
+        fail("点了「知道了」还在：%r" % scr)
+    entries = json.loads(post({"action": "journal.list", "params": {"limit": 20}})[1])["result"]["entries"]
+    acks = [e for e in entries if e.get("action") == "op.ack"]
+    if len(acks) != 1 or acks[0].get("source") != "web" or acks[0].get("op_id") != op_id:
+        fail("op.ack 的流水账不对：%r" % acks)
+
+
 def main() -> int:
     try:
         hang_until_done()
@@ -374,6 +423,7 @@ def main() -> int:
         journal()
         netselect_session()
         wifi_apply()
+        op_ack_and_screen()
     finally:
         clear()
     return 0

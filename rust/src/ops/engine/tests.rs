@@ -453,6 +453,9 @@ async fn other_writers_get_busy_with_who_and_what() {
                 assert_eq!(d["source"], "screen");
                 assert_eq!(d["action"], "network.set_mode");
                 assert!(d["age_ms"].as_u64().unwrap() >= 3_000);
+                // V2-39：带一句话
+                assert_eq!(d["say_zh"], "正在换制式（触屏发起，3 秒），稍等");
+                assert_eq!(d["say_en"], "Busy: network mode (Screen)");
             }
             other => panic!("{other:?}"),
         }
@@ -1133,4 +1136,170 @@ async fn a_session_never_outlives_seven_minutes() {
         e.session_gate("netselect.scan", Some(&sid)),
         Err(SessionError::Gone)
     );
+}
+
+// ---- E4 T13：op 块、「知道了」（STATE_V2.md V2-34、V2-37） ----
+
+fn observed(e: &Engine<Dev>) -> Arc<Mutex<Vec<Value>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s = seen.clone();
+    e.set_observer(Arc::new(move |v| s.lock().unwrap().push(v)));
+    seen
+}
+
+fn latest(seen: &Arc<Mutex<Vec<Value>>>) -> Value {
+    seen.lock().unwrap().last().cloned().unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn op_block_follows_the_engine() {
+    let dev = Dev::new();
+    dev.s().registered = false;
+    let e = engine(&dev, true, None);
+    let seen = observed(&e);
+    // 接上时马上交一次：没有事务
+    assert_eq!(
+        latest(&seen),
+        json!({"rollback_enabled": true, "active": null, "last": null})
+    );
+    let op = op_of(&e.submit(req("Only_LTE", Source::Web)).await);
+    let b = latest(&seen);
+    assert_eq!(b["active"]["op_id"], op["op_id"]);
+    assert_eq!(b["active"]["phase"], "verifying");
+    assert_eq!(b["active"]["say_zh"], "正在确认");
+    assert_eq!(b["active"]["source_zh"], "网页");
+    assert!(b["last"].is_null());
+    // 写之前已经交过一次「正在换制式」（意图落盘时）
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["active"]["phase"] == "applying" && v["active"]["say_zh"] == "正在换制式")
+    );
+    // 首页：进行中
+    let so = e.screen_op().unwrap();
+    assert_eq!(so.kind, crate::screen::ScreenOpKind::Live);
+    // 立即退回：块马上变
+    e.revert(&id(&op)).unwrap();
+    assert_eq!(latest(&seen)["active"]["phase"], "rolling_back");
+    assert_eq!(latest(&seen)["active"]["can_revert"], false);
+    dev.s().registered = true;
+    let fin = settle(&e, &id(&op)).await;
+    assert_eq!(end(&fin), pair("rolled_back", "user_revert"));
+    let b = latest(&seen);
+    assert!(b["active"].is_null());
+    assert_eq!(b["last"]["op_id"], op["op_id"]);
+    assert_eq!(b["last"]["say_zh"], "已退回自动");
+    assert_eq!(b["last"]["stay"], "brief");
+    assert_eq!(b["last"]["needs_ack"], false);
+    assert_eq!(b, e.block());
+    // 3 秒类的不叠到首页
+    assert!(e.screen_op().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn op_block_is_quiet_without_a_change() {
+    let dev = Dev::new();
+    dev.s().registered = false;
+    let e = engine(&dev, false, None);
+    let seen = observed(&e);
+    e.publish_now();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    e.publish_now();
+    {
+        let s = seen.lock().unwrap();
+        assert!(s.len() >= 2 && s.iter().all(|v| *v == s[0]), "{s:?}");
+    }
+    // 进行中：倒计时每轮都在变（新订阅的拿到准的）
+    op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
+    let a = e.block();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let b = e.block();
+    let r = |v: &Value| v["active"]["remaining_ms"].as_u64().unwrap();
+    assert!(r(&b) < r(&a), "{a} {b}");
+    assert_eq!(a["rollback_enabled"], false);
+    assert_eq!(a["active"]["next_zh"], "还剩 {t} · 自动退回没开");
+    // 结束以后：结果行不随时间变
+    dev.s().registered = true;
+    let id = a["active"]["op_id"].as_str().unwrap().to_owned();
+    settle(&e, &id).await;
+    let a = e.block();
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(a, e.block());
+    assert!(a["last"].get("age_ms").is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn ack_is_shared_and_journaled() {
+    let dev = Dev::new();
+    dev.s().registered = false;
+    let dir = temp_dir();
+    let e = Engine::new(
+        dev.clone(),
+        cfg(false),
+        Store::open(Some(dir.clone())),
+        Record::open(Some(dir.clone())),
+    );
+    let op = op_of(&e.submit(req("Only_LTE", Source::Web)).await);
+    let fin = settle(&e, &id(&op)).await;
+    assert_eq!(end(&fin), pair("unverified", "no_rollback"));
+    let b = e.block();
+    assert_eq!(b["last"]["needs_ack"], true);
+    assert_eq!(b["last"]["say_zh"], "没通 · 还是只用 4G");
+    assert_eq!(
+        e.screen_op().unwrap().kind,
+        crate::screen::ScreenOpKind::Sticky
+    );
+    // 只能点最近结束的那个
+    assert!(e.ack("other", Source::Web).is_err());
+    // 触屏点了，网页那边也收起
+    let r = e.ack(&id(&op), Source::Screen).unwrap();
+    assert_eq!(r["acked"], true);
+    let b = e.block();
+    assert_eq!(
+        (b["last"]["acked"].clone(), b["last"]["needs_ack"].clone()),
+        (json!(true), json!(false))
+    );
+    assert!(e.screen_op().is_none());
+    // 网页再点：照样成功，不重复记账
+    assert!(e.ack(&id(&op), Source::Web).is_ok());
+    e.record().flush().await;
+    let acks: Vec<Value> = e
+        .record()
+        .list(50)
+        .into_iter()
+        .filter(|l| l["action"] == "op.ack")
+        .collect();
+    assert_eq!(acks.len(), 1, "{acks:?}");
+    assert_eq!(acks[0]["source"], "screen");
+    assert_eq!(acks[0]["op_id"], op["op_id"]);
+    assert_eq!(acks[0]["item"], NETWORK_MODE);
+}
+
+#[tokio::test(start_paused = true)]
+async fn last_result_survives_restart() {
+    let dev = Dev::new();
+    dev.s().registered = false;
+    let dir = temp_dir();
+    let e = engine(&dev, false, Some(dir.clone()));
+    let op = op_of(&e.submit(req("Only_LTE", Source::Web)).await);
+    settle(&e, &id(&op)).await;
+    // datad 重启：结果还在，还没点
+    let e2 = engine(&dev, false, Some(dir.clone()));
+    let b = e2.block();
+    assert_eq!(b["last"]["op_id"], op["op_id"]);
+    assert_eq!(b["last"]["needs_ack"], true);
+    e2.ack(&id(&op), Source::Web).unwrap();
+    // 再重启：点过的不再出现
+    let e3 = engine(&dev, false, Some(dir));
+    assert_eq!(e3.block()["last"]["acked"], true);
+    assert!(e3.screen_op().is_none());
+    // 下一次同一项的事务结束后接替
+    dev.s().registered = true;
+    let op2 = op_of(&e3.submit(req("Only_5G", Source::Screen)).await);
+    settle(&e3, &id(&op2)).await;
+    assert_eq!(e3.block()["last"]["op_id"], op2["op_id"]);
+    // 旧的那条在最近列表里：后来又改过，不能撤销
+    let old = e3.status(Some(&id(&op)));
+    assert!(old.is_null() || old["undo"]["why_zh"] == "之后又改过");
 }

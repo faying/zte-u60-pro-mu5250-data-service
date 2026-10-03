@@ -6,6 +6,7 @@
 //! - `pending`：`pending.json` 落盘和 `takeover` 标记。
 //! - `record`：流水账 `journal.jsonl` 和 `owners.json`，单一写者（T5）。
 //! - `engine`：锁、覆盖/插队、确认驱动、续跑、旧请求队列。
+//! - `ui`：给界面的文字和标志（T13：状态文案表、三行进度、撤销、首页「进行中」）。
 //! - `write_lock`：跨进程写锁（flock，和应急直写脚本互斥，D29）。
 //!
 //! 环境变量：`ZWRT_DATAD_OPS_DIR`（落盘目录，默认 `/data/u60-ops`，空 = 不落盘）、
@@ -18,6 +19,7 @@ pub mod probe;
 pub mod record;
 pub mod spec;
 pub mod txn;
+pub mod ui;
 pub mod write_lock;
 
 use crate::executor::Executor;

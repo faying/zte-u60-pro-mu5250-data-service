@@ -112,6 +112,8 @@ pub enum Reason {
     Takeover,
     SimChanged,
     ApnNoData,
+    /// 不需要确认的动作（状态文案表有这一行；描述表里还没有这类动作）。
+    NoVerify,
 }
 
 /// 确认规则（D34）。
@@ -323,6 +325,9 @@ pub struct Txn {
     /// 数据通过了（探测成功、或不应当有数据）。只给 status 看。
     #[serde(default)]
     pub data_ok: bool,
+    /// 最近一次读数里已注册（三行进度的第二行，T13）。
+    #[serde(default)]
+    pub registered: bool,
     pub rollback_enabled: bool,
     pub deadline_ms: u64,
     pub boot_id: String,
@@ -367,6 +372,7 @@ impl Txn {
             probe_fails: 0,
             probe_last_ms: None,
             data_ok: false,
+            registered: false,
             rollback_enabled: n.rollback_enabled,
             deadline_ms: n.deadline_ms,
             boot_id: n.boot_id,
@@ -582,6 +588,7 @@ impl Txn {
             SimCheck::Unknown => return self.on_tick(now),
             SimCheck::Same => {}
         }
+        self.registered = r.registered;
         self.note_probe(r, now);
         if let Some(v) = r.value.as_deref() {
             self.read_ok = true;
@@ -724,16 +731,22 @@ impl Txn {
         Next::Wait
     }
 
+    /// 在等确认或等退回，并且没有在途的写：倒计时在走。
+    pub fn counting(&self) -> bool {
+        self.waiting() && self.intent.is_none()
+    }
+
+    /// 离到点还有多久（不在等时为 None）。
+    pub fn remaining_ms(&self, now: u64) -> Option<u64> {
+        self.waiting().then(|| {
+            self.deadline_ms
+                .saturating_sub(now.saturating_sub(self.wait_start_ms))
+        })
+    }
+
     /// 给客户端看的状态（`op.status`、提交和 busy 的回复里）。
     pub fn status(&self, now: u64) -> Value {
-        let remaining = if self.waiting() {
-            json!(
-                self.deadline_ms
-                    .saturating_sub(now.saturating_sub(self.wait_start_ms))
-            )
-        } else {
-            Value::Null
-        };
+        let remaining = self.remaining_ms(now).map_or(Value::Null, |v| json!(v));
         json!({
             "op_id": self.op_id,
             "action": self.action,

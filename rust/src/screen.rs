@@ -574,7 +574,7 @@ fn pinned_mode(sel: &str) -> Option<&'static str> {
 /// B27 reports WL_AND_5G and TCHGWL_5G for automatic, and NETWORK_auto after
 /// the lock page's 恢复默认 (nwinfo_reset_band_cell_setting, read 9-29).
 /// Returns (中文, English); English per manager docs/ui-glossary.md §7.
-fn net_select_word(sel: &str) -> (String, String) {
+pub(crate) fn net_select_word(sel: &str) -> (String, String) {
     const K: &[(&str, &str, &str)] = &[
         ("WL_AND_5G", "自动", "Auto"),
         ("TCHGWL_5G", "自动", "Auto"),
@@ -648,6 +648,71 @@ pub enum State {
     Only2g,
     Only3g,
     Narrow,
+    /// E4 T13：有进行中的写操作（V2-38）。
+    Changing,
+    /// E4 T13：退回也没通，还没点「知道了」（V2-38，DD9）。
+    RevertFail,
+}
+
+/// 首页结论要带的写操作（E4 T13，V2-38），由 `ops::ui::screen_op` 算好交进来。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScreenOp {
+    pub kind: ScreenOpKind,
+    /// 大字（中, 英），只在 Live、Alert 用。
+    pub head: (String, String),
+    /// 提示（中, 英）：Live/Alert 是整行，Sticky 接在网络结论的提示后面。
+    pub hint: (String, String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenOpKind {
+    /// 进行中：中性色大字。
+    Live,
+    /// 退回也没通：红色，占状态块。
+    Alert,
+    /// 常驻结果：大字照旧是网络结论，提示末尾加一句。
+    Sticky,
+}
+
+/// 网络结论之上叠写操作（V2-38）。无 SIM、移动网络已关照旧（写操作在那时没有意义）；
+/// 进行中和退回也没通排在只能紧急呼叫、无服务、没连上网之前。
+fn with_op(mut o: Story, op: Option<&ScreenOp>) -> Story {
+    let Some(op) = op else { return o };
+    if matches!(o.state, State::Nosim | State::Airplane) {
+        return o;
+    }
+    match op.kind {
+        ScreenOpKind::Live | ScreenOpKind::Alert => {
+            (o.state, o.tone) = if op.kind == ScreenOpKind::Live {
+                (State::Changing, Tone::Neutral)
+            } else {
+                (State::RevertFail, Tone::Bad)
+            };
+            o.cause = Cause::None;
+            o.headline = cstr(op.head.0.clone(), 32);
+            o.headline_en = op.head.1.clone();
+            o.hint = cstr(op.hint.0.clone(), 128);
+            o.hint_en = op.hint.1.clone();
+        }
+        ScreenOpKind::Sticky => {
+            let en_base = if o.hint_en.is_empty() {
+                o.hint.clone()
+            } else {
+                o.hint_en.clone()
+            };
+            o.hint = if o.hint.is_empty() {
+                cstr(op.hint.0.clone(), 128)
+            } else {
+                cstr(format!("{}；{}", o.hint, op.hint.0), 128)
+            };
+            o.hint_en = if en_base.is_empty() {
+                op.hint.1.clone()
+            } else {
+                format!("{en_base}; {}", op.hint.1)
+            };
+        }
+    }
+    o.finish_en()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1573,7 +1638,13 @@ pub fn net_view(state: &Value) -> NetView {
     net_view_with(state, None)
 }
 
+#[cfg(test)]
 pub fn net_view_with(state: &Value, win: Option<CellWindow>) -> NetView {
+    net_view_op(state, win, None)
+}
+
+/// 加上写操作（E4 T13，V2-38）。`nosvc` 仍按网络本身算。
+pub fn net_view_op(state: &Value, win: Option<CellWindow>, op: Option<&ScreenOp>) -> NetView {
     let d = parse(state);
     let mut v = NetView::default();
     carriers(&d, &mut v);
@@ -1627,6 +1698,7 @@ pub fn net_view_with(state: &Value, win: Option<CellWindow>) -> NetView {
     };
     v.story = story(&nin);
     v.nosvc = matches!(v.story.state, State::Nosvc | State::Sos);
+    v.story = with_op(std::mem::take(&mut v.story), op);
 
     let home = imsi_plmn(&d.sim_imsi);
     v.have_home = home.is_some();

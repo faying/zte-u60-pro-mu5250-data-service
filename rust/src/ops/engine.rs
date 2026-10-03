@@ -10,11 +10,13 @@
 //!   锁空出来再按原来的 `/control` 处理执行一次（每项只留最新、120 秒过期、安全类插队时清空）。
 
 use super::{
-    pending::Store,
+    pending::{Last, Store},
     record::{self, Record},
     spec::{self, Spec},
     txn::{self, NewTxn, Phase, ProbeTarget, Reading, Reason, Source, Txn},
+    ui,
 };
+use crate::screen::ScreenOp;
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
@@ -29,6 +31,9 @@ use std::{
 use tokio::sync::Notify;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// `/v2` 的 `op` 块的出口（V2-34）：在引擎的锁里调，交给 `Hub::record`。
+pub type Observer = Arc<dyn Fn(Value) + Send + Sync>;
 
 /// 引擎对设备的全部读写和时钟。真机是 `UbusDevice`，测试是假基带。
 pub trait Device: Send + Sync + 'static {
@@ -173,6 +178,8 @@ struct St {
     recent: VecDeque<Txn>,
     legacy: VecDeque<LegacyReq>,
     saved_seen_ms: u64,
+    /// 最近结束的事务（界面上的结果行，V2-34、V2-37）。
+    last: Option<Last>,
 }
 
 struct Inner<D> {
@@ -185,6 +192,7 @@ struct Inner<D> {
     wake: Notify,
     runner: OnceLock<LegacyRunner>,
     draining: AtomicBool,
+    observer: OnceLock<Observer>,
 }
 
 pub struct Engine<D: Device> {
@@ -232,13 +240,56 @@ impl St {
         if let Some(t) = &self.active
             && t.op_id == op_id
         {
-            return Some(t.status(now));
+            return Some(self.view(t, now));
         }
         self.recent
             .iter()
             .rev()
             .find(|t| t.op_id == op_id)
-            .map(|t| t.status(now))
+            .map(|t| self.view(t, now))
+    }
+
+    /// DD10：同一项后来又有别的事务（结束的或进行中的）。
+    fn ctx(&self, t: &Txn) -> ui::Ctx {
+        let active_later = self
+            .active
+            .as_ref()
+            .is_some_and(|a| a.op_id != t.op_id && a.item == t.item);
+        let recent_later = self
+            .recent
+            .iter()
+            .skip_while(|r| r.op_id != t.op_id)
+            .skip(1)
+            .any(|r| r.item == t.item);
+        ui::Ctx {
+            later_change: active_later || recent_later,
+        }
+    }
+
+    fn view(&self, t: &Txn, now: u64) -> Value {
+        ui::view(t, now, self.ctx(t))
+    }
+
+    /// `op` 块（V2-34）。不带 `age_ms`：它每拍都变，没有进行中的事务时块要保持不变、不发。
+    fn block(&self, rollback_enabled: bool, now: u64) -> Value {
+        let view = |t: &Txn| {
+            let mut v = self.view(t, now);
+            if let Some(m) = v.as_object_mut() {
+                m.remove("age_ms");
+            }
+            v
+        };
+        let last = self.last.as_ref().map(|l| {
+            let mut v = view(&l.txn);
+            v["acked"] = json!(l.acked);
+            v["needs_ack"] = json!(!l.acked && ui::sticky(&l.txn));
+            v
+        });
+        json!({
+            "rollback_enabled": rollback_enabled,
+            "active": self.active.as_deref().map(view),
+            "last": last,
+        })
     }
 
     fn remember(&mut self, t: Txn) {
@@ -249,13 +300,19 @@ impl St {
     }
 
     /// 把进行中的事务移进最近列表（它已经是终态）、记一行流水账。不删落盘：调用方决定。
-    fn retire(&mut self, rec: &Record) {
+    fn retire(&mut self, rec: &Record, store: &Store) {
         if let Some(t) = self.active.take() {
             eprintln!(
                 "ops: {} {} from {:?} ended {:?}/{:?}",
                 t.op_id, t.action, t.source, t.phase, t.reason
             );
             rec.append(record::txn_line(&t));
+            let last = Last {
+                txn: (*t).clone(),
+                acked: false,
+            };
+            store.save_last(&last);
+            self.last = Some(last);
             self.remember(*t);
         }
     }
@@ -274,38 +331,51 @@ fn legacy_line(r: &LegacyReq, result: &str, reason: Option<&str>) -> Value {
 }
 
 fn doing_session(s: &Session, now: u64) -> Value {
+    let age = now.saturating_sub(s.opened_ms);
+    let (zh, en) = ui::busy_words("netselect.session", s.source, age);
     json!({
         "op_id": s.id,
         "action": "netselect.session",
         "source": s.source,
         "phase": "session",
-        "age_ms": now.saturating_sub(s.opened_ms),
+        "age_ms": age,
+        "say_zh": zh,
+        "say_en": en,
     })
 }
 
-/// busy 回复里的「正在做什么」。
+/// busy 回复里的「正在做什么」（V2-39 带一句话）。
 fn doing(t: &Txn, now: u64) -> Value {
+    let age = now.saturating_sub(t.created_ms);
+    let (zh, en) = ui::busy_words(&t.item, t.source, age);
     json!({
         "op_id": t.op_id,
         "action": t.action,
         "source": t.source,
         "phase": t.phase,
-        "age_ms": now.saturating_sub(t.created_ms),
+        "age_ms": age,
+        "say_zh": zh,
+        "say_en": en,
     })
 }
 
 impl<D: Device> Engine<D> {
     pub fn new(dev: D, cfg: Config, store: Store, record: Record) -> Self {
+        let last = store.load_last();
         Self {
             inner: Arc::new(Inner {
                 dev,
                 cfg,
                 store,
                 record,
-                st: Mutex::new(St::default()),
+                st: Mutex::new(St {
+                    last,
+                    ..St::default()
+                }),
                 wake: Notify::new(),
                 runner: OnceLock::new(),
                 draining: AtomicBool::new(false),
+                observer: OnceLock::new(),
             }),
         }
     }
@@ -330,8 +400,12 @@ impl<D: Device> Engine<D> {
     /// 落盘当前事务：阶段变了每次都落，只是又等了一拍的隔 10 秒落一次；到终态删掉。
     fn persist(&self, st: &mut St, force: bool) {
         let Some(t) = &st.active else {
+            self.publish(st);
             return;
         };
+        if !t.phase.is_final() {
+            self.publish(st);
+        }
         if t.phase.is_final() {
             self.inner.store.clear();
         } else if force || t.seen_ms.saturating_sub(st.saved_seen_ms) >= SEEN_SAVE_MS {
@@ -343,9 +417,65 @@ impl<D: Device> Engine<D> {
     /// 当前事务到了终态：放锁、记进最近列表、删落盘。
     fn finish(&self, st: &mut St) {
         if st.active.as_ref().is_some_and(|t| t.phase.is_final()) {
-            st.retire(&self.inner.record);
+            st.retire(&self.inner.record, &self.inner.store);
             self.inner.store.clear();
+            self.publish(st);
         }
+    }
+
+    /// 把 `op` 块交出去（V2-34）：在引擎的锁里算、在锁里交，先后不会乱。
+    fn publish(&self, st: &St) {
+        if let Some(obs) = self.inner.observer.get() {
+            obs(st.block(self.inner.cfg.rollback, self.now()));
+        }
+    }
+
+    /// 接上 `/v2` 的 `op` 块，并马上交一次（启动后、第一轮之前订阅的也有数据）。
+    pub fn set_observer(&self, obs: Observer) {
+        let _ = self.inner.observer.set(obs);
+        self.publish_now();
+    }
+
+    /// 每轮采集交一次：进行中时倒计时跟着走，datad 卡住时这块和别的块一样变 stale。
+    pub fn publish_now(&self) {
+        let st = self.lock();
+        self.publish(&st);
+    }
+
+    /// `/v2/screen` 顶层的 `op`（按请求那一刻算）。
+    pub fn block(&self) -> Value {
+        self.lock().block(self.inner.cfg.rollback, self.now())
+    }
+
+    /// 首页结论要叠的写操作（V2-38）。
+    pub fn screen_op(&self) -> Option<ScreenOp> {
+        let st = self.lock();
+        ui::screen_op(
+            st.active.as_deref(),
+            st.last.as_ref().map(|l| (&l.txn, l.acked)),
+            self.now(),
+        )
+    }
+
+    /// 「知道了」（V2-37）：只记账，只能点最近结束的那个；点过再点照样成功、不重复记账。
+    pub fn ack(&self, op_id: &str, source: Source) -> Result<Value, String> {
+        let mut st = self.lock();
+        let Some(last) = st.last.as_mut().filter(|l| l.txn.op_id == op_id) else {
+            return Err("not the latest finished change".into());
+        };
+        if !last.acked {
+            last.acked = true;
+            self.inner.store.save_last(last);
+            self.inner.record.append(json!({
+                "source": source,
+                "action": "op.ack",
+                "op_id": op_id,
+                "item": last.txn.item,
+                "result": "ok",
+            }));
+        }
+        self.publish(&st);
+        Ok(json!({"op_id": op_id, "acked": true}))
     }
 
     /// datad 启动时：有落盘的事务就接着跑（D13、D18、D31）。没有就什么都不读（不多发 ubus）。
@@ -440,7 +570,7 @@ impl<D: Device> Engine<D> {
                 }
                 inherit = Some(t.rollback_to.clone());
                 t.cancel(Reason::Superseded);
-                st.retire(&self.inner.record);
+                st.retire(&self.inner.record, &self.inner.store);
             }
             let mut t = Txn::new(
                 NewTxn {

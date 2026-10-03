@@ -1779,3 +1779,110 @@ fn stall_through_net_view_with() {
         "nodata"
     );
 }
+
+// ---- E4 T13：写操作叠在首页结论上（STATE_V2.md V2-38） ----
+
+fn live_op() -> ScreenOp {
+    ScreenOp {
+        kind: ScreenOpKind::Live,
+        head: ("正在确认".into(), "Checking".into()),
+        hint: (
+            "1:42 后没通就退回到自动".into(),
+            "Back to Auto in 1:42 if no data".into(),
+        ),
+    }
+}
+
+fn with_op_story(f: fn(&mut NetIn<'static>), op: &ScreenOp) -> Story {
+    let mut x = base();
+    f(&mut x);
+    with_op(story(&x), Some(op))
+}
+
+#[test]
+fn story_changing_beats_no_service_and_offline() {
+    let cases: &[fn(&mut NetIn<'static>)] = &[
+        |_| {},
+        // 换制式时常会先经过无服务、只能紧急呼叫、没连上网：都不出红色
+        |x| {
+            x.bars = 0;
+            x.net_type = "No Service"
+        },
+        |x| x.net_type = "Limited Service",
+        |x| x.data_up = false,
+        |x| {
+            x.bars = 1;
+            x.sinr = -3.0
+        },
+    ];
+    for (i, f) in cases.iter().enumerate() {
+        let o = with_op_story(*f, &live_op());
+        assert_eq!(o.state, State::Changing, "case {i}");
+        assert_eq!((o.tone, o.cause), (Tone::Neutral, Cause::None), "case {i}");
+        assert_eq!(
+            (o.headline.as_str(), o.headline_en.as_str()),
+            ("正在确认", "Checking")
+        );
+        assert_eq!(o.hint, "1:42 后没通就退回到自动");
+        assert!(o.headline_en.chars().count() <= 10);
+        check_pairs(&format!("changing {i}"), &story_pairs(&o), &[]);
+    }
+    // 状态栏那些照旧按网络算
+    let o = with_op_story(|x| x.bars = 0, &live_op());
+    assert_eq!(o.rat, "无服务");
+    // 无 SIM、移动网络已关不叠（写操作那时没有意义）
+    let o = with_op_story(|x| x.sim_state = "sim absent", &live_op());
+    assert_eq!(o.state, State::Nosim);
+    let o = with_op_story(|x| x.airplane = true, &live_op());
+    assert_eq!(o.state, State::Airplane);
+    // 没有写操作：和以前一模一样
+    let mut x = base();
+    x.data_up = false;
+    assert_eq!(with_op(story(&x), None), story(&x));
+}
+
+#[test]
+fn story_revert_fail_takes_the_card() {
+    let op = ScreenOp {
+        kind: ScreenOpKind::Alert,
+        head: ("退回也没通".into(), "Failed".into()),
+        hint: (
+            "当前设置未知 · 上次确认是自动 · 再试一次退回或重启设备".into(),
+            "Current setting unknown · last good Auto · retry revert or restart".into(),
+        ),
+    };
+    let o = with_op_story(|_| {}, &op);
+    assert_eq!((o.state, o.tone), (State::RevertFail, Tone::Bad));
+    assert_eq!(o.headline, "退回也没通");
+    assert_eq!(o.headline_en, "Failed");
+    assert!(o.hint.starts_with("当前设置未知"));
+    check_pairs("revert_fail", &story_pairs(&o), &[]);
+    assert_eq!(state_name(State::RevertFail), "revert_fail");
+    assert_eq!(state_name(State::Changing), "changing");
+    // 触屏 C 读 state 的缓冲是 char[12]
+    assert!(state_name(State::RevertFail).len() < 12);
+}
+
+#[test]
+fn story_sticky_result_rides_on_the_hint() {
+    let op = ScreenOp {
+        kind: ScreenOpKind::Sticky,
+        head: (String::new(), String::new()),
+        hint: ("没通 · 已退回自动".into(), "No data · back to Auto".into()),
+    };
+    // 网络正常：大字照旧，提示就是那一句
+    let o = with_op_story(|_| {}, &op);
+    assert_eq!((o.state, o.headline.as_str()), (State::Ok, "顺畅"));
+    assert_eq!(o.hint, "没通 · 已退回自动");
+    assert_eq!(o.hint_en, "No data · back to Auto");
+    // 有提示的：接在后面
+    let o = with_op_story(|x| x.data_up = false, &op);
+    assert_eq!(o.state, State::Nodata);
+    assert!(o.hint.ends_with("；没通 · 已退回自动"), "{}", o.hint);
+    assert!(
+        o.hint_en.ends_with("; No data · back to Auto"),
+        "{}",
+        o.hint_en
+    );
+    check_pairs("sticky", &story_pairs(&o), &[]);
+}
