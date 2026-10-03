@@ -73,6 +73,18 @@ pub const ACTIONS: &[&str] = &[
     "cooling.liquid.set_mode",
 ];
 
+/// E4 T7b 新加的写：agent 的搜网流程（D17，会话里的步骤）和其他影响上网的写。
+/// 和 `op.*` 一样先不进 `/capabilities`（T13 一起加），旧客户端看到的能力表不变。
+pub const E4_ACTIONS: &[&str] = &[
+    "netselect.scan",
+    "netselect.register",
+    "netselect.auto",
+    "cellular.redial",
+    "modem.airplane",
+    "modem.online",
+    "apn.set_pdp_type",
+];
+
 fn object(params: &Value) -> &Map<String, Value> {
     params.as_object().expect("server validates params")
 }
@@ -217,6 +229,35 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         }
         "cell.unlock_all" => unlock_all().await,
         // 原厂「恢复默认频段/小区」：解开全部锁频和锁小区（触屏锁频页的重置按钮）。
+        // D17：搜网会话里的步骤（会话规则在 ops::engine::session_gate）。
+        // 原厂的搜网调用可能等到搜完才回：agent 本来就只给 3 秒，超时也照样看状态。
+        "netselect.scan" => call("zte_nwinfo_api", "nwinfo_manual_scan", json!({})).await,
+        "netselect.register" => netselect_register(params).await,
+        // 回自动选网：原厂没有能用的 ubus 调用（9-26 读过原厂搜网协议），只能 AT+COPS=0
+        "netselect.auto" => at_outcome(crate::at::send(crate::at::Cmd::CopsAuto).await),
+        "cellular.redial" => redial(params).await,
+        "modem.airplane" => match string(params, "operate_mode", true) {
+            Ok(Some(m))
+                if m != "ONLINE"
+                    && !m.is_empty()
+                    && m.len() <= 16
+                    && m.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') =>
+            {
+                call(
+                    "zte_nwinfo_api",
+                    "nwinfo_set_mode",
+                    json!({"operate_mode": m}),
+                )
+                .await
+            }
+            Ok(_) => Outcome::Invalid(
+                "operate_mode must be a mode other than ONLINE (use modem.online)".into(),
+            ),
+            Err(e) => Outcome::Invalid(e),
+        },
+        // nwinfo_set_mode ONLINE 不能把基带从 LPM 拉回来，只有 AT+CFUN=1 行
+        "modem.online" => at_outcome(crate::at::send(crate::at::Cmd::CfunOnline).await),
+        "apn.set_pdp_type" => apn_pdp_type(params).await,
         "band.reset" => {
             call(
                 "zte_nwinfo_api",
@@ -484,6 +525,100 @@ async fn cellular_set(params: &Value) -> Outcome {
     current.insert("cid".into(), json!(1));
     call("zwrt_data", "set_wwaniface", Value::Object(current)).await
 }
+fn at_outcome(r: Result<String, String>) -> Outcome {
+    match r {
+        Ok(a) => Outcome::Ok(json!({"answer": a.trim()})),
+        Err(e) => Outcome::Failed(e),
+    }
+}
+
+/// `{mcc_mnc:"46001", rat?:"…"}` → nwinfo_manual_register `{m_mcc_mnc, m_rat}`（agent 一直这样发）。
+async fn netselect_register(params: &Value) -> Outcome {
+    let plmn = match string(params, "mcc_mnc", true) {
+        Ok(Some(v)) if (5..=6).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_digit()) => v,
+        Ok(_) => return Outcome::Invalid("mcc_mnc must be 5-6 digits".into()),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let rat = match string(params, "rat", false) {
+        Ok(v) => v.unwrap_or_default(),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    if rat.len() > 8 || !rat.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Outcome::Invalid("rat must be a short code".into());
+    }
+    call(
+        "zte_nwinfo_api",
+        "nwinfo_manual_register",
+        json!({"m_mcc_mnc": plmn, "m_rat": rat}),
+    )
+    .await
+}
+
+/// 重新拨号：`type` 1（IPv4）、2（IPv6），不给就两条都拨（agent ensure_data_up 的做法）。
+async fn redial(params: &Value) -> Outcome {
+    let types: Vec<i64> = match integer(params, "type", false) {
+        Ok(Some(t @ (1 | 2))) => vec![t],
+        Ok(Some(_)) => return Outcome::Invalid("type must be 1 or 2".into()),
+        Ok(None) => vec![1, 2],
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let mut last = Value::Null;
+    for t in types {
+        match state::ubus(
+            "zwrt_qcmap_cli",
+            "set_qcliiface",
+            json!({"source_module":"zte_topsw_data","type":t,"enable":1,"sub_id":1}),
+        )
+        .await
+        {
+            Ok(v) => last = v,
+            Err(e) => return Outcome::Failed(e),
+        }
+    }
+    Outcome::Ok(last)
+}
+
+/// WAN IPv6 开关（agent router_wan_ipv6_set 的做法）：拨号 APN 的 PDP 类型改成 IPv4v6（3）或
+/// 只 IPv4（1），别的字段照原样写回；再把正在用的连接的 IPv6 那条腿拉起或断开。
+async fn apn_pdp_type(params: &Value) -> Outcome {
+    let enabled = match boolean(params, "ipv6") {
+        Ok(v) => v,
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let apn = match state::ubus("zwrt_apn_object", "get_apn_at_cid", json!({"cid":1})).await {
+        Ok(v) => v,
+        Err(e) => return Outcome::Failed(format!("read APN failed: {e}")),
+    };
+    let pdp = if enabled { 3 } else { 1 };
+    let s = |k: &str| apn.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let n = |k: &str, d: i64| apn.get(k).and_then(Value::as_i64).unwrap_or(d);
+    let req = json!({
+        "profilename": s("profilename"),
+        "wanapn": s("wanapn"),
+        "username": s("username"),
+        "password": s("password"),
+        "pdpType": pdp,
+        "pppAuthMode": n("pppAuthMode", 0),
+        "profileId": s("profileId"),
+        "isEnable": true,
+        "cid": 1,
+        "isValid": n("isValid", 1),
+        "extraInt1": n("extraInt1", 0),
+        "roamingPdpType": pdp,
+    });
+    if let Err(e) = state::ubus("zwrt_apn_object", "set_apn_at_cid", req).await {
+        return Outcome::Failed(format!("set APN failed: {e}"));
+    }
+    // 正在用的连接：type 2 是 IPv6 那条腿；失败不算（PDP 类型已改，下次拨号生效）
+    let _ = state::ubus(
+        "zwrt_qcmap_cli",
+        "set_qcliiface",
+        json!({"source_module":"zte_topsw_data","type":2,"enable": if enabled {1} else {0},"sub_id":1}),
+    )
+    .await;
+    Outcome::Ok(json!({"ipv6_enabled": enabled, "pdp_type": pdp}))
+}
+
 async fn band(params: &Value, lte: bool, nsa: bool) -> Outcome {
     let bands = match string(params, "bands", false) {
         Ok(v) => v.unwrap_or_default(),

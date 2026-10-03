@@ -71,6 +71,30 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `journal.append` | `item` 或 `action`、`result`，可选 `reason`、`old`、`new`、`detail` 等 | 只记账（eSIM、CHILL 这类不经 `/control` 的改动由 agent 补记）；要顶层 `source`；`result` 为 `skipped` 时按下面的规则合并。不受事务锁、不进执行者队列 |
 | `journal.list` | `limit?`（默认 50，最多 500） | `{"entries":[…新的在前],"owners":{项:{source,user,undo,value,op_id,ts,t}}}` |
 
+**搜网会话**（E4 T7b，D17）：agent 的搜网 / 手动注册 / 回自动流程留在 agent，期间占住写锁。
+
+| action | params | 说明 |
+|---|---|---|
+| `netselect.session.open` | — | 要顶层 `source`；回 `{session, max_ms, lease_ms}`。有事务或会话进行中回 409 `busy` 带 `doing` |
+| `netselect.session.renew` | `session` | agent 至少每 60 秒续一次，不续就当 agent 不在了、收回；最长 7 分钟 |
+| `netselect.session.close` | `session`、`result?` | 放锁；会话号不对或已结束回 409 `invalid_state` |
+
+会话期间：影响上网的写（`cellular.set`、`network.set_mode`、锁频、锁小区、APN、卡槽、`modem.*`、`apn.set_pdp_type`）收 409，`doing.action` 是 `netselect.session`；描述表里的旧请求排队；其他写（短信、USB……）照常。会话结束（关、到点 `expired`、不续 `agent_gone`）各记一行流水账。
+
+会话里的步骤（要顶层 `source`；`netselect.scan`、`netselect.register` 还要顶层 `session` = 当前会话号；`netselect.auto`、`cellular.redial` 带会话号算会话里的一步，不带也能做，会话结束后 guard 退回就是这样）。这几个和 `modem.*`、`apn.set_pdp_type` 先不进 `/capabilities`：
+
+| action | params | 原厂 |
+|---|---|---|
+| `netselect.scan` | — | `zte_nwinfo_api nwinfo_manual_scan` |
+| `netselect.register` | `mcc_mnc`（5–6 位数字）、`rat?` | `nwinfo_manual_register {m_mcc_mnc, m_rat}` |
+| `netselect.auto` | — | `AT+COPS=0`（原厂没有能用的 ubus 调用） |
+| `cellular.redial` | `type?`（1 IPv4、2 IPv6，不给两条都拨） | `zwrt_qcmap_cli set_qcliiface` |
+| `modem.airplane` | `operate_mode`（ONLINE 以外） | `nwinfo_set_mode` |
+| `modem.online` | — | `AT+CFUN=1`（`nwinfo_set_mode ONLINE` 拉不回 LPM） |
+| `apn.set_pdp_type` | `ipv6`（布尔） | 拨号 APN 的 PDP 类型改成 IPv4v6 / IPv4（其他字段照原样），再拉起或断开 IPv6 那条腿 |
+
+AT 只发这两条固定命令。AT 口和 zte-agent 共用，两边都拿 `ZWRT_DATAD_AT_LOCK`（默认 `/var/run/u60-at.lock`，flock）；口是 `ZWRT_DATAD_AT_PORT`，没设就按 agent 的顺序找第一个回 OK 的。等到 OK/ERROR 就停，最多 6 秒。
+
 **流水账**（T5）：`ZWRT_DATAD_OPS_DIR` 下的 `journal.jsonl`，每行一个 JSON，带 `ts`（unix 秒）和 `t`（设备时钟的年月日时分秒，设备时钟本来就是当地时间）。会改设备的 `/control` 动作都记一行（`sms.mark_read` 不记）：事务结束时记 op_id、来源、SIM（ICCID 后 4 位/卡槽）、旧值、新值、退回目标、读回、终态和原因；不走事务的写记动作、来源（没有 source 记 `legacy`）、参数、`ok`/`failed` 和 HTTP 状态；旧请求队列的排队、被替换、丢掉也各记一行；重启、关机在执行前先记 `requested` 并等它写进闪存。密码类字段（Wi-Fi 密码、APN 用户名/密码、eSIM 激活码/确认码、PIN 等）只写 `(changed)`；ICCID、EID、IMSI、号码类字段只留后 4 位；短信动作不记参数。同一来源 + 同一项 + 同一原因的 `skipped` 只记开头一行（`skip:start`）和结束一行（`skip:end`，`count` = 一共跳过几次；原因变了，或这个来源对这一项有了别的记录时结束；计数在内存里，datad 重启时进行中的那段丢掉）。文件超过 `ZWRT_DATAD_JOURNAL_MAX_BYTES`（默认 262144）就改名为 `journal.1.jsonl`，两份合计不超过约 2 倍上限；单行最长 2 KB。`owners.json` 记每一项最后是谁写的（screen/web/legacy 的 `user` 为 true），流水账滚掉也不丢。
 
 **旧请求**（没有 `source`）回复和以前逐字节相同。事务进行中：同一项的旧请求当覆盖写照常执行；描述表里的其他旧请求回成功（`{"result":"success"}`）并进旧请求队列，锁空出来再执行（每项只留最新、120 秒过期、关数据或重启时清空）。描述表里的动作在执行者队列满时也这样处理，不回 503；旧的关数据请求在队列满时作为内部任务马上执行。

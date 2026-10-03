@@ -126,9 +126,50 @@ const RECENT: usize = 16;
 /// 等确认期间至少隔这么久落一次盘（重启后算上一次开机等了多久）。
 const SEEN_SAVE_MS: u64 = 10_000;
 
+/// 搜网会话（D17）：agent 的搜网/手动注册/回自动流程期间占住写锁。
+#[derive(Clone, Debug)]
+struct Session {
+    id: String,
+    source: Source,
+    opened_ms: u64,
+    renewed_ms: u64,
+}
+
+/// 会话最长多久（D17：7 分钟）。
+pub const SESSION_MAX_MS: u64 = 7 * 60_000;
+/// 多久没续就当 agent 不在了（agent 每 20 秒续一次）。
+pub const SESSION_LEASE_MS: u64 = 60_000;
+
+/// 会话里的步骤：只有带着当前会话号才能做。
+pub const SESSION_STEPS: &[&str] = &["netselect.scan", "netselect.register"];
+/// 会话里也能做、没有会话时也能做的（guard 退回自动、重拨；D15/D17）。
+pub const SESSION_OPTIONAL: &[&str] = &["netselect.auto", "cellular.redial"];
+/// 会话期间收 409 的写：影响上网的那些（和 agent 应急写覆盖的一致）。其他写（短信、USB……）照常。
+pub const SESSION_BLOCKS: &[&str] = &[
+    "cellular.set",
+    "network.set_mode",
+    "band.set_lte",
+    "band.set_nr_sa",
+    "band.set_nr_nsa",
+    "band.reset",
+    "cell.lock_lte",
+    "cell.lock_nr",
+    "cell.unlock_all",
+    "apn.set_mode",
+    "apn.enable",
+    "apn.add",
+    "apn.modify",
+    "apn.delete",
+    "sim.set_slot",
+    "modem.airplane",
+    "modem.online",
+    "apn.set_pdp_type",
+];
+
 #[derive(Default)]
 struct St {
     active: Option<Box<Txn>>,
+    session: Option<Session>,
     recent: VecDeque<Txn>,
     legacy: VecDeque<LegacyReq>,
     saved_seen_ms: u64,
@@ -229,6 +270,16 @@ fn legacy_line(r: &LegacyReq, result: &str, reason: Option<&str>) -> Value {
         "params": record::redact(&r.action, &r.params),
         "result": result,
         "reason": reason,
+    })
+}
+
+fn doing_session(s: &Session, now: u64) -> Value {
+    json!({
+        "op_id": s.id,
+        "action": "netselect.session",
+        "source": s.source,
+        "phase": "session",
+        "age_ms": now.saturating_sub(s.opened_ms),
     })
 }
 
@@ -350,6 +401,9 @@ impl<D: Device> Engine<D> {
             if let Some(v) = st.find(&op_id, now) {
                 return Submit::Existing(v);
             }
+            if let Some(s) = &st.session {
+                return Submit::Busy(doing_session(s, now));
+            }
             if let Some(t) = &st.active
                 && !overridable(t, &req)
             {
@@ -375,6 +429,9 @@ impl<D: Device> Engine<D> {
             let mut st = self.lock();
             if let Some(v) = st.find(&op_id, now) {
                 return Submit::Existing(v);
+            }
+            if let Some(s) = &st.session {
+                return Submit::Busy(doing_session(s, now));
             }
             let mut inherit = None;
             if let Some(t) = st.active.as_mut() {
@@ -675,6 +732,9 @@ impl<D: Device> Engine<D> {
             return LegacyGate::Pass;
         };
         let mut st = self.lock();
+        if st.session.is_some() {
+            return LegacyGate::Queue;
+        }
         let Some(t) = st.active.as_mut() else {
             return LegacyGate::Pass;
         };
@@ -732,7 +792,7 @@ impl<D: Device> Engine<D> {
                     let ttl = e.inner.cfg.legacy_ttl_ms;
                     let mut st = e.lock();
                     let rec = &e.inner.record;
-                    if st.active.is_some() {
+                    if st.active.is_some() || st.session.is_some() {
                         None
                     } else {
                         st.legacy.retain(|r| {
@@ -751,7 +811,7 @@ impl<D: Device> Engine<D> {
                     // 放下标志之后又来了活：再抢一次。
                     let more = {
                         let st = e.lock();
-                        st.active.is_none() && !st.legacy.is_empty()
+                        st.active.is_none() && st.session.is_none() && !st.legacy.is_empty()
                     };
                     if more && !e.inner.draining.swap(true, Ordering::AcqRel) {
                         continue;
@@ -770,6 +830,137 @@ impl<D: Device> Engine<D> {
                 }
             }
         });
+    }
+}
+
+/// 会话怎么样了（`netselect.session.*` 的回复、流水账）。
+#[derive(Debug, PartialEq)]
+pub enum SessionError {
+    /// 别的事务或会话占着：它是什么。
+    Busy(Value),
+    /// 会话号不对，或会话已经结束。
+    Gone,
+}
+
+impl<D: Device> Engine<D> {
+    fn session_line(&self, s: &Session, result: &str, reason: Option<&str>) {
+        self.inner.record.append(json!({
+            "source": s.source,
+            "item": "netselect.session",
+            "op_id": s.id,
+            "result": result,
+            "reason": reason,
+            "age_ms": self.now().saturating_sub(s.opened_ms),
+        }));
+    }
+
+    /// 到点或租约过期的会话收回（记流水账、放出旧请求队列）。
+    fn reap_session(&self, st: &mut St) {
+        let now = self.now();
+        let why = match &st.session {
+            Some(s) if now.saturating_sub(s.opened_ms) >= SESSION_MAX_MS => "expired",
+            Some(s) if now.saturating_sub(s.renewed_ms) >= SESSION_LEASE_MS => "agent_gone",
+            _ => return,
+        };
+        let s = st.session.take().expect("checked");
+        eprintln!("ops: session {} ended: {why}", s.id);
+        self.session_line(&s, "ended", Some(why));
+    }
+
+    /// 开一个搜网会话。有事务或会话进行中就回它是什么。
+    pub fn session_open(&self, source: Source) -> Result<Value, SessionError> {
+        let now = self.now();
+        let s = {
+            let mut st = self.lock();
+            self.reap_session(&mut st);
+            if let Some(s) = &st.session {
+                return Err(SessionError::Busy(doing_session(s, now)));
+            }
+            if let Some(t) = &st.active {
+                return Err(SessionError::Busy(doing(t, now)));
+            }
+            let s = Session {
+                id: new_op_id(),
+                source,
+                opened_ms: now,
+                renewed_ms: now,
+            };
+            st.session = Some(s.clone());
+            s
+        };
+        self.session_line(&s, "opened", None);
+        // 到点、agent 不续了也要收回，不靠下一个请求来碰
+        let e = self.clone();
+        let id = s.id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let ended = {
+                    let mut st = e.lock();
+                    e.reap_session(&mut st);
+                    st.session.as_ref().is_none_or(|s| s.id != id)
+                };
+                if ended {
+                    e.kick_legacy();
+                    return;
+                }
+            }
+        });
+        Ok(json!({"session": s.id, "max_ms": SESSION_MAX_MS, "lease_ms": SESSION_LEASE_MS}))
+    }
+
+    /// agent 还在：续租约。
+    pub fn session_renew(&self, id: &str) -> Result<Value, SessionError> {
+        let now = self.now();
+        let mut st = self.lock();
+        self.reap_session(&mut st);
+        match st.session.as_mut() {
+            Some(s) if s.id == id => {
+                s.renewed_ms = now;
+                Ok(
+                    json!({"session": id, "left_ms": SESSION_MAX_MS.saturating_sub(now.saturating_sub(s.opened_ms))}),
+                )
+            }
+            _ => Err(SessionError::Gone),
+        }
+    }
+
+    /// 流程做完了：放锁（`result` 记进流水账）。
+    pub fn session_close(&self, id: &str, result: Option<&str>) -> Result<(), SessionError> {
+        let s = {
+            let mut st = self.lock();
+            self.reap_session(&mut st);
+            match &st.session {
+                Some(s) if s.id == id => st.session.take().expect("checked"),
+                _ => return Err(SessionError::Gone),
+            }
+        };
+        self.session_line(&s, "closed", result);
+        self.kick_legacy();
+        Ok(())
+    }
+
+    /// 一个写能不能现在做（会话规则）：步骤要带当前会话号；回自动、重拨带了就算会话里的、
+    /// 没会话时也能做；影响上网的其他写在会话期间收 409。带当前会话号的请求顺便续租约。
+    pub fn session_gate(&self, action: &str, session: Option<&str>) -> Result<(), SessionError> {
+        let now = self.now();
+        let mut st = self.lock();
+        self.reap_session(&mut st);
+        let current = st.session.as_mut();
+        let step = SESSION_STEPS.contains(&action);
+        let optional = SESSION_OPTIONAL.contains(&action);
+        match (current, session) {
+            (Some(s), Some(id)) if s.id == id && (step || optional) => {
+                s.renewed_ms = now;
+                Ok(())
+            }
+            (Some(s), _) if step || optional || SESSION_BLOCKS.contains(&action) => {
+                Err(SessionError::Busy(doing_session(s, now)))
+            }
+            (None, _) if step => Err(SessionError::Gone),
+            // 会话已经结束（到点、收回）：回自动、重拨照做，算 guard 自己的一步（D15）
+            _ => Ok(()),
+        }
     }
 }
 

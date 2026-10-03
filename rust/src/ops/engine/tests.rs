@@ -1001,3 +1001,136 @@ async fn finished_changes_and_legacy_queue_are_journaled() {
         (Some("screen"), Some("Only_LTE"))
     );
 }
+
+// ── 搜网会话（D17，E4 T7b）──────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn session_holds_the_lock_for_connectivity_writes_only() {
+    let dev = Dev::new();
+    let e = engine(&dev, false, None);
+    let open = e.session_open(Source::Web).unwrap();
+    let sid = open["session"].as_str().unwrap().to_owned();
+    // 网络模式、其他影响上网的写：409，说清是会话
+    match e.submit(req("Only_LTE", Source::Screen)).await {
+        Submit::Busy(d) => assert_eq!(d["action"], "netselect.session"),
+        other => panic!("{other:?}"),
+    }
+    for a in [
+        "cellular.set",
+        "band.set_lte",
+        "apn.enable",
+        "modem.airplane",
+    ] {
+        assert!(
+            matches!(e.session_gate(a, None), Err(SessionError::Busy(_))),
+            "{a}"
+        );
+    }
+    // 短信、USB 这些照常
+    for a in ["sms.delete", "sms.mark_read", "usb.set", "journal.append"] {
+        assert_eq!(e.session_gate(a, None), Ok(()), "{a}");
+    }
+    // 步骤：要带当前会话号
+    assert_eq!(e.session_gate("netselect.scan", Some(&sid)), Ok(()));
+    assert!(matches!(
+        e.session_gate("netselect.register", None),
+        Err(SessionError::Busy(_))
+    ));
+    assert!(matches!(
+        e.session_gate("netselect.register", Some("other")),
+        Err(SessionError::Busy(_))
+    ));
+    assert_eq!(e.session_gate("netselect.auto", Some(&sid)), Ok(()));
+    // 第二个会话、旧请求
+    assert!(matches!(
+        e.session_open(Source::Web),
+        Err(SessionError::Busy(_))
+    ));
+    assert_eq!(e.legacy_gate(Some(NETWORK_MODE), false), LegacyGate::Queue);
+    // 关掉以后一切照常
+    e.session_close(&sid, Some("registered")).unwrap();
+    assert_eq!(e.session_gate("cellular.set", None), Ok(()));
+    assert!(matches!(
+        e.submit(req("Only_LTE", Source::Screen)).await,
+        Submit::Applied { .. }
+    ));
+    assert_eq!(e.session_close(&sid, None), Err(SessionError::Gone));
+}
+
+#[tokio::test(start_paused = true)]
+async fn steps_need_a_session_but_revert_and_redial_do_not() {
+    let dev = Dev::new();
+    let e = engine(&dev, false, None);
+    assert_eq!(
+        e.session_gate("netselect.scan", None),
+        Err(SessionError::Gone)
+    );
+    assert_eq!(
+        e.session_gate("netselect.register", Some("x")),
+        Err(SessionError::Gone)
+    );
+    // guard 在会话结束后退回自动、重拨（D15）
+    assert_eq!(e.session_gate("netselect.auto", None), Ok(()));
+    assert_eq!(e.session_gate("netselect.auto", Some("ended-one")), Ok(()));
+    assert_eq!(e.session_gate("cellular.redial", None), Ok(()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_cannot_open_over_a_change_in_progress() {
+    let dev = Dev::new();
+    let e = engine(&dev, false, None);
+    let op = op_of(&e.submit(req("Only_LTE", Source::Web)).await);
+    match e.session_open(Source::Web) {
+        Err(SessionError::Busy(d)) => assert_eq!(d["op_id"], op["op_id"]),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_agent_that_stops_renewing_loses_the_session_and_queued_requests_run() {
+    let dev = Dev::new();
+    let e = engine(&dev, false, None);
+    let calls = recording_runner(&e, 0);
+    let sid = e.session_open(Source::Web).unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // 续着就一直在（续到 2 分钟）
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        e.session_renew(&sid).unwrap();
+    }
+    // 会话期间来的旧请求排着（120 秒内不过期）
+    e.enqueue_legacy(NETWORK_MODE, "network.set_mode", json!({"mode":"Only_5G"}));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(calls.lock().unwrap().is_empty());
+    // 不续了：租约 60 秒后收回，排着的旧请求接着做
+    tokio::time::sleep(Duration::from_millis(SESSION_LEASE_MS + 2_000)).await;
+    assert_eq!(e.session_renew(&sid), Err(SessionError::Gone));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_eq!(e.session_gate("cellular.set", None), Ok(()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_never_outlives_seven_minutes() {
+    let dev = Dev::new();
+    let e = engine(&dev, false, None);
+    let sid = e.session_open(Source::Web).unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut alive = 0;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        if e.session_renew(&sid).is_ok() {
+            alive += 1;
+        }
+    }
+    // 7 分钟 = 21 次 20 秒
+    assert!((20..=21).contains(&alive), "{alive}");
+    assert_eq!(
+        e.session_gate("netselect.scan", Some(&sid)),
+        Err(SessionError::Gone)
+    );
+}

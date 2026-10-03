@@ -595,7 +595,9 @@ async fn run_control(app: App, action: String, body: Value) -> Result<Response, 
 
 async fn control_job(app: App, action: String, body: Value) -> Response {
     let marker = app.inner.exec.clone();
-    let writes = crate::control::ACTIONS.contains(&action.as_str()) && !read_only(&action);
+    let writes = (crate::control::ACTIONS.contains(&action.as_str())
+        || crate::control::E4_ACTIONS.contains(&action.as_str()))
+        && !read_only(&action);
     // D29：会改设备的动作在执行者里拿着跨进程写锁做（和应急直写脚本互斥）。
     let _lock = if writes {
         Some(crate::ops::write_lock::acquire().await)
@@ -762,6 +764,18 @@ async fn ops_route(app: &App, action: &str, body: &Value) -> Option<Response> {
         }
         _ => {}
     }
+    // 搜网会话和它的步骤只给带来源的新客户端（D17）
+    let session_action =
+        action.starts_with("netselect.") || crate::ops::engine::SESSION_OPTIONAL.contains(&action);
+    if session_action && body.get("source").is_none() {
+        return Some(op_error(
+            action,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "source required",
+            None,
+        ));
+    }
     let source = body.get("source")?;
     let Some(source) = source.as_str().and_then(crate::ops::Source::parse) else {
         return Some(op_error(
@@ -772,6 +786,51 @@ async fn ops_route(app: &App, action: &str, body: &Value) -> Option<Response> {
             None,
         ));
     };
+    let session_err = |e: crate::ops::engine::SessionError| match e {
+        crate::ops::engine::SessionError::Busy(doing) => op_error(
+            action,
+            StatusCode::CONFLICT,
+            "busy",
+            "another change is in progress",
+            Some(("doing", doing)),
+        ),
+        crate::ops::engine::SessionError::Gone => op_error(
+            action,
+            StatusCode::CONFLICT,
+            "invalid_state",
+            "no such session (ended or expired)",
+            None,
+        ),
+    };
+    let session_id = |v: &Value| v.get("session").and_then(Value::as_str).map(str::to_owned);
+    match action {
+        "netselect.session.open" => {
+            return Some(match ops.session_open(source) {
+                Ok(v) => control_ok(action, v),
+                Err(e) => session_err(e),
+            });
+        }
+        "netselect.session.renew" | "netselect.session.close" => {
+            let Some(id) = session_id(params) else {
+                return Some(invalid_parameter(action, "missing parameter: session"));
+            };
+            let r = if action.ends_with("renew") {
+                ops.session_renew(&id)
+            } else {
+                let result = params.get("result").and_then(Value::as_str);
+                ops.session_close(&id, result)
+                    .map(|()| json!({"session": id}))
+            };
+            return Some(match r {
+                Ok(v) => control_ok(action, v),
+                Err(e) => session_err(e),
+            });
+        }
+        _ => {}
+    }
+    if let Err(e) = ops.session_gate(action, session_id(body).as_deref()) {
+        return Some(session_err(e));
+    }
     let spec = crate::ops::spec::find(action)?;
     let target = match spec.target(params) {
         Ok(v) => v,

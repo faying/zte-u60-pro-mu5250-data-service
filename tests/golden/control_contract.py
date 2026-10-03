@@ -298,6 +298,45 @@ def journal() -> None:
             fail("密码写进了流水账")
 
 
+def netselect_session() -> None:
+    """D17：搜网会话占着锁时，影响上网的写回 409（说明是会话），步骤要带会话号，短信照常；关掉以后放开。"""
+    s = json.loads(post({"action": "op.status"})[1])["result"]
+    if s and s.get("phase") in ("accepted", "applying", "verifying", "rolling_back"):
+        wait_final(s["op_id"])
+    status, raw = post({"action": "netselect.session.open", "source": "web", "params": {}})
+    if status != b"HTTP/1.1 200 OK":
+        fail("开会话没成功：%r %r" % (status, raw))
+    sid = json.loads(raw)["result"]["session"]
+    status, raw = post({"action": "network.set_mode", "source": "web", "params": {"mode": "Only_LTE"}})
+    reply = json.loads(raw)
+    if status != b"HTTP/1.1 409 Conflict" or reply.get("doing", {}).get("action") != "netselect.session":
+        fail("会话期间切网络模式应该 409：%r %r" % (status, raw))
+    status, raw = post({"action": "band.set_lte", "source": "web", "params": {"bands": "1,3"}})
+    if status != b"HTTP/1.1 409 Conflict":
+        fail("会话期间锁频应该 409：%r %r" % (status, raw))
+    status, raw = post({"action": "netselect.scan", "source": "web", "params": {}})
+    if status != b"HTTP/1.1 409 Conflict":
+        fail("不带会话号的搜网应该 409：%r %r" % (status, raw))
+    status, raw = post({"action": "netselect.scan", "source": "web", "session": sid, "params": {}})
+    if status == b"HTTP/1.1 409 Conflict":
+        fail("带会话号的搜网不该 409：%r" % raw)
+    status, raw = post({"action": "netselect.scan", "params": {}})
+    if status != b"HTTP/1.1 400 Bad Request":
+        fail("没有 source 的搜网应该 400：%r %r" % (status, raw))
+    status, raw = post({"action": "sms.mark_read", "source": "auto", "params": {"ids": "1", "tag": 0}})
+    if status == b"HTTP/1.1 409 Conflict":
+        fail("会话期间短信已读不该被挡：%r" % raw)
+    status, raw = post({"action": "netselect.session.close", "source": "web", "params": {"session": sid, "result": "done"}})
+    if status != b"HTTP/1.1 200 OK":
+        fail("关会话没成功：%r %r" % (status, raw))
+    status, raw = post({"action": "netselect.session.close", "source": "web", "params": {"session": sid}})
+    if status != b"HTTP/1.1 409 Conflict":
+        fail("关两次应该 409：%r %r" % (status, raw))
+    status, raw = post({"action": "band.set_lte", "source": "web", "params": {"bands": "1,3"}})
+    if status == b"HTTP/1.1 409 Conflict":
+        fail("会话关了锁频还是 409：%r" % raw)
+
+
 def main() -> int:
     try:
         hang_until_done()
@@ -309,6 +348,7 @@ def main() -> int:
         write_lock_is_shared()
         set_interval_applies()
         journal()
+        netselect_session()
     finally:
         clear()
     return 0
