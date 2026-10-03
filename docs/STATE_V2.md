@@ -251,10 +251,11 @@ datad 自己有看门狗（独立系统线程，每秒看一次）：超过 **30
 datad 启动时把 pid 写进 `ZWRT_DATAD_PID_FILE`（默认 `/var/run/zwrt-datad.pid`），应急直写脚本据此判断 datad 在不在（D18）。
 测试（E4 T3）：`stuck_call_is_reported_and_stalls_after_limit`
 
-**V2-33** 采集轮之外（控制任务、内部任务）的调用超时了，结果算「未知」：原厂那边可能还在做（D28）。
-执行者先把闸关上：下一个非采集轮的调用之前，用这个对象的只读请求探测（块表里读它的那个请求；块表里没有就是 `system board`），
-每次最多 8 秒、最多 4 次，对象回答了（成功或报错都算）才放行；4 次都超时也放行并记一行，写的结果交给事务按读回判断。
-采集轮里的读超时不关闸（照 V2-18 本轮跳过）。写事务遇到超时不判失败，只按读回判断。
-另有跨进程写锁 `ZWRT_DATAD_WRITE_LOCK`（默认 `/var/run/u60-write.lock`，flock，D29）：datad 的每个写（事务的写和退回、会改设备的 `/control`）
-和启动时处理 takeover/pending 的全过程都拿着它，和应急直写脚本互斥；拿不到就等，满 20 秒还拿不到就记一行照做。
-测试（E4 T3）：`timeout_holds_next_call_until_object_answers`、`gate_opens_after_four_failed_probes`、`round_timeouts_do_not_close_the_gate`、`timed_out_write_is_unknown_and_confirmed_by_readback`
+**V2-33** 写的上下文（拿着跨进程写锁的那段：事务的写和退回、会改设备的 `/control`）里调用超时了，结果算「未知」：原厂那边可能还在做（D28）。
+执行者先把闸关上：下一个写的调用之前，先用这个对象的只读请求探测（固定表：`zte_nwinfo_api` 用 `nwinfo_get_netinfo`、`zwrt_data` 用 `get_wwaniface` 等；
+表里没有就用块表里读它的请求，再没有就是 `system board`），每次最多 8 秒、最多 4 次，对象回答了（成功或报错都算）才放行；
+4 次都超时也放行并记一行，写的结果交给事务按读回判断。
+写之外的调用（采集轮、事务确认时的读、只读的 `/control`）超时不关闸、也不等闸，免得确认期间整个执行者陪着探测。写事务遇到超时不判失败，只按读回判断。
+跨进程写锁 `ZWRT_DATAD_WRITE_LOCK`（默认 `/var/run/u60-write.lock`，flock，D29）：datad 的每个写和启动时处理 takeover/pending 的全过程都拿着它，
+和应急直写脚本互斥；拿不到就等，满 15 秒还拿不到就记一行照做（小于订阅方判卡死的 20 秒）。
+测试（E4 T3）：`timeout_holds_next_call_until_object_answers`、`gate_opens_after_four_failed_probes`、`round_timeouts_do_not_close_the_gate`、`read_timeouts_do_not_close_the_gate`、`probe_uses_the_vendor_read_for_written_objects`、`timed_out_write_is_unknown_and_confirmed_by_readback`

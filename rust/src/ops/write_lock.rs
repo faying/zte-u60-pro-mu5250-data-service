@@ -2,7 +2,8 @@
 //!
 //! datad 每个写步骤、以及启动时处理 takeover/pending 的全过程都拿着它；触屏/agent 的应急直写脚本
 //! （`u60-fallback.sh`）从判定 datad 不在到写完也拿着它。拿不到就等（每 50 ms 试一次）；
-//! 等满 20 秒还拿不到就记一行、不拿锁照做（比卡住执行者让看门狗杀掉好；20 秒小于看门狗的 30 秒）。
+//! 等满 15 秒还拿不到就记一行、不拿锁照做（比卡住执行者让看门狗杀掉好；15 秒小于订阅方判卡死的 20 秒）。
+//! 拿着锁的这段在执行者里是「写的上下文」（`executor::write_scope`）：调用超时会关闸（V2-33）。
 //! `ZWRT_DATAD_WRITE_LOCK` 指定路径，空串 = 不用锁。文件打不开时只记一次日志。
 
 use fs2::FileExt;
@@ -12,17 +13,27 @@ use std::{
     time::Duration,
 };
 
-const WAIT: Duration = Duration::from_secs(20);
+const WAIT: Duration = Duration::from_secs(15);
 const STEP: Duration = Duration::from_millis(50);
 
 /// 拿着锁；丢掉就放。
-pub struct WriteLock(Option<File>);
+pub struct WriteLock {
+    file: Option<File>,
+    _scope: crate::executor::WriteScope,
+}
 
 impl Drop for WriteLock {
     fn drop(&mut self) {
-        if let Some(f) = &self.0 {
+        if let Some(f) = &self.file {
             let _ = FileExt::unlock(f);
         }
+    }
+}
+
+fn held(file: Option<File>) -> WriteLock {
+    WriteLock {
+        file,
+        _scope: crate::executor::write_scope(),
     }
 }
 
@@ -38,7 +49,7 @@ static OPEN_FAILED: AtomicBool = AtomicBool::new(false);
 
 pub async fn acquire() -> WriteLock {
     let Some(path) = path() else {
-        return WriteLock(None);
+        return held(None);
     };
     let file = match OpenOptions::new()
         .create(true)
@@ -51,20 +62,20 @@ pub async fn acquire() -> WriteLock {
             if !OPEN_FAILED.swap(true, Ordering::Relaxed) {
                 eprintln!("ops: cannot open write lock {path}: {e}; writing without it");
             }
-            return WriteLock(None);
+            return held(None);
         }
     };
     let start = tokio::time::Instant::now();
     loop {
         if file.try_lock_exclusive().is_ok() {
-            return WriteLock(Some(file));
+            return held(Some(file));
         }
         if start.elapsed() >= WAIT {
             eprintln!(
                 "ops: write lock {path} still held after {} s, writing anyway",
                 WAIT.as_secs()
             );
-            return WriteLock(None);
+            return held(None);
         }
         tokio::time::sleep(STEP).await;
     }

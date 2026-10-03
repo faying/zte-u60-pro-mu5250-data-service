@@ -1076,6 +1076,19 @@ async fn idle_executor_is_never_stalled() {
     assert!(hb.iter().all(|(_, a)| *a == 0));
 }
 
+/// 写的上下文里调一次（像拿着写锁的事务写或 `/control` 写）。
+async fn write_call(
+    exec: &Executor,
+    object: &'static str,
+    method: &'static str,
+) -> Result<Value, UbusError> {
+    exec.task(async move {
+        let _w = super::write_scope();
+        call(object, method, &json!({})).await
+    })
+    .await
+}
+
 #[tokio::test(start_paused = true)]
 async fn timeout_holds_next_call_until_object_answers() {
     // V2-33（D28）：写超时了，下一个调用之前先用只读请求探测这个对象，回答了才放行。
@@ -1086,12 +1099,12 @@ async fn timeout_holds_next_call_until_object_answers() {
         "dev.list",
         Step::Reply(json!({}), Duration::from_millis(50)),
     );
-    let r = exec.call("dev", "set", &json!({"v":1})).await;
+    let r = write_call(&exec, "dev", "set").await;
     assert!(matches!(r, Err(UbusError::Timeout { .. })));
-    exec.call("dev", "set", &json!({"v":2})).await.unwrap();
+    write_call(&exec, "dev", "set").await.unwrap();
     assert_eq!(mock.names(), ["dev.set", "dev.list", "dev.list", "dev.set"]);
     // 放闸以后不再探测
-    exec.call("other", "get", &json!({})).await.unwrap();
+    write_call(&exec, "other", "get").await.unwrap();
     assert_eq!(mock.names().last().unwrap(), "other.get");
     assert_eq!(mock.names().len(), 5);
 }
@@ -1102,8 +1115,8 @@ async fn gate_opens_after_four_failed_probes() {
     mock.push("dev.set", Step::Timeout(Duration::from_secs(8)));
     mock.default_step("system.board", Step::Timeout(Duration::from_secs(8)));
     let t0 = Instant::now();
-    let _ = exec.call("dev", "set", &json!({})).await;
-    exec.call("dev", "get", &json!({})).await.unwrap();
+    let _ = write_call(&exec, "dev", "set").await;
+    write_call(&exec, "dev", "get").await.unwrap();
     // 块表里没有这个对象：问 ubusd 本身；4 次都超时也放行
     assert_eq!(
         mock.names(),
@@ -1125,9 +1138,55 @@ async fn round_timeouts_do_not_close_the_gate() {
     mock.push("a.list", Step::Timeout(Duration::from_secs(2)));
     exec.start_rounds(Arc::new(NoLegacy));
     tokio::time::sleep(Duration::from_millis(3_500)).await;
-    exec.call("ctl", "set", &json!({})).await.unwrap();
+    write_call(&exec, "ctl", "set").await.unwrap();
     let names = mock.names();
     let i = names.iter().position(|n| n == "ctl.set").unwrap();
     // 采集轮里的读超时不关闸：控制调用前面没有探测
     assert_eq!(names[..i], ["a.list"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn probe_uses_the_vendor_read_for_written_objects() {
+    // 块表里没有 zte_nwinfo_api：用固定表里的 nwinfo_get_netinfo 探测，不是只问 ubusd
+    let (exec, mock, _) = setup(vec![spec("a", 3600)], Config::default(), 1000);
+    mock.push(
+        "zte_nwinfo_api.nwinfo_set_netselect",
+        Step::Timeout(Duration::from_secs(8)),
+    );
+    let _ = write_call(&exec, "zte_nwinfo_api", "nwinfo_set_netselect").await;
+    write_call(&exec, "zte_nwinfo_api", "nwinfo_set_netselect")
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.names(),
+        [
+            "zte_nwinfo_api.nwinfo_set_netselect",
+            "zte_nwinfo_api.nwinfo_get_netinfo",
+            "zte_nwinfo_api.nwinfo_set_netselect"
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn read_timeouts_do_not_close_the_gate() {
+    // 事务确认时读 nwinfo 超时（基带在重新注册）：不关闸，下一个写不用陪着探测
+    let (exec, mock, _) = setup(vec![], Config::default(), 1000);
+    mock.push(
+        "zte_nwinfo_api.nwinfo_get_netinfo",
+        Step::Timeout(Duration::from_secs(8)),
+    );
+    let r = exec
+        .call("zte_nwinfo_api", "nwinfo_get_netinfo", &json!({}))
+        .await;
+    assert!(matches!(r, Err(UbusError::Timeout { .. })));
+    write_call(&exec, "zte_nwinfo_api", "nwinfo_set_netselect")
+        .await
+        .unwrap();
+    assert_eq!(
+        mock.names(),
+        [
+            "zte_nwinfo_api.nwinfo_get_netinfo",
+            "zte_nwinfo_api.nwinfo_set_netselect"
+        ]
+    );
 }

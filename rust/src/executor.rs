@@ -197,9 +197,46 @@ struct Shared {
     kick: AtomicBool,
     stats: Stats,
     live: Liveness,
-    /// V2-33（D28）：采集轮之外的调用超时了，这是那个对象。下一个调用之前先探测它，回答了才放行。
+    /// V2-33（D28）：写的上下文里调用超时了，这是那个对象。下一个写调用之前先探测它，回答了才放行。
     gate: Mutex<Option<String>>,
+    /// 正在做写（拿着跨进程写锁的任务，`write_scope`）。
+    writing: AtomicBool,
 }
+
+/// 写的上下文：拿着跨进程写锁的那段（`ops::write_lock`）。只有这里面的调用超时才关闸，
+/// 也只有这里面的调用要等闸（D28 说的是「不放给下一个写」；读超时不关闸，免得确认期间整个执行者陪着探测）。
+pub struct WriteScope(Option<Arc<Shared>>);
+
+impl Drop for WriteScope {
+    fn drop(&mut self) {
+        if let Some(s) = &self.0 {
+            s.writing.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 在执行者里开始一段写；不在执行者里时什么都不做。
+pub fn write_scope() -> WriteScope {
+    WriteScope(
+        CTX.try_with(|c| {
+            c.shared.writing.store(true, Ordering::Relaxed);
+            c.shared.clone()
+        })
+        .ok(),
+    )
+}
+
+/// 探测用的只读请求：会被 `/control` 写到的原厂对象各一个（块表里没有它们）。
+const PROBES: &[(&str, &str)] = &[
+    ("zte_nwinfo_api", "nwinfo_get_netinfo"),
+    ("zwrt_data", "get_wwaniface"),
+    ("zwrt_zte_mdm.api", "get_sim_info"),
+    ("zwrt_apn_object", "get_apn_mode"),
+    ("zwrt_router.api", "router_get_status_no_auth"),
+    ("zwrt_bsp.usb", "list"),
+    ("zwrt_wms", "zwrt_wms_get_wms_capacity"),
+    ("zwrt_nfc", "zwrt_nfc_wifi_get"),
+];
 
 #[derive(Clone)]
 struct Ctx {
@@ -262,12 +299,13 @@ impl Shared {
         method: &str,
         args: &Value,
     ) -> Result<Value, UbusError> {
-        // V2-33：采集轮里的读不等闸（超时就本轮跳过这个对象，V2-18）。
-        if !round {
+        // V2-33：只有写的上下文等闸、关闸；采集轮和别的读不管（读超时照 V2-18 处理）。
+        let writing = !round && self.writing.load(Ordering::Relaxed);
+        if writing {
             self.reopen_gate().await;
         }
         let r = self.raw_call(round, object, method, args).await;
-        if !round && matches!(r, Err(UbusError::Timeout { .. })) {
+        if writing && matches!(r, Err(UbusError::Timeout { .. })) {
             // 我们这边超时了，原厂那边可能还在做：结果未知，闸先关上。
             eprintln!(
                 "executor: {object} {method} timed out; holding writes until {object} answers again"
@@ -302,8 +340,16 @@ impl Shared {
         *lock(&self.gate) = None;
     }
 
-    /// 探测用的只读请求：块表里读这个对象的那个请求；块表里没有就问 ubusd 本身（`system board`）。
+    /// 探测用的只读请求：先查 `PROBES`，再查块表里读这个对象的请求；都没有就问 ubusd 本身（`system board`）。
     fn probe_for(&self, object: &str) -> (String, String, Value) {
+        if let Some((o, m)) = PROBES.iter().find(|(o, _)| *o == object) {
+            let args = if *o == "zwrt_data" {
+                serde_json::json!({"source_module":"web","cid":1,"connect_status":""})
+            } else {
+                Value::Object(Default::default())
+            };
+            return ((*o).into(), (*m).into(), args);
+        }
         for i in 0..self.hub.len() {
             let (o, m, a) = self.hub.request(i);
             if o == object {
@@ -521,6 +567,7 @@ impl Executor {
             stats: Stats::default(),
             live: Liveness::new(),
             gate: Mutex::new(None),
+            writing: AtomicBool::new(false),
         });
         tokio::spawn(shared.clone().run());
         Self { shared }
