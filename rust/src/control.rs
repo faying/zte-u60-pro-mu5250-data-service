@@ -87,6 +87,7 @@ pub const E4_ACTIONS: &[&str] = &[
     "wifi.reload",
     "vendor.call",
     "dns.doh",
+    "sms.db_delete",
 ];
 
 /// E4 T7c：其余原厂设置的写，参数原样交给原厂（和 agent 以前直接调的一样），
@@ -304,6 +305,7 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         "wifi.reload" => call("zwrt_wlan", "reload", json!({})).await,
         "vendor.call" => vendor_call(params).await,
         "dns.doh" => dns_doh(params).await,
+        "sms.db_delete" => sms_db_delete(params).await,
         "band.reset" => {
             call(
                 "zte_nwinfo_api",
@@ -1074,6 +1076,40 @@ async fn dns_doh(params: &Value) -> Outcome {
         Ok(_) => Outcome::Ok(json!({"enabled": enabled})),
         // agent 以前也不看结果：配置文件写了就算，dnsmasq 重启失败如实说
         Err(e) => Outcome::Failed(format!("dnsmasq: {e}")),
+    }
+}
+
+/// 原厂 `zwrt_wms_delete_sms` 删不掉存在 SIM 里的短信（回 result 3，不删），列表又是从
+/// 原厂的 sms.db 读的：agent 删完还在的就直接在库里删（E4 T7c，搬进 datad）。
+/// `ids` 只能是数字和分号；SQL 是固定的。
+async fn sms_db_delete(params: &Value) -> Outcome {
+    let ids = match string(params, "ids", true) {
+        Ok(Some(v)) => v,
+        Ok(None) => return Outcome::Invalid("missing parameter: ids".into()),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let list: Vec<&str> = ids.split(';').filter(|s| !s.is_empty()).collect();
+    if list.is_empty()
+        || list.len() > 500
+        || !list
+            .iter()
+            .all(|s| s.len() <= 12 && s.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Outcome::Invalid("ids must be numbers separated by ';'".into());
+    }
+    let db = std::env::var("ZWRT_DATAD_SMS_DB")
+        .unwrap_or_else(|_| "/etc_rw/ztembb/ztesms/sms_db/sms.db".into());
+    let bin = std::env::var("ZWRT_DATAD_SQLITE_BIN").unwrap_or_else(|_| "/usr/bin/sqlite3".into());
+    let sql = format!("DELETE FROM sms WHERE id IN ({});", list.join(","));
+    match crate::command::run(
+        &bin,
+        ["-cmd".to_string(), ".timeout 2000".to_string(), db, sql],
+        std::time::Duration::from_secs(5),
+    )
+    .await
+    {
+        Ok(_) => Outcome::Ok(json!({"deleted": list.len()})),
+        Err(e) => Outcome::Failed(format!("sqlite3: {e}")),
     }
 }
 
@@ -2311,6 +2347,15 @@ mod wifi_apply_tests {
                 .await,
             Outcome::Invalid(_)
         ));
+        for bad in ["1;2) OR 1=1;--", "", ";;", "a;1"] {
+            assert!(
+                matches!(
+                    sms_db_delete(&json!({"ids": bad})).await,
+                    Outcome::Invalid(_)
+                ),
+                "{bad}"
+            );
+        }
         // FOTA 永远不在表里（硬规则）
         assert!(
             !VENDOR_CALLS
