@@ -1,0 +1,660 @@
+## 1 ok -
+> {"action":"device.login_info","params":{}}
+< 200 {"action":"device.login_info","ok":true,"result":{"login_fail_num":0,"zte_web_sault":"fixture-salt"}}
+## 2 fail *
+> {"action":"device.login_info","params":{}}
+< 502 {"action":"device.login_info","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 3 ok -
+> {"action":"device.login","params":{"password_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+< 200 {"action":"device.login","ok":true,"result":{"result":0,"ubus_rpc_session":"fixture-session"}}
+## 4 invalid -
+> {"action":"device.login","params":{"password_hash":"xyz"}}
+< 400 {"action":"device.login","error":{"code":"invalid_parameter","message":"password_hash must be a 64 character SHA-256 hex value"},"ok":false}
+## 5 fail *
+> {"action":"device.login","params":{"password_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+< 502 {"action":"device.login","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 6 ok -
+> {"action":"device.session_status","params":{}}
+< 200 {"action":"device.session_status","ok":true,"result":{"logged_in":true}}
+## 7 ok -
+> {"action":"device.logout","params":{}}
+< 200 {"action":"device.logout","ok":true,"result":{"logged_in":false}}
+## 8 ok -
+> {"action":"device.change_password","params":{"old_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","new_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}
+< 200 {"action":"device.change_password","ok":true,"result":{"result":"success"}}
+## 9 invalid -
+> {"action":"device.change_password","params":{}}
+< 400 {"action":"device.change_password","error":{"code":"invalid_parameter","message":"old_hash and new_hash must be SHA-256 hex values"},"ok":false}
+## 10 fail *
+> {"action":"device.change_password","params":{"old_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","new_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}
+< 502 {"action":"device.change_password","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 11 ok -
+> {"action":"wifi.status","params":{}}
+< 200 {"action":"wifi.status","ok":true,"result":{"main_2g":{"disabled":"0","encryption":"sae-mixed","key":"fixture-password","ssid":"Fixture 2G"},"main_5g":{"disabled":"0","encryption":"sae-mixed","key":"fixture-password","ssid":"Fixture 5G"}}}
+## 12 fail *
+> {"action":"wifi.status","params":{}}
+< 200 {"action":"wifi.status","ok":true,"result":{"main_2g":{"disabled":"0","encryption":"sae-mixed","key":"fixture-password","ssid":"Fixture 2G"},"main_5g":{"disabled":"0","encryption":"sae-mixed","key":"fixture-password","ssid":"Fixture 5G"}}}
+## 13 ok -
+> {"action":"wifi.dual_band_status","params":{}}
+< 200 {"action":"wifi.dual_band_status","ok":true,"result":{"BandSteeringSwitch":"1","WiFiDualBandEnabled":"1","WiFiDualBandSupported":"1"}}
+## 14 fail *
+> {"action":"wifi.dual_band_status","params":{}}
+< 502 {"action":"wifi.dual_band_status","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 15 ok -
+> {"action":"wifi.txpower.status","params":{}}
+< 200 {"action":"wifi.txpower.status","ok":true,"result":{"2g":{"enabled":false,"factory_limit_dbm":19,"limit_dbm":30,"percent":100,"txpower_dbm":30},"5g":{"enabled":true,"factory_limit_dbm":18,"limit_dbm":30,"percent":100,"txpower_dbm":30}}}
+## 16 fail *
+> {"action":"wifi.txpower.status","params":{}}
+< 200 {"action":"wifi.txpower.status","ok":true,"result":{"2g":{"enabled":false,"factory_limit_dbm":19,"limit_dbm":30,"percent":100,"txpower_dbm":30},"5g":{"enabled":true,"factory_limit_dbm":18,"limit_dbm":30,"percent":100,"txpower_dbm":30}}}
+## 17 ok -
+> {"action":"wifi.advanced.status","params":{}}
+< 502 {"action":"wifi.advanced.status","error":{"code":"device_call_failed","message":"cannot read wireless configuration"},"ok":false}
+## 18 fail *
+> {"action":"wifi.advanced.status","params":{}}
+< 502 {"action":"wifi.advanced.status","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 19 ok -
+> {"action":"wireless.config","params":{"band":"5g","channel":149}}
+< 200 {"action":"wireless.config","ok":true,"result":{"band":"5g","changed":true,"channel":"149","channel_source":"iwinfo","country":"CN"}}
+## 20 invalid -
+> {"action":"wireless.config","params":{"band":"6g"}}
+< 200 {"action":"wireless.config","ok":true,"result":{"channel_source":"iwinfo","countries":["00","CN","HK"],"country":"CN","country_scope":"device","radios":{"2g":{"ap_section":"main_2g","channel":"0","country":"CN","enabled":false,"htmode":"EHT40","section":"wifi0","supported_channels":[0,1,6,11]},"5g":{"ap_section":"main_5g","channel":"149","country":"CN","enabled":true,"htmode":"EHT160","section":"wifi1","supported_channels":[0,36,40,149]}}}}
+## 21 fail *
+> {"action":"wireless.config","params":{"band":"5g","channel":149}}
+< 200 {"action":"wireless.config","ok":true,"result":{"band":"5g","changed":false,"channel":"149","country":"CN"}}
+## 22 ok -
+> {"action":"sleep.status","params":{}}
+< 200 {"action":"sleep.status","ok":true,"result":{"enabled":"","idle_seconds":"","status":"","wakeup":""}}
+## 23 fail *
+> {"action":"sleep.status","params":{}}
+< 200 {"action":"sleep.status","ok":true,"result":{"enabled":"","idle_seconds":"","status":"","wakeup":""}}
+## 24 ok -
+> {"action":"usb.status","params":{}}
+< 200 {"action":"usb.status","ok":true,"result":{"typec":{"result":"success"},"usb":{"connect":0,"mode":"user","typec_cc":"no_cc","usb2rj45":0}}}
+## 25 fail *
+> {"action":"usb.status","params":{}}
+< 502 {"action":"usb.status","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 26 ok -
+> {"action":"power.direct_supply.status","params":{}}
+< 200 {"action":"power.direct_supply.status","ok":true,"result":{"enabled":null,"mode":null,"supported":false}}
+## 27 fail *
+> {"action":"power.direct_supply.status","params":{}}
+< 502 {"action":"power.direct_supply.status","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 28 ok -
+> {"action":"apn.list","params":{}}
+< 200 {"action":"apn.list","ok":true,"result":{"automatic":{"result":"success"},"enabled":{"result":"success"},"manual":{"result":"success"},"mode":{"result":"success"}}}
+## 29 fail *
+> {"action":"apn.list","params":{}}
+< 502 {"action":"apn.list","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 30 ok -
+> {"action":"client.access","params":{}}
+< 200 {"action":"client.access","ok":true,"result":{"lan":{"lan_access_list_info":[{"hostname":"lan-live","ip_address":"192.168.0.3","mac_address":"00:11:22:33:44:66"}]},"policy":{"result":"success"},"wifi":{"wireless_access_list_info":[{"hostname":"wifi-live","ip_address":"192.168.0.2","mac_address":"00:11:22:33:44:55"}]}}}
+## 31 fail *
+> {"action":"client.access","params":{}}
+< 502 {"action":"client.access","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 32 ok -
+> {"action":"neighbor.status","params":{}}
+< 200 {"action":"neighbor.status","ok":true,"result":{"age_ms":null,"ambiguous_measurements":0,"capture_bytes":0,"cells":[],"collector_running":false,"discarded":0,"enabled":false,"frames":0,"generation":0,"malformed":0,"partial":false,"reason":"disabled_by_default","sampled_at":null,"source":"","status":"disabled"}}
+## 33 ok -
+> {"action":"neighbor.set","params":{"enabled":false}}
+< 200 {"action":"neighbor.set","ok":true,"result":{"age_ms":null,"ambiguous_measurements":0,"capture_bytes":0,"cells":[],"collector_running":false,"discarded":0,"enabled":false,"frames":0,"generation":0,"malformed":0,"partial":false,"reason":"disabled_by_default","sampled_at":null,"source":"","status":"disabled"}}
+## 34 invalid -
+> {"action":"neighbor.set","params":{"enabled":"yes"}}
+< 400 {"action":"neighbor.set","error":{"code":"invalid_parameter","message":"enabled must be boolean"},"ok":false}
+## 35 ok -
+> {"action":"state.refresh","params":{}}
+< 200 {"action":"state.refresh","ok":true,"result":{"queued":true}}
+## 36 ok -
+> {"action":"state.set_interval","params":{"milliseconds":500}}
+< 200 {"action":"state.set_interval","ok":true,"result":{"sample_interval_ms":500}}
+## 37 invalid -
+> {"action":"state.set_interval","params":{}}
+< 400 {"action":"state.set_interval","error":{"code":"invalid_parameter","message":"milliseconds must be between 500 and 5000"},"ok":false}
+## 38 ok -
+> {"action":"state.set_interval","params":{"milliseconds":1000}}
+< 200 {"action":"state.set_interval","ok":true,"result":{"sample_interval_ms":1000}}
+## 39 invalid -
+> {"action":"state.set_interval","params":{"milliseconds":499}}
+< 400 {"action":"state.set_interval","error":{"code":"invalid_parameter","message":"milliseconds must be between 500 and 5000"},"ok":false}
+## 40 ok -
+> {"action":"state.set_interval","params":{"milliseconds":5000}}
+< 200 {"action":"state.set_interval","ok":true,"result":{"sample_interval_ms":5000}}
+## 41 invalid -
+> {"action":"state.set_interval","params":{"milliseconds":5001}}
+< 400 {"action":"state.set_interval","error":{"code":"invalid_parameter","message":"milliseconds must be between 500 and 5000"},"ok":false}
+## 42 ok -
+> {"action":"qos.reload","params":{}}
+< 200 {"action":"qos.reload","ok":true,"result":{"queued":true}}
+## 43 ok -
+> {"action":"device.reboot","params":{}}
+< 200 {"action":"device.reboot","ok":true,"result":{"result":"success"}}
+## 44 fail *
+> {"action":"device.reboot","params":{}}
+< 502 {"action":"device.reboot","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 45 ok -
+> {"action":"device.poweroff","params":{}}
+< 200 {"action":"device.poweroff","ok":true,"result":{"result":"success"}}
+## 46 fail *
+> {"action":"device.poweroff","params":{}}
+< 502 {"action":"device.poweroff","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 47 ok -
+> {"action":"cellular.connect","params":{}}
+< 200 {"action":"cellular.connect","ok":true,"result":{"result":"success"}}
+## 48 fail *
+> {"action":"cellular.connect","params":{}}
+< 502 {"action":"cellular.connect","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 49 ok -
+> {"action":"cellular.disconnect","params":{}}
+< 200 {"action":"cellular.disconnect","ok":true,"result":{"result":"success"}}
+## 50 fail *
+> {"action":"cellular.disconnect","params":{}}
+< 502 {"action":"cellular.disconnect","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 51 ok -
+> {"action":"cellular.set","params":{"roaming":1}}
+< 200 {"action":"cellular.set","ok":true,"result":{"result":"success"}}
+## 52 invalid -
+> {"action":"cellular.set","params":{}}
+< 400 {"action":"cellular.set","error":{"code":"invalid_parameter","message":"no cellular fields supplied"},"ok":false}
+## 53 fail *
+> {"action":"cellular.set","params":{"roaming":1}}
+< 502 {"action":"cellular.set","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 54 ok -
+> {"action":"network.set_mode","params":{"mode":"WL_AND_5G"}}
+< 200 {"action":"network.set_mode","ok":true,"result":{"result":"success"}}
+## 55 invalid -
+> {"action":"network.set_mode","params":{}}
+< 400 {"action":"network.set_mode","error":{"code":"invalid_parameter","message":"missing parameter: mode"},"ok":false}
+## 56 fail *
+> {"action":"network.set_mode","params":{"mode":"WL_AND_5G"}}
+< 502 {"action":"network.set_mode","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 57 ok -
+> {"action":"band.set_lte","params":{"bands":"1,3,8"}}
+< 200 {"action":"band.set_lte","ok":true,"result":{"result":"success"}}
+## 58 invalid -
+> {"action":"band.set_lte","params":{"bands":"1;reboot"}}
+< 400 {"action":"band.set_lte","error":{"code":"invalid_parameter","message":"bands must contain only numbers and commas"},"ok":false}
+## 59 fail *
+> {"action":"band.set_lte","params":{"bands":"1,3,8"}}
+< 502 {"action":"band.set_lte","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 60 ok -
+> {"action":"band.set_nr_sa","params":{"bands":"78"}}
+< 200 {"action":"band.set_nr_sa","ok":true,"result":{"result":"success"}}
+## 61 invalid -
+> {"action":"band.set_nr_sa","params":{"bands":"x"}}
+< 400 {"action":"band.set_nr_sa","error":{"code":"invalid_parameter","message":"bands must contain only numbers and commas"},"ok":false}
+## 62 fail *
+> {"action":"band.set_nr_sa","params":{"bands":"78"}}
+< 502 {"action":"band.set_nr_sa","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 63 ok -
+> {"action":"band.set_nr_nsa","params":{"bands":"41,78"}}
+< 200 {"action":"band.set_nr_nsa","ok":true,"result":{"result":"success"}}
+## 64 invalid -
+> {"action":"band.set_nr_nsa","params":{"bands":7}}
+< 400 {"action":"band.set_nr_nsa","error":{"code":"invalid_parameter","message":"bands must be a string"},"ok":false}
+## 65 fail *
+> {"action":"band.set_nr_nsa","params":{"bands":"41,78"}}
+< 502 {"action":"band.set_nr_nsa","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 66 ok -
+> {"action":"cell.lock_lte","params":{"pci":"100","earfcn":"1850"}}
+< 200 {"action":"cell.lock_lte","ok":true,"result":{"result":"success"}}
+## 67 invalid -
+> {"action":"cell.lock_lte","params":{"pci":"100"}}
+< 400 {"action":"cell.lock_lte","error":{"code":"invalid_parameter","message":"missing parameter: earfcn"},"ok":false}
+## 68 fail *
+> {"action":"cell.lock_lte","params":{"pci":"100","earfcn":"1850"}}
+< 502 {"action":"cell.lock_lte","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 69 ok -
+> {"action":"cell.lock_nr","params":{"pci":"200","arfcn":"627264","band":"78"}}
+< 200 {"action":"cell.lock_nr","ok":true,"result":{"result":"success"}}
+## 70 invalid -
+> {"action":"cell.lock_nr","params":{"pci":1}}
+< 400 {"action":"cell.lock_nr","error":{"code":"invalid_parameter","message":"pci must be a string"},"ok":false}
+## 71 fail *
+> {"action":"cell.lock_nr","params":{"pci":"200","arfcn":"627264","band":"78"}}
+< 502 {"action":"cell.lock_nr","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 72 ok -
+> {"action":"cell.unlock_all","params":{}}
+< 200 {"action":"cell.unlock_all","ok":true,"result":{"result":"success"}}
+## 73 fail *
+> {"action":"cell.unlock_all","params":{}}
+< 502 {"action":"cell.unlock_all","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 74 ok -
+> {"action":"band.reset","params":{}}
+< 200 {"action":"band.reset","ok":true,"result":{"result":"success"}}
+## 75 fail *
+> {"action":"band.reset","params":{}}
+< 502 {"action":"band.reset","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 76 ok -
+> {"action":"sim.set_slot","params":{"slot":2}}
+< 200 {"action":"sim.set_slot","ok":true,"result":{"result":"success"}}
+## 77 invalid -
+> {"action":"sim.set_slot","params":{"slot":3}}
+< 400 {"action":"sim.set_slot","error":{"code":"invalid_parameter","message":"slot must be 1 or 2"},"ok":false}
+## 78 fail *
+> {"action":"sim.set_slot","params":{"slot":2}}
+< 502 {"action":"sim.set_slot","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 79 ok -
+> {"action":"sim.set_slot","params":{"slot":1}}
+< 200 {"action":"sim.set_slot","ok":true,"result":{"result":"success"}}
+## 80 invalid -
+> {"action":"sim.set_slot","params":{}}
+< 400 {"action":"sim.set_slot","error":{"code":"invalid_parameter","message":"missing parameter: slot"},"ok":false}
+## 81 ok -
+> {"action":"wifi.set_dual_band","params":{"enabled":true}}
+< 200 {"action":"wifi.set_dual_band","ok":true,"result":{"result":"success"}}
+## 82 invalid -
+> {"action":"wifi.set_dual_band","params":{"enabled":2}}
+< 400 {"action":"wifi.set_dual_band","error":{"code":"invalid_parameter","message":"enabled must be boolean"},"ok":false}
+## 83 fail *
+> {"action":"wifi.set_dual_band","params":{"enabled":true}}
+< 502 {"action":"wifi.set_dual_band","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 84 ok -
+> {"action":"wifi.set_module","params":{"enabled":1}}
+< 200 {"action":"wifi.set_module","ok":true,"result":{"result":"success"}}
+## 85 invalid -
+> {"action":"wifi.set_module","params":{"enabled":"on"}}
+< 400 {"action":"wifi.set_module","error":{"code":"invalid_parameter","message":"enabled must be an integer"},"ok":false}
+## 86 fail *
+> {"action":"wifi.set_module","params":{"enabled":1}}
+< 502 {"action":"wifi.set_module","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 87 ok -
+> {"action":"wifi.set_chip","params":{"chip":"chip1","guest_enabled":0}}
+< 200 {"action":"wifi.set_chip","ok":true,"result":{"result":"success"}}
+## 88 invalid -
+> {"action":"wifi.set_chip","params":{}}
+< 400 {"action":"wifi.set_chip","error":{"code":"invalid_parameter","message":"missing parameter: chip"},"ok":false}
+## 89 fail *
+> {"action":"wifi.set_chip","params":{"chip":"chip1","guest_enabled":0}}
+< 502 {"action":"wifi.set_chip","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 90 ok -
+> {"action":"wifi.configure","params":{"section":"main_2g","ssid":"Golden","enabled":true}}
+< 200 {"action":"wifi.configure","ok":true,"result":{"changed":true,"section":"main_2g"}}
+## 91 invalid -
+> {"action":"wifi.configure","params":{}}
+< 400 {"action":"wifi.configure","error":{"code":"invalid_parameter","message":"missing parameter: section"},"ok":false}
+## 92 fail *
+> {"action":"wifi.configure","params":{"section":"main_2g","ssid":"Golden","enabled":true}}
+< 200 {"action":"wifi.configure","ok":true,"result":{"changed":false,"section":"main_2g"}}
+## 93 ok -
+> {"action":"wifi.txpower.apply","params":{"band":"2g","percent":90,"limit_dbm":19}}
+< 200 {"action":"wifi.txpower.apply","ok":true,"result":{"band":"2g","changed":true,"factory_limit_dbm":19,"limit_dbm":19,"percent":90,"txpower_dbm":19}}
+## 94 invalid -
+> {"action":"wifi.txpower.apply","params":{}}
+< 400 {"action":"wifi.txpower.apply","error":{"code":"invalid_parameter","message":"missing parameter: band"},"ok":false}
+## 95 fail *
+> {"action":"wifi.txpower.apply","params":{"band":"2g","percent":90,"limit_dbm":19}}
+< 200 {"action":"wifi.txpower.apply","ok":true,"result":{"band":"2g","changed":false,"factory_limit_dbm":19,"limit_dbm":19,"percent":90,"txpower_dbm":19}}
+## 96 ok -
+> {"action":"wifi.txpower.set_percent","params":{"band":"2g","percent":80}}
+< 200 {"action":"wifi.txpower.set_percent","ok":true,"result":{"band":"2g","changed":true,"factory_limit_dbm":19,"limit_dbm":19,"percent":80,"txpower_dbm":19}}
+## 97 invalid -
+> {"action":"wifi.txpower.set_percent","params":{"band":"2g"}}
+< 400 {"action":"wifi.txpower.set_percent","error":{"code":"invalid_parameter","message":"missing power value"},"ok":false}
+## 98 fail *
+> {"action":"wifi.txpower.set_percent","params":{"band":"2g","percent":80}}
+< 200 {"action":"wifi.txpower.set_percent","ok":true,"result":{"band":"2g","changed":false,"factory_limit_dbm":19,"limit_dbm":19,"percent":80,"txpower_dbm":19}}
+## 99 ok -
+> {"action":"wifi.txpower.set_limit","params":{"band":"5g","limit_dbm":20}}
+< 200 {"action":"wifi.txpower.set_limit","ok":true,"result":{"band":"5g","changed":true,"factory_limit_dbm":18,"limit_dbm":20,"percent":100,"txpower_dbm":20}}
+## 100 invalid -
+> {"action":"wifi.txpower.set_limit","params":{"band":"5g"}}
+< 400 {"action":"wifi.txpower.set_limit","error":{"code":"invalid_parameter","message":"missing power value"},"ok":false}
+## 101 fail *
+> {"action":"wifi.txpower.set_limit","params":{"band":"5g","limit_dbm":20}}
+< 200 {"action":"wifi.txpower.set_limit","ok":true,"result":{"band":"5g","changed":false,"factory_limit_dbm":18,"limit_dbm":20,"percent":100,"txpower_dbm":20}}
+## 102 ok -
+> {"action":"wifi.txpower.restore_limit","params":{"band":"5g"}}
+< 200 {"action":"wifi.txpower.restore_limit","ok":true,"result":{"band":"5g","changed":true,"factory_limit_dbm":18,"limit_dbm":18,"percent":100,"txpower_dbm":18}}
+## 103 invalid -
+> {"action":"wifi.txpower.restore_limit","params":{}}
+< 400 {"action":"wifi.txpower.restore_limit","error":{"code":"invalid_parameter","message":"missing parameter: band"},"ok":false}
+## 104 fail *
+> {"action":"wifi.txpower.restore_limit","params":{"band":"5g"}}
+< 200 {"action":"wifi.txpower.restore_limit","ok":true,"result":{"band":"5g","changed":false,"factory_limit_dbm":18,"limit_dbm":18,"percent":100,"txpower_dbm":18}}
+## 105 ok -
+> {"action":"wifi.psm.set","params":{"section":"main_5g","mode":"off"}}
+< 200 {"action":"wifi.psm.set","ok":true,"result":{"mode":"off","pending":false,"saved":true,"section":"main_5g"}}
+## 106 invalid -
+> {"action":"wifi.psm.set","params":{"section":"main_5g"}}
+< 400 {"action":"wifi.psm.set","error":{"code":"invalid_parameter","message":"missing parameter: mode"},"ok":false}
+## 107 fail *
+> {"action":"wifi.psm.set","params":{"section":"main_5g","mode":"off"}}
+< 200 {"action":"wifi.psm.set","ok":true,"result":{"mode":"off","pending":false,"saved":true,"section":"main_5g"}}
+## 108 ok -
+> {"action":"wifi.txpower.set_dbm","params":{"band":"5g","dbm":17}}
+< 200 {"action":"wifi.txpower.set_dbm","ok":true,"result":{"applied_interfaces":0,"band":"5g","dbm":17,"mode":"fixed","pending":true,"saved":true}}
+## 109 invalid -
+> {"action":"wifi.txpower.set_dbm","params":{}}
+< 400 {"action":"wifi.txpower.set_dbm","error":{"code":"invalid_parameter","message":"missing parameter: band"},"ok":false}
+## 110 fail *
+> {"action":"wifi.txpower.set_dbm","params":{"band":"5g","dbm":17}}
+< 200 {"action":"wifi.txpower.set_dbm","ok":true,"result":{"applied_interfaces":0,"band":"5g","dbm":17,"mode":"fixed","pending":true,"saved":true}}
+## 111 ok -
+> {"action":"wifi.interface.create","params":{"band":"5g","ssid":"Golden Extra","key":"golden-extra-key"}}
+< 200 {"action":"wifi.interface.create","ok":true,"result":{"changed":true,"pending":true,"saved":true,"section":"datad_ssid_1"}}
+## 112 invalid -
+> {"action":"wifi.interface.create","params":{"band":"7g"}}
+< 400 {"action":"wifi.interface.create","error":{"code":"invalid_parameter","message":"invalid extra SSID settings or duplicate SSID on this band"},"ok":false}
+## 113 fail *
+> {"action":"wifi.interface.create","params":{"band":"5g","ssid":"Golden Extra","key":"golden-extra-key"}}
+< 400 {"action":"wifi.interface.create","error":{"code":"invalid_parameter","message":"invalid extra SSID settings or duplicate SSID on this band"},"ok":false}
+## 114 ok -
+> {"action":"wifi.interface.configure","params":{"section":"datad_ssid_1","ssid":"Golden Extra 2","enabled":true}}
+< 200 {"action":"wifi.interface.configure","ok":true,"result":{"changed":true,"pending":true,"saved":true,"section":"datad_ssid_1"}}
+## 115 invalid -
+> {"action":"wifi.interface.configure","params":{}}
+< 400 {"action":"wifi.interface.configure","error":{"code":"invalid_parameter","message":"missing parameter: section"},"ok":false}
+## 116 fail *
+> {"action":"wifi.interface.configure","params":{"section":"datad_ssid_1","ssid":"Golden Extra 2","enabled":true}}
+< 200 {"action":"wifi.interface.configure","ok":true,"result":{"changed":true,"pending":true,"saved":true,"section":"datad_ssid_1"}}
+## 117 ok -
+> {"action":"wifi.interface.delete","params":{"section":"datad_ssid_1"}}
+< 200 {"action":"wifi.interface.delete","ok":true,"result":{"changed":true,"deleted":true,"section":"datad_ssid_1"}}
+## 118 invalid -
+> {"action":"wifi.interface.delete","params":{}}
+< 400 {"action":"wifi.interface.delete","error":{"code":"invalid_parameter","message":"missing parameter: section"},"ok":false}
+## 119 fail *
+> {"action":"wifi.interface.delete","params":{"section":"datad_ssid_1"}}
+< 400 {"action":"wifi.interface.delete","error":{"code":"invalid_parameter","message":"invalid extra SSID settings or duplicate SSID on this band"},"ok":false}
+## 120 ok -
+> {"action":"lan.set","params":{"dhcp_start":"192.168.0.100"}}
+< 200 {"action":"lan.set","ok":true,"result":{"result":"success"}}
+## 121 invalid -
+> {"action":"lan.set","params":{}}
+< 400 {"action":"lan.set","error":{"code":"invalid_parameter","message":"no fields supplied"},"ok":false}
+## 122 fail *
+> {"action":"lan.set","params":{"dhcp_start":"192.168.0.100"}}
+< 502 {"action":"lan.set","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 123 ok -
+> {"action":"lan.set_mtu","params":{"mtu":"1400"}}
+< 200 {"action":"lan.set_mtu","ok":true,"result":{"result":"success"}}
+## 124 invalid -
+> {"action":"lan.set_mtu","params":{}}
+< 400 {"action":"lan.set_mtu","error":{"code":"invalid_parameter","message":"missing parameter: mtu"},"ok":false}
+## 125 fail *
+> {"action":"lan.set_mtu","params":{"mtu":"1400"}}
+< 502 {"action":"lan.set_mtu","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 126 ok -
+> {"action":"dns.set","params":{"primary":"1.1.1.1","manual_ipv4":1}}
+< 200 {"action":"dns.set","ok":true,"result":{"result":"success"}}
+## 127 invalid -
+> {"action":"dns.set","params":{}}
+< 400 {"action":"dns.set","error":{"code":"invalid_parameter","message":"no fields supplied"},"ok":false}
+## 128 fail *
+> {"action":"dns.set","params":{"primary":"1.1.1.1","manual_ipv4":1}}
+< 502 {"action":"dns.set","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 129 ok -
+> {"action":"power.direct_supply.set","params":{"enabled":false}}
+< 502 {"action":"power.direct_supply.set","error":{"code":"device_call_failed","message":"direct supply is not supported or state is unknown"},"ok":false}
+## 130 invalid -
+> {"action":"power.direct_supply.set","params":{"enabled":"x"}}
+< 400 {"action":"power.direct_supply.set","error":{"code":"invalid_parameter","message":"enabled must be boolean"},"ok":false}
+## 131 fail *
+> {"action":"power.direct_supply.set","params":{"enabled":false}}
+< 502 {"action":"power.direct_supply.set","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 132 ok -
+> {"action":"usb.set","params":{"mode":"rndis"}}
+< 200 {"action":"usb.set","ok":true,"result":{"result":"success"}}
+## 133 invalid -
+> {"action":"usb.set","params":{}}
+< 400 {"action":"usb.set","error":{"code":"invalid_parameter","message":"no fields supplied"},"ok":false}
+## 134 fail *
+> {"action":"usb.set","params":{"mode":"rndis"}}
+< 502 {"action":"usb.set","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 135 ok -
+> {"action":"sleep.set","params":{"seconds":"600"}}
+< 200 {"action":"sleep.set","ok":true,"result":{"result":"success"}}
+## 136 invalid -
+> {"action":"sleep.set","params":{}}
+< 400 {"action":"sleep.set","error":{"code":"invalid_parameter","message":"missing parameter: seconds"},"ok":false}
+## 137 fail *
+> {"action":"sleep.set","params":{"seconds":"600"}}
+< 502 {"action":"sleep.set","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 138 ok -
+> {"action":"nfc.set","params":{"enabled":1}}
+< 200 {"action":"nfc.set","ok":true,"result":{"result":"success"}}
+## 139 invalid -
+> {"action":"nfc.set","params":{"enabled":"on"}}
+< 400 {"action":"nfc.set","error":{"code":"invalid_parameter","message":"enabled must be an integer"},"ok":false}
+## 140 fail *
+> {"action":"nfc.set","params":{"enabled":1}}
+< 502 {"action":"nfc.set","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 141 ok -
+> {"action":"apn.set_mode","params":{"mode":0}}
+< 200 {"action":"apn.set_mode","ok":true,"result":{"result":"success"}}
+## 142 invalid -
+> {"action":"apn.set_mode","params":{}}
+< 400 {"action":"apn.set_mode","error":{"code":"invalid_parameter","message":"missing parameter: mode"},"ok":false}
+## 143 fail *
+> {"action":"apn.set_mode","params":{"mode":0}}
+< 502 {"action":"apn.set_mode","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 144 ok -
+> {"action":"apn.add","params":{"name":"golden","apn":"internet","auth_mode":0}}
+< 200 {"action":"apn.add","ok":true,"result":{"result":"success"}}
+## 145 invalid -
+> {"action":"apn.add","params":{}}
+< 400 {"action":"apn.add","error":{"code":"invalid_parameter","message":"missing parameter: name"},"ok":false}
+## 146 fail *
+> {"action":"apn.add","params":{"name":"golden","apn":"internet","auth_mode":0}}
+< 502 {"action":"apn.add","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 147 ok -
+> {"action":"apn.modify","params":{"profile_id":"2","name":"golden","apn":"internet2","auth_mode":0}}
+< 200 {"action":"apn.modify","ok":true,"result":{"result":"success"}}
+## 148 invalid -
+> {"action":"apn.modify","params":{"name":"golden"}}
+< 400 {"action":"apn.modify","error":{"code":"invalid_parameter","message":"missing parameter: profile_id"},"ok":false}
+## 149 fail *
+> {"action":"apn.modify","params":{"profile_id":"2","name":"golden","apn":"internet2","auth_mode":0}}
+< 502 {"action":"apn.modify","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 150 ok -
+> {"action":"apn.delete","params":{"profile_id":"2"}}
+< 200 {"action":"apn.delete","ok":true,"result":{"result":"success"}}
+## 151 invalid -
+> {"action":"apn.delete","params":{}}
+< 400 {"action":"apn.delete","error":{"code":"invalid_parameter","message":"missing parameter: profile_id"},"ok":false}
+## 152 fail *
+> {"action":"apn.delete","params":{"profile_id":"2"}}
+< 502 {"action":"apn.delete","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 153 ok -
+> {"action":"apn.enable","params":{"profile_id":"1"}}
+< 200 {"action":"apn.enable","ok":true,"result":{"result":"success"}}
+## 154 invalid -
+> {"action":"apn.enable","params":{}}
+< 400 {"action":"apn.enable","error":{"code":"invalid_parameter","message":"missing parameter: profile_id"},"ok":false}
+## 155 fail *
+> {"action":"apn.enable","params":{"profile_id":"1"}}
+< 502 {"action":"apn.enable","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 156 ok -
+> {"action":"traffic.set_limit","params":{"enabled":1,"value":"1024","type":2}}
+< 200 {"action":"traffic.set_limit","ok":true,"result":{"result":"success"}}
+## 157 invalid -
+> {"action":"traffic.set_limit","params":{}}
+< 400 {"action":"traffic.set_limit","error":{"code":"invalid_parameter","message":"missing parameter: enabled"},"ok":false}
+## 158 fail *
+> {"action":"traffic.set_limit","params":{"enabled":1,"value":"1024","type":2}}
+< 502 {"action":"traffic.set_limit","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 159 ok -
+> {"action":"traffic.set_clear_day","params":{"day":1}}
+< 200 {"action":"traffic.set_clear_day","ok":true,"result":{"result":"success"}}
+## 160 invalid -
+> {"action":"traffic.set_clear_day","params":{}}
+< 400 {"action":"traffic.set_clear_day","error":{"code":"invalid_parameter","message":"missing parameter: day"},"ok":false}
+## 161 fail *
+> {"action":"traffic.set_clear_day","params":{"day":1}}
+< 502 {"action":"traffic.set_clear_day","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 162 ok -
+> {"action":"traffic.calibrate","params":{"value":"2048"}}
+< 200 {"action":"traffic.calibrate","ok":true,"result":{"result":"success"}}
+## 163 invalid -
+> {"action":"traffic.calibrate","params":{}}
+< 400 {"action":"traffic.calibrate","error":{"code":"invalid_parameter","message":"missing parameter: value"},"ok":false}
+## 164 fail *
+> {"action":"traffic.calibrate","params":{"value":"2048"}}
+< 502 {"action":"traffic.calibrate","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 165 ok -
+> {"action":"sms.delete","params":{"ids":"1;2"}}
+< 200 {"action":"sms.delete","ok":true,"result":{"result":"success"}}
+## 166 invalid -
+> {"action":"sms.delete","params":{}}
+< 400 {"action":"sms.delete","error":{"code":"invalid_parameter","message":"missing parameter: ids"},"ok":false}
+## 167 fail *
+> {"action":"sms.delete","params":{"ids":"1;2"}}
+< 502 {"action":"sms.delete","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 168 ok -
+> {"action":"sms.mark_read","params":{"ids":"1","tag":0}}
+< 200 {"action":"sms.mark_read","ok":true,"result":{"result":"success"}}
+## 169 invalid -
+> {"action":"sms.mark_read","params":{}}
+< 400 {"action":"sms.mark_read","error":{"code":"invalid_parameter","message":"missing parameter: ids"},"ok":false}
+## 170 fail *
+> {"action":"sms.mark_read","params":{"ids":"1","tag":0}}
+< 502 {"action":"sms.mark_read","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 171 ok -
+> {"action":"sms.send_raw","params":{"sender":"host","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}
+< 200 {"action":"sms.send_raw","ok":true,"result":{"sender":"host","status":3}}
+## 172 invalid -
+> {"action":"sms.send_raw","params":{"sender":"host"}}
+< 400 {"action":"sms.send_raw","error":{"code":"invalid_parameter","message":"missing SMS parameters"},"ok":false}
+## 173 fail *
+> {"action":"sms.send_raw","params":{"sender":"host","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}
+< 502 {"action":"sms.send_raw","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 174 ok -
+> {"action":"sms.list_after","params":{"after_id":0,"limit":5}}
+< 200 {"action":"sms.list_after","ok":true,"result":{"has_more":false,"items":[{"content":"6D4B8BD5","date":"26,08,27,04,00,00,+,0","id":7,"number":"10086","tag":"1"}]}}
+## 175 invalid -
+> {"action":"sms.list_after","params":{"after_id":"x"}}
+< 400 {"action":"sms.list_after","error":{"code":"invalid_parameter","message":"after_id must be a non-negative integer"},"ok":false}
+## 176 fail *
+> {"action":"sms.list_after","params":{"after_id":0,"limit":5}}
+< 502 {"action":"sms.list_after","error":{"code":"device_call_failed","message":"mem_store 1: <root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 177 ok -
+> {"action":"client.kick","params":{"macs":"00:11:22:33:44:55"}}
+< 200 {"action":"client.kick","ok":true,"result":{"result":"success"}}
+## 178 invalid -
+> {"action":"client.kick","params":{}}
+< 400 {"action":"client.kick","error":{"code":"invalid_parameter","message":"missing parameter: macs"},"ok":false}
+## 179 fail *
+> {"action":"client.kick","params":{"macs":"00:11:22:33:44:55"}}
+< 502 {"action":"client.kick","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 180 ok -
+> {"action":"client.rename","params":{"mac":"00:11:22:33:44:55","hostname":"golden"}}
+< 200 {"action":"client.rename","ok":true,"result":{"result":"success"}}
+## 181 invalid -
+> {"action":"client.rename","params":{"mac":"zz"}}
+< 400 {"action":"client.rename","error":{"code":"invalid_parameter","message":"invalid mac address"},"ok":false}
+## 182 fail *
+> {"action":"client.rename","params":{"mac":"00:11:22:33:44:55","hostname":"golden"}}
+< 502 {"action":"client.rename","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 183 ok -
+> {"action":"client.block","params":{"mac":"00:11:22:33:44:55"}}
+< 200 {"action":"client.block","ok":true,"result":{"blocked":true,"mac":"00:11:22:33:44:55"}}
+## 184 invalid -
+> {"action":"client.block","params":{"mac":"zz"}}
+< 400 {"action":"client.block","error":{"code":"invalid_parameter","message":"invalid mac address"},"ok":false}
+## 185 fail *
+> {"action":"client.block","params":{"mac":"00:11:22:33:44:55"}}
+< 502 {"action":"client.block","error":{"code":"device_call_failed","message":"client policy committed but reload failed: <root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 186 ok -
+> {"action":"client.unblock","params":{"mac":"00:11:22:33:44:55"}}
+< 200 {"action":"client.unblock","ok":true,"result":{"blocked":false,"mac":"00:11:22:33:44:55"}}
+## 187 invalid -
+> {"action":"client.unblock","params":{}}
+< 400 {"action":"client.unblock","error":{"code":"invalid_parameter","message":"missing parameter: mac"},"ok":false}
+## 188 fail *
+> {"action":"client.unblock","params":{"mac":"00:11:22:33:44:55"}}
+< 502 {"action":"client.unblock","error":{"code":"device_call_failed","message":"client policy committed but reload failed: <root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 189 ok -
+> {"action":"multiwan.interface.set","params":{"section":"zte_mwan2","enabled":1,"track_ip":"1.1.1.1,8.8.8.8","timeout":5}}
+< 200 {"action":"multiwan.interface.set","ok":true,"result":{"applied":false,"section":"zte_mwan2"}}
+## 190 invalid -
+> {"action":"multiwan.interface.set","params":{"section":"bad section"}}
+< 400 {"action":"multiwan.interface.set","error":{"code":"invalid_parameter","message":"unknown mwan3 interface"},"ok":false}
+## 191 fail *
+> {"action":"multiwan.interface.set","params":{"section":"zte_mwan2","enabled":1,"track_ip":"1.1.1.1,8.8.8.8","timeout":5}}
+< 200 {"action":"multiwan.interface.set","ok":true,"result":{"applied":false,"section":"zte_mwan2"}}
+## 192 ok -
+> {"action":"multiwan.member.set","params":{"section":"zte_mwan2_m1","metric":20,"weight":4}}
+< 200 {"action":"multiwan.member.set","ok":true,"result":{"applied":false,"section":"zte_mwan2_m1"}}
+## 193 invalid -
+> {"action":"multiwan.member.set","params":{}}
+< 400 {"action":"multiwan.member.set","error":{"code":"invalid_parameter","message":"missing parameter: section"},"ok":false}
+## 194 fail *
+> {"action":"multiwan.member.set","params":{"section":"zte_mwan2_m1","metric":20,"weight":4}}
+< 200 {"action":"multiwan.member.set","ok":true,"result":{"applied":false,"section":"zte_mwan2_m1"}}
+## 195 ok -
+> {"action":"multiwan.policy.set","params":{"section":"balanced","last_resort":"default","use_member":"zte_mwan2_m1"}}
+< 200 {"action":"multiwan.policy.set","ok":true,"result":{"applied":false,"section":"balanced"}}
+## 196 invalid -
+> {"action":"multiwan.policy.set","params":{}}
+< 400 {"action":"multiwan.policy.set","error":{"code":"invalid_parameter","message":"missing parameter: section"},"ok":false}
+## 197 fail *
+> {"action":"multiwan.policy.set","params":{"section":"balanced","last_resort":"default","use_member":"zte_mwan2_m1"}}
+< 200 {"action":"multiwan.policy.set","ok":true,"result":{"applied":false,"section":"balanced"}}
+## 198 ok -
+> {"action":"multiwan.rule.set","params":{"section":"default_rule_v4","use_policy":"balanced","sticky":0,"logging":1}}
+< 200 {"action":"multiwan.rule.set","ok":true,"result":{"applied":false,"section":"default_rule_v4"}}
+## 199 invalid -
+> {"action":"multiwan.rule.set","params":{}}
+< 400 {"action":"multiwan.rule.set","error":{"code":"invalid_parameter","message":"missing parameter: section"},"ok":false}
+## 200 fail *
+> {"action":"multiwan.rule.set","params":{"section":"default_rule_v4","use_policy":"balanced","sticky":0,"logging":1}}
+< 200 {"action":"multiwan.rule.set","ok":true,"result":{"applied":false,"section":"default_rule_v4"}}
+## 201 ok -
+> {"action":"aggregation.set","params":{"enabled":false}}
+< 200 {"action":"aggregation.set","ok":true,"result":{"enabled":false}}
+## 202 invalid -
+> {"action":"aggregation.set","params":{}}
+< 400 {"action":"aggregation.set","error":{"code":"invalid_parameter","message":"enabled must be boolean"},"ok":false}
+## 203 fail *
+> {"action":"aggregation.set","params":{"enabled":false}}
+< 502 {"action":"aggregation.set","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 204 ok -
+> {"action":"qos.clear","params":{}}
+< 200 {"action":"qos.clear","ok":true,"result":{"cleared":true,"files":1}}
+## 205 fail *
+> {"action":"qos.clear","params":{}}
+< 200 {"action":"qos.clear","ok":true,"result":{"cleared":true,"files":1}}
+## 206 ok -
+> {"action":"cooling.fan.set_enabled","params":{"enabled":true}}
+< 200 {"action":"cooling.fan.set_enabled","ok":true,"result":{"always_on":true,"enabled":true,"mode":"always_on"}}
+## 207 invalid -
+> {"action":"cooling.fan.set_enabled","params":{}}
+< 400 {"action":"cooling.fan.set_enabled","error":{"code":"invalid_parameter","message":"enabled must be boolean"},"ok":false}
+## 208 ok -
+> {"action":"cooling.fan.set_mode","params":{"mode":"automatic"}}
+< 200 {"action":"cooling.fan.set_mode","ok":true,"result":{"always_on":false,"enabled":false,"mode":"automatic"}}
+## 209 invalid -
+> {"action":"cooling.fan.set_mode","params":{"mode":"turbo"}}
+< 400 {"action":"cooling.fan.set_mode","error":{"code":"invalid_parameter","message":"mode must be automatic, custom, or always_on"},"ok":false}
+## 210 ok -
+> {"action":"cooling.fan.set_curve","params":{"points":[{"temperature":40,"pwm":0},{"temperature":45,"pwm":0},{"temperature":50,"pwm":76},{"temperature":60,"pwm":128},{"temperature":70,"pwm":255}]}}
+< 200 {"action":"cooling.fan.set_curve","ok":true,"result":{"always_on":false,"enabled":false,"mode":"custom","points":[{"pwm":0,"temperature":40},{"pwm":0,"temperature":45},{"pwm":76,"temperature":50},{"pwm":128,"temperature":60},{"pwm":255,"temperature":70}]}}
+## 211 invalid -
+> {"action":"cooling.fan.set_curve","params":{"points":[]}}
+< 400 {"action":"cooling.fan.set_curve","error":{"code":"invalid_parameter","message":"points must contain 2 to 8 objects"},"ok":false}
+## 212 ok -
+> {"action":"cooling.liquid.set_enabled","params":{"enabled":false}}
+< 200 {"action":"cooling.liquid.set_enabled","ok":true,"result":{"always_on":false,"enabled":false}}
+## 213 invalid -
+> {"action":"cooling.liquid.set_enabled","params":{}}
+< 400 {"action":"cooling.liquid.set_enabled","error":{"code":"invalid_parameter","message":"enabled must be boolean"},"ok":false}
+## 214 ok -
+> {"action":"cooling.liquid.set_mode","params":{"mode":"high"}}
+< 200 {"action":"cooling.liquid.set_mode","ok":true,"result":{"always_on":true,"amplitude":200,"enabled":true,"level":2,"mode":"high","speed_percent":100}}
+## 215 invalid -
+> {"action":"cooling.liquid.set_mode","params":{}}
+< 400 {"action":"cooling.liquid.set_mode","error":{"code":"invalid_parameter","message":"mode must be automatic, low, or high"},"ok":false}
+## 216 unknown -
+> {"action":"fixture.unknown","params":{}}
+< 404 {"action":"fixture.unknown","error":{"code":"unknown_action","message":"unsupported control action"},"ok":false}
+## 217 no-action -
+> {"params":{}}
+< 400 {"error":{"code":"invalid_request","message":"missing action"},"ok":false}
+## 218 bad-json -
+> {"action":
+< 400 {"error":{"code":"invalid_request","message":"request body must be valid JSON"},"ok":false}
+## 219 params-not-object -
+> {"action":"device.reboot","params":[]}
+< 400 {"action":"device.reboot","error":{"code":"invalid_request","message":"params must be a JSON object"},"ok":false}
+## 220 no-params -
+> {"action":"qos.reload"}
+< 200 {"action":"qos.reload","ok":true,"result":{"queued":true}}

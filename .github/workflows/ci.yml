@@ -30,6 +30,7 @@ jobs:
       - run: ../tests/rust_control_integration.sh
       - run: sh ../tests/listen_orphan_test.sh target/debug/zwrt-datad
       - run: sh ../tests/golden/golden.sh check target/debug/zwrt-datad
+      - run: sh ../tests/golden/control_golden.sh check target/debug/zwrt-datad
       - run: sh ../tests/state_v2_doc_check.sh && sh ../tests/state_v2_doc_check.sh --self-test
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --locked --release

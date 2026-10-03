@@ -23,3 +23,25 @@ fn legacy_events_golden_unchanged() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// 旧 /control 回复 golden（E4 T1，write-op-layer.md D26）：tests/golden/control_golden.sh check。
+/// 按 control_cases.txt 发每个动作的成功、参数不对、ubus 失败请求，状态码和回复体逐字节比；
+/// 再跑 control_contract.py：挂起到做完才回复、队列满 503 的回复体、state.set_interval 生效。
+/// 需要 sh、curl、python3、openssl。
+#[test]
+fn legacy_control_golden_unchanged() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let script = root.join("tests/golden/control_golden.sh");
+    let output = Command::new("sh")
+        .arg(&script)
+        .arg("check")
+        .arg(env!("CARGO_BIN_EXE_zwrt-datad"))
+        .output()
+        .expect("run tests/golden/control_golden.sh");
+    assert!(
+        output.status.success(),
+        "legacy /control replies changed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
