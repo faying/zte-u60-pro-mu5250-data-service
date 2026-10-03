@@ -73,9 +73,20 @@ fn stay(t: &Txn) -> &'static str {
 
 /// 终态的一句话（状态文案表，不带符号）：(mark, 中, 英)。`x` 退回目标，`y` 目标，`old` 写之前的值。
 fn final_words(t: &Txn, x: &Words, y: &Words, old: &Words) -> (&'static str, String, String) {
+    final_line(t.phase, t.reason, x, y, old)
+}
+
+/// 终态的一句话，按阶段和原因（改动记录也用，T8c）。
+pub fn final_line(
+    phase: Phase,
+    reason: Option<Reason>,
+    x: &Words,
+    y: &Words,
+    old: &Words,
+) -> (&'static str, String, String) {
     use Phase::*;
     use Reason::*;
-    let (mark, zh, en) = match (t.phase, t.reason) {
+    let (mark, zh, en) = match (phase, reason) {
         (Confirmed, Some(UserKeep)) => (
             "warn",
             format!("{} · 没确认通", cat("保留", &y.0)),
@@ -151,21 +162,37 @@ pub struct Ctx {
 
 /// DD10：能不能撤销，不能时的原因。
 fn undo_denied(t: &Txn, ctx: Ctx) -> Option<(&'static str, &'static str)> {
-    const SINCE: (&str, &str) = ("之后又改过", "Changed since");
     if ctx.later_change {
         return Some(SINCE);
     }
-    match t.phase {
-        Phase::Confirmed | Phase::Unverified => None,
-        Phase::RolledBack | Phase::NotApplied => Some(("设置没变 · 不用撤销", "Nothing to undo")),
-        Phase::RollbackFailed => Some(("先再试一次退回", "Retry the revert instead")),
-        Phase::Cancelled => match t.reason {
+    undo_why(
+        Some(t.phase),
+        t.reason,
+        t.readback.as_deref() == Some(t.target.as_str()),
+    )
+}
+
+const SINCE: (&str, &str) = ("之后又改过", "Changed since");
+
+/// 按终态和原因：能撤为 None，否则原因（改动记录也用，T8c）。`target_still` = 读回还是写进去的值。
+pub fn undo_why(
+    phase: Option<Phase>,
+    reason: Option<Reason>,
+    target_still: bool,
+) -> Option<(&'static str, &'static str)> {
+    match phase {
+        Some(Phase::Confirmed | Phase::Unverified) => None,
+        Some(Phase::RolledBack | Phase::NotApplied) => {
+            Some(("设置没变 · 不用撤销", "Nothing to undo"))
+        }
+        Some(Phase::RollbackFailed) => Some(("先再试一次退回", "Retry the revert instead")),
+        Some(Phase::Cancelled) => match reason {
             Some(Reason::SimChanged) => Some(("换过卡", "SIM changed")),
             Some(Reason::Superseded) => Some(SINCE),
-            _ if t.readback.as_deref() == Some(t.target.as_str()) => None,
+            _ if target_still => None,
             _ => Some(SINCE),
         },
-        _ => None,
+        _ => Some(("这类操作不能撤销", "Can't be undone")),
     }
 }
 

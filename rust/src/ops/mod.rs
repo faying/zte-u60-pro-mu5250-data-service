@@ -14,6 +14,7 @@
 //! `ZWRT_DATAD_LEGACY_TTL_MS`、各动作的 `deadline_env`、`ZWRT_DATAD_WRITE_LOCK`；时钟 `ZWRT_DATAD_UPTIME_PATH`（默认 `/proc/uptime`）。
 
 pub mod engine;
+pub mod journal_view;
 pub mod pending;
 pub mod probe;
 pub mod record;

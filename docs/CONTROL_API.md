@@ -72,7 +72,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `op.ack` | `op_id` | 「知道了」：只记账，要顶层 `source`（screen/web）；只能点最近结束的那个（`op` 块的 `last`），点过再点照样成功。别的 op_id 回 409 `invalid_state`（STATE_V2.md V2-37） |
 
 | `journal.append` | `item` 或 `action`、`result`，可选 `reason`、`old`、`new`、`detail` 等 | 只记账（eSIM、CHILL 这类不经 `/control` 的改动由 agent 补记）；要顶层 `source`；`result` 为 `skipped` 时按下面的规则合并。不受事务锁、不进执行者队列 |
-| `journal.list` | `limit?`（默认 50，最多 500） | `{"entries":[…新的在前],"owners":{项:{source,user,undo,value,op_id,ts,t}}}` |
+| `journal.list` | `limit?`（默认 50，最多 500） | `{"entries":[…新的在前],"owners":{项:{source,user,undo,value,op_id,ts,t}}}`；每行另带界面显示用的 `what_zh/_en`、`change_zh/_en`、`result_zh/_en`、`mark`、`source_zh/_en`、`hide`、`undo_view`（STATE_V2.md V2-41） |
 
 **搜网会话**（E4 T7b，D17）：agent 的搜网 / 手动注册 / 回自动流程留在 agent，期间占住写锁。
 

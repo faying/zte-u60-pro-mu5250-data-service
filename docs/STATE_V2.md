@@ -312,4 +312,12 @@ cancelled 里 sim_changed 不能（「换过卡」）、superseded 不能（「�
 触屏超过 20 秒就显示「数据服务没响应」、写控件变灰；没有这个字段（旧 datad）当不知道，不当卡住。
 测试：`screen_reply_carries_executor_age`
 
+**V2-41** 改动记录（`journal.list`，DD5、DD10、DD11）的每一行原样保留，另加界面直接显示的字段：`what_zh/_en`（制式、移动数据、eSIM …）、
+`change_zh/_en`（事务是「旧 → 新」，不走事务的写按参数写「关掉数据」「改成只用 4G」这类，看不出就是 ""）、`result_zh/_en`（事务用状态文案表那句，其他是已改 / 没改成 / 已发出 / 排队中 …）、
+`mark`（ok / warn / bad）、`source_zh/_en`、`hide`（不单独成一行：「知道了」的记账、已经有结束行的跳过段开头）、`undo_view`。
+跳过段的结束行写「情景跳过 ×N（你手动改过）」，还没结束的写「情景跳过中（…）」。
+`undo_view` 只有事务的行有：`{ok, label_zh/_en（撤销/重做）, why_zh/_en, request}`，规则同 V2-36；同一项后来又改过（之后的事务，或不走事务的写成功了）就是「之后又改过」。
+`request` 是照发就行的写（`{action, undo: true, params}`，客户端加上顶层 `source`），能撤时才有用。行本身的 `undo`（这一行是不是撤销）不变。
+测试：`every_entry_kind_reads_as_a_sentence`、`only_the_latest_change_of_an_item_can_be_undone`
+
 不在 datad 的几行（客户端自己判断的）：「数据服务没响应」（心跳 `exec_age_ms`，V2-32）、「和设备断开了 · 操作结果未知」（网页）、改动记录的空和读不到，归触屏 T8、网页 T9 和术语表 T14。

@@ -764,9 +764,12 @@ async fn ops_route(app: &App, action: &str, body: &Value) -> Option<Response> {
                 .clamp(1, 500) as usize;
             // 先等前面接受的行落盘，刚记的也读得到。
             ops.record().flush().await;
+            // E4 T8c（V2-41）：每行加上界面直接显示的字段
+            let mut entries = ops.record().list(limit);
+            crate::ops::journal_view::decorate(&mut entries);
             return Some(control_ok(
                 action,
-                json!({"entries": ops.record().list(limit), "owners": ops.record().owners()}),
+                json!({"entries": entries, "owners": ops.record().owners()}),
             ));
         }
         "op.ack" => {
