@@ -92,6 +92,7 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
 | `signal` | 旧 `/state` 的 `net` 对象 | 旧采集算好的 `net`（不另调 ubus） |
 | `live` | `{ "system", "runtime", "traffic" }`，三个值分别是旧 `/state` 的同名对象 | 旧采集算好的结果（不另调 ubus） |
 | `sms` | `{ "unread", "max_id", "count" }`：`unread` 同旧 `/state` 的 `sms.unread`；`max_id`、`count` 是 `/v2` 新加的（V2-30）；不带 `list` | 旧采集读好的容量和两库第一页（不另调 ubus） |
+| `sim` | 旧 `/state` 的 `sim` 对象（`iccid`、`imsi`、`spn`、`state`、`current_slot` …），2026-10-03 加；变了才发 | 旧采集读好的 `zwrt_zte_mdm.api get_sim_info`（不另调 ubus） |
 
 stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 `signal` 在 `nwinfo_get_netinfo` 失败时读失败；`live` 在 `system info` 或实时流量 `get_wwandst` 失败时读失败。

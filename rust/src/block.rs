@@ -104,6 +104,8 @@ pub fn phase1_blocks() -> Vec<BlockSpec> {
         BlockSpec::derived("live", Box::new(LivePolicy)),
         // V2-30：短信摘要，由旧采集按原来的短信节拍（容量 30 秒、列表 10 秒）交进来。
         BlockSpec::derived("sms", Box::new(OnChange)),
+        // SIM 身份和状态（旧 `/state` 的 `sim` 对象），变了才发（2026-10-03）。
+        BlockSpec::derived("sim", Box::new(OnChange)),
     ]
 }
 

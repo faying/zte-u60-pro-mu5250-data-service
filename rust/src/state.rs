@@ -1197,6 +1197,7 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     // `/v2` 派生块的健康：信号块看 nwinfo，live 块看 system info 和实时流量。
     let signal_ok = net.is_ok();
     let live_ok = info.is_ok() && traffic.is_ok();
+    let sim_ok = sim.is_ok();
     // stall 的 30 秒窗口：厂商收发包数（cell_window.rs；没读到就作废窗口）
     crate::cell_window::sample(
         now_ms(),
@@ -1855,6 +1856,16 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         now,
     );
     hub.record("sms", sms_block, now);
+    // sim 块 = 旧 `/state` 的 `sim` 对象（含 iccid）。zte-agent 的换卡监视靠它，
+    // 不再自己每 10 秒调 ubus（2026-10-03，apn_pick）。
+    hub.record(
+        "sim",
+        match fields.get("sim") {
+            Some(v) if sim_ok => Ok(v.clone()),
+            _ => Err("zwrt_zte_mdm.api get_sim_info failed".into()),
+        },
+        now,
+    );
     Snapshot {
         ts: SystemTime::now()
             .duration_since(UNIX_EPOCH)
