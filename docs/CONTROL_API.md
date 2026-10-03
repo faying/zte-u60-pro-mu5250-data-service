@@ -68,6 +68,11 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `op.revert` | `op_id` | 立即退回（自动退回关着也能用）；不在等确认时回 409 `invalid_state` |
 | `op.keep` | `op_id` | 保留现状，取消退回，记 `confirmed/user_keep` |
 
+| `journal.append` | `item` 或 `action`、`result`，可选 `reason`、`old`、`new`、`detail` 等 | 只记账（eSIM、CHILL 这类不经 `/control` 的改动由 agent 补记）；要顶层 `source`；`result` 为 `skipped` 时按下面的规则合并。不受事务锁、不进执行者队列 |
+| `journal.list` | `limit?`（默认 50，最多 500） | `{"entries":[…新的在前],"owners":{项:{source,user,undo,value,op_id,ts,t}}}` |
+
+**流水账**（T5）：`ZWRT_DATAD_OPS_DIR` 下的 `journal.jsonl`，每行一个 JSON，带 `ts`（unix 秒）和 `t`（设备时钟的年月日时分秒，设备时钟本来就是当地时间）。会改设备的 `/control` 动作都记一行（`sms.mark_read` 不记）：事务结束时记 op_id、来源、SIM（ICCID 后 4 位/卡槽）、旧值、新值、退回目标、读回、终态和原因；不走事务的写记动作、来源（没有 source 记 `legacy`）、参数、`ok`/`failed` 和 HTTP 状态；旧请求队列的排队、被替换、丢掉也各记一行；重启、关机在执行前先记 `requested` 并等它写进闪存。密码类字段（Wi-Fi 密码、APN 用户名/密码、eSIM 激活码/确认码、PIN 等）只写 `(changed)`；短信动作不记参数。同一来源 + 同一项 + 同一原因的 `skipped` 只记开头一行（`skip:start`）和结束一行（`skip:end`，`count` = 一共跳过几次；原因变了，或这个来源对这一项有了别的记录时结束；计数在内存里，datad 重启时进行中的那段丢掉）。文件超过 `ZWRT_DATAD_JOURNAL_MAX_BYTES`（默认 262144）就改名为 `journal.1.jsonl`，两份合计不超过约 2 倍上限；单行最长 2 KB。`owners.json` 记每一项最后是谁写的（screen/web/legacy 的 `user` 为 true），流水账滚掉也不丢。
+
 **旧请求**（没有 `source`）回复和以前逐字节相同。事务进行中：同一项的旧请求当覆盖写照常执行；描述表里的其他旧请求回成功（`{"result":"success"}`）并进旧请求队列，锁空出来再执行（每项只留最新、120 秒过期、关数据或重启时清空）。描述表里的动作在执行者队列满时也这样处理，不回 503；旧的关数据请求在队列满时作为内部任务马上执行。
 
 进行中的事务落盘在 `ZWRT_DATAD_OPS_DIR`（默认 `/data/u60-ops`，空串 = 不落盘）的 `pending.json`：datad 重启接着确认；整机重启后时限重新计，第 2 次开机仍未确认或累计等待超过时限就马上退回；目录里有 `takeover` 标记（应急直写留下的）就放弃。写调用超时也回 502，但事务不判失败，只按读回判断（STATE_V2.md V2-33）。datad 的每个写都拿着跨进程写锁 `ZWRT_DATAD_WRITE_LOCK`（默认 `/var/run/u60-write.lock`），和应急直写脚本互斥。其他环境变量：`ZWRT_DATAD_OP_POLL_MS`（确认时读设备的间隔，默认 2000）、`ZWRT_DATAD_LEGACY_TTL_MS`（默认 120000）、`ZWRT_DATAD_DEADLINE_NETWORK_MODE_MS`（默认 120000）。

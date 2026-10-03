@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::ops::{
+    record::Record,
     spec::{NETWORK_MODE, SPECS},
     txn::{Conn, DataPath, SimId},
 };
@@ -186,7 +187,12 @@ fn crashed(dir: &std::path::Path) -> PathBuf {
 }
 
 fn engine(dev: &Dev, rollback: bool, dir: Option<PathBuf>) -> Engine<Dev> {
-    Engine::new(dev.clone(), cfg(rollback), Store::open(dir))
+    Engine::new(
+        dev.clone(),
+        cfg(rollback),
+        Store::open(dir),
+        Record::default(),
+    )
 }
 
 fn spec() -> &'static Spec {
@@ -663,6 +669,7 @@ async fn legacy_queue_retries_when_executor_is_full_and_expires() {
             ..cfg(false)
         },
         Store::open(None),
+        Record::default(),
     );
     let calls = recording_runner(&e, 0);
     let a = op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
@@ -932,4 +939,65 @@ async fn timed_out_write_is_unknown_and_confirmed_by_readback() {
     assert_eq!(dev.s().writes, ["Only_LTE"]);
     // 数据通是在蜂窝接口上探测出来的
     assert_eq!(dev.s().probes, ["rmnet_data0"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn finished_changes_and_legacy_queue_are_journaled() {
+    let dir = temp_dir();
+    let dev = Dev::new();
+    let e = Engine::new(
+        dev.clone(),
+        cfg(false),
+        Store::open(None),
+        Record::open_with(Some(dir.clone()), 1 << 20),
+    );
+    let op = op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
+    settle(&e, &id(&op)).await;
+    e.enqueue_legacy(NETWORK_MODE, "network.set_mode", json!({"mode":"A"}));
+    e.enqueue_legacy(NETWORK_MODE, "network.set_mode", json!({"mode":"B"}));
+    e.clear_legacy("device.reboot");
+    // 写者是真线程，测试的时钟是暂停的：按真实时间等它落盘。
+    let mut lines = vec![];
+    for _ in 0..200 {
+        lines = e.record().list(10);
+        if lines.len() >= 5 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let what: Vec<(&str, &str)> = lines
+        .iter()
+        .rev()
+        .map(|l| {
+            (
+                l["source"].as_str().unwrap_or_default(),
+                l["result"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        what,
+        [
+            ("screen", "confirmed"),
+            ("legacy", "queued"),
+            ("legacy", "replaced"),
+            ("legacy", "queued"),
+            ("legacy", "dropped"),
+        ]
+    );
+    let done = &lines[4];
+    assert_eq!(
+        (
+            done["old"].as_str(),
+            done["new"].as_str(),
+            done["readback"].as_str()
+        ),
+        (Some("WL_AND_5G"), Some("Only_LTE"), Some("Only_LTE"))
+    );
+    assert_eq!(done["sim"], "0001/1");
+    let owner = &e.record().owners()["network.mode"];
+    assert_eq!(
+        (owner["source"].as_str(), owner["value"].as_str()),
+        (Some("screen"), Some("Only_LTE"))
+    );
 }

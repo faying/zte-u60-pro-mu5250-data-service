@@ -80,7 +80,7 @@ impl Store {
     }
 }
 
-fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let tmp = dir.join(format!(".{name}.tmp"));
     {
         let mut f = File::create(&tmp)?;

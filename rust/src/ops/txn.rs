@@ -35,6 +35,18 @@ pub enum Source {
 }
 
 impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Screen => "screen",
+            Self::Web => "web",
+            Self::Legacy => "legacy",
+            Self::Guard => "guard",
+            Self::Scenario => "scenario",
+            Self::Scheduler => "scheduler",
+            Self::Auto => "auto",
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "screen" => Self::Screen,
@@ -283,6 +295,9 @@ pub struct Txn {
     pub ever_matched: bool,
     /// 写之后拿到过至少一次读数（一次都没有时到点不能判 not_applied）。
     pub read_ok: bool,
+    /// 最近一次配置读回（流水账的「读回」）。
+    #[serde(default)]
+    pub readback: Option<String>,
     /// 写调用本身报错了（读回仍是旧值就马上判 not_applied，不用等到点）。
     pub apply_failed: bool,
     pub intent: Option<Intent>,
@@ -340,6 +355,7 @@ impl Txn {
             rollback_reason: None,
             ever_matched: false,
             read_ok: false,
+            readback: None,
             apply_failed: false,
             intent: None,
             sim: n.sim,
@@ -569,6 +585,7 @@ impl Txn {
         self.note_probe(r, now);
         if let Some(v) = r.value.as_deref() {
             self.read_ok = true;
+            self.readback = Some(v.to_owned());
             if self.phase == Phase::Verifying {
                 if v == self.target {
                     // 读回对上就记下（数据通不通另算）：对上过、数据一直不通，到点按没通处理，不算 not_applied。

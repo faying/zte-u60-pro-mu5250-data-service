@@ -111,6 +111,7 @@ impl App {
             crate::ops::UbusDevice::new(exec.clone()),
             crate::ops::Config::from_env(),
             crate::ops::pending::Store::open(crate::ops::ops_dir()),
+            crate::ops::record::Record::open(crate::ops::ops_dir()),
         );
         let app = Self {
             inner: Arc::new(Inner {
@@ -594,19 +595,132 @@ async fn run_control(app: App, action: String, body: Value) -> Result<Response, 
 
 async fn control_job(app: App, action: String, body: Value) -> Response {
     let marker = app.inner.exec.clone();
+    let writes = crate::control::ACTIONS.contains(&action.as_str()) && !read_only(&action);
     // D29：会改设备的动作在执行者里拿着跨进程写锁做（和应急直写脚本互斥）。
-    let _lock = if crate::control::ACTIONS.contains(&action.as_str()) && !read_only(&action) {
+    let _lock = if writes {
         Some(crate::ops::write_lock::acquire().await)
     } else {
         None
     };
-    let response = control_task(app, &action, body).await;
+    let journal = writes.then(|| JournalWrite::new(&action, &body)).flatten();
+    // 重启、关机：先把这一行写进闪存再做（之后没机会了）。
+    if let Some(j) = &journal
+        && matches!(action.as_str(), "device.reboot" | "device.poweroff")
+    {
+        j.line(&app, "requested", None);
+        app.inner.ops.record().flush().await;
+    }
+    let response = control_task(app.clone(), &action, body).await;
+    if let Some(j) = &journal
+        && !matches!(action.as_str(), "device.reboot" | "device.poweroff")
+    {
+        let ok = response.status().is_success();
+        j.line(
+            &app,
+            if ok { "ok" } else { "failed" },
+            (!ok).then_some(response.status().as_u16()),
+        );
+        if ok {
+            j.owner(&app);
+        }
+    }
     // V2-27：成功后相关块下一轮立即读（没有映射就全部块），不另起一轮采集。
     if response.status().is_success() && !read_only(&action) {
         crate::state::invalidate_cache();
         marker.mark_immediate(blocks_for_action(&action));
     }
     response
+}
+
+/// 不走事务的写记一行流水账（T5）：旧请求直接执行的、带来源但不在描述表里的。
+/// `sms.mark_read` 太频繁，不记；短信动作只记动作名（`record::redact`）。
+struct JournalWrite {
+    action: String,
+    source: crate::ops::Source,
+    params: Value,
+    /// 描述表里的动作：改的项和目标值（成功后记 owners）。
+    item: Option<(&'static str, String)>,
+}
+
+impl JournalWrite {
+    fn new(action: &str, body: &Value) -> Option<Self> {
+        if action == "sms.mark_read" {
+            return None;
+        }
+        let empty = json!({});
+        let params = body.get("params").unwrap_or(&empty);
+        let source = body
+            .get("source")
+            .and_then(Value::as_str)
+            .and_then(crate::ops::Source::parse)
+            .unwrap_or(crate::ops::Source::Legacy);
+        let item =
+            crate::ops::spec::find(action).and_then(|s| s.target(params).ok().map(|v| (s.item, v)));
+        Some(Self {
+            action: action.to_owned(),
+            source,
+            params: crate::ops::record::redact(action, params),
+            item,
+        })
+    }
+
+    fn line(&self, app: &App, result: &str, status: Option<u16>) {
+        app.inner.ops.record().append(json!({
+            "action": self.action,
+            "item": self.item.as_ref().map(|i| i.0),
+            "source": self.source,
+            "params": self.params,
+            "result": result,
+            "status": status,
+        }));
+    }
+
+    fn owner(&self, app: &App) {
+        if let Some((item, value)) = &self.item {
+            app.inner
+                .ops
+                .record()
+                .set_owner(item, self.source, false, value, None);
+        }
+    }
+}
+
+/// `journal.append`（只记账，T5）：eSIM、CHILL 这类不经 `/control` 的改动由 agent 补记。
+/// 要顶层 `source`；`params.result` 必填，`skipped` 按 D27 合并。不受事务锁、不进执行者。
+fn journal_append(app: &App, action: &str, body: &Value, params: &Value) -> Response {
+    let Some(source) = body
+        .get("source")
+        .and_then(Value::as_str)
+        .and_then(crate::ops::Source::parse)
+    else {
+        return invalid_parameter(action, "journal.append needs a known top-level source");
+    };
+    let Some(result) = params
+        .get("result")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return invalid_parameter(action, "missing parameter: result");
+    };
+    let Some(what) = params
+        .get("item")
+        .or_else(|| params.get("action"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return invalid_parameter(action, "missing parameter: item or action");
+    };
+    let record = app.inner.ops.record();
+    if result == "skipped" {
+        let reason = params.get("reason").and_then(Value::as_str).unwrap_or("");
+        record.skip(source.as_str(), what, reason);
+    } else {
+        let mut line = crate::ops::record::redact(what, params);
+        line["source"] = json!(source);
+        line["journal_append"] = json!(true);
+        record.append(line);
+    }
+    control_ok(action, json!({"recorded":true}))
 }
 
 /// E4：`op.status` / `op.revert` / `op.keep`，以及带 source 的、描述表里的写（走事务）。
@@ -618,6 +732,20 @@ async fn ops_route(app: &App, action: &str, body: &Value) -> Option<Response> {
     let op_id = params.get("op_id").and_then(Value::as_str);
     match action {
         "op.status" => return Some(control_ok(action, ops.status(op_id))),
+        "journal.append" => return Some(journal_append(app, action, body, params)),
+        "journal.list" => {
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(50)
+                .clamp(1, 500) as usize;
+            // 先等前面接受的行落盘，刚记的也读得到。
+            ops.record().flush().await;
+            return Some(control_ok(
+                action,
+                json!({"entries": ops.record().list(limit), "owners": ops.record().owners()}),
+            ));
+        }
         "op.revert" | "op.keep" => {
             let Some(op_id) = op_id else {
                 return Some(invalid_parameter(action, "missing parameter: op_id"));

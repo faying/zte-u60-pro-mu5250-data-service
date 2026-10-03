@@ -4,6 +4,7 @@
 //! - `spec`：动作描述表（T2 只有网络模式）和安全类写的判断。
 //! - `probe`：确认用的 DNS 探测，绑定蜂窝接口（T4）。
 //! - `pending`：`pending.json` 落盘和 `takeover` 标记。
+//! - `record`：流水账 `journal.jsonl` 和 `owners.json`，单一写者（T5）。
 //! - `engine`：锁、覆盖/插队、确认驱动、续跑、旧请求队列。
 //! - `write_lock`：跨进程写锁（flock，和应急直写脚本互斥，D29）。
 //!
@@ -14,6 +15,7 @@
 pub mod engine;
 pub mod pending;
 pub mod probe;
+pub mod record;
 pub mod spec;
 pub mod txn;
 pub mod write_lock;

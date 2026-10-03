@@ -11,6 +11,7 @@
 
 use super::{
     pending::Store,
+    record::{self, Record},
     spec::{self, Spec},
     txn::{self, NewTxn, Phase, ProbeTarget, Reading, Reason, Source, Txn},
 };
@@ -137,6 +138,7 @@ struct Inner<D> {
     dev: D,
     cfg: Config,
     store: Store,
+    record: Record,
     st: Mutex<St>,
     /// 叫醒驱动（用户点了退回）：退回只由驱动发，不会发两次。
     wake: Notify,
@@ -205,16 +207,29 @@ impl St {
         self.recent.push_back(t);
     }
 
-    /// 把进行中的事务移进最近列表（它已经是终态）。不删落盘：调用方决定。
-    fn retire(&mut self) {
+    /// 把进行中的事务移进最近列表（它已经是终态）、记一行流水账。不删落盘：调用方决定。
+    fn retire(&mut self, rec: &Record) {
         if let Some(t) = self.active.take() {
             eprintln!(
                 "ops: {} {} from {:?} ended {:?}/{:?}",
                 t.op_id, t.action, t.source, t.phase, t.reason
             );
+            rec.append(record::txn_line(&t));
             self.remember(*t);
         }
     }
+}
+
+/// 旧请求队列的一行（排队、被更新的替换、丢掉）；真正执行时由 `/control` 那边再记一行结果。
+fn legacy_line(r: &LegacyReq, result: &str, reason: Option<&str>) -> Value {
+    json!({
+        "source": Source::Legacy,
+        "action": r.action,
+        "item": r.item,
+        "params": record::redact(&r.action, &r.params),
+        "result": result,
+        "reason": reason,
+    })
 }
 
 /// busy 回复里的「正在做什么」。
@@ -229,12 +244,13 @@ fn doing(t: &Txn, now: u64) -> Value {
 }
 
 impl<D: Device> Engine<D> {
-    pub fn new(dev: D, cfg: Config, store: Store) -> Self {
+    pub fn new(dev: D, cfg: Config, store: Store, record: Record) -> Self {
         Self {
             inner: Arc::new(Inner {
                 dev,
                 cfg,
                 store,
+                record,
                 st: Mutex::new(St::default()),
                 wake: Notify::new(),
                 runner: OnceLock::new(),
@@ -245,6 +261,11 @@ impl<D: Device> Engine<D> {
 
     pub fn set_legacy_runner(&self, runner: LegacyRunner) {
         let _ = self.inner.runner.set(runner);
+    }
+
+    /// 流水账和 owners（`journal.append`、旧请求直接执行的写也记在这里）。
+    pub fn record(&self) -> &Record {
+        &self.inner.record
     }
 
     fn lock(&self) -> MutexGuard<'_, St> {
@@ -271,7 +292,7 @@ impl<D: Device> Engine<D> {
     /// 当前事务到了终态：放锁、记进最近列表、删落盘。
     fn finish(&self, st: &mut St) {
         if st.active.as_ref().is_some_and(|t| t.phase.is_final()) {
-            st.retire();
+            st.retire(&self.inner.record);
             self.inner.store.clear();
         }
     }
@@ -362,7 +383,7 @@ impl<D: Device> Engine<D> {
                 }
                 inherit = Some(t.rollback_to.clone());
                 t.cancel(Reason::Superseded);
-                st.retire();
+                st.retire(&self.inner.record);
             }
             let mut t = Txn::new(
                 NewTxn {
@@ -389,6 +410,20 @@ impl<D: Device> Engine<D> {
             self.persist(&mut st, true);
         }
         let result = self.inner.dev.write(req.spec, &req.target).await;
+        // 写到了设备（成功，或超时、结果未知）：这一项最后是这个来源写的（D16）。
+        let reached = match &result {
+            Ok(_) => true,
+            Err(e) => e.timed_out,
+        };
+        if reached {
+            self.inner.record.set_owner(
+                req.spec.item,
+                req.source,
+                req.undo,
+                &req.target,
+                Some(&op_id),
+            );
+        }
         let now = self.now();
         let (op, live) = {
             let mut st = self.lock();
@@ -613,17 +648,20 @@ impl<D: Device> Engine<D> {
             t.cancel(Reason::Preempted);
             self.finish(&mut st);
         }
-        Self::drop_legacy(&mut st, "a safety write");
+        self.drop_legacy(&mut st, "a safety write");
     }
 
     /// 重启/关机被接受：清空旧请求队列（进行中的事务不放弃，开机后接着确认）。
     pub fn clear_legacy(&self, why: &str) {
-        Self::drop_legacy(&mut self.lock(), why);
+        self.drop_legacy(&mut self.lock(), why);
     }
 
-    fn drop_legacy(st: &mut St, why: &str) {
+    fn drop_legacy(&self, st: &mut St, why: &str) {
         for r in st.legacy.drain(..) {
             eprintln!("ops: dropped queued legacy {} because of {why}", r.action);
+            self.inner
+                .record
+                .append(legacy_line(&r, "dropped", Some(why)));
         }
     }
 
@@ -657,19 +695,23 @@ impl<D: Device> Engine<D> {
         let now = self.now();
         {
             let mut st = self.lock();
+            let rec = &self.inner.record;
             st.legacy.retain(|r| {
                 let keep = r.item != item;
                 if !keep {
                     eprintln!("ops: queued legacy {} replaced by a newer one", r.action);
+                    rec.append(legacy_line(r, "replaced", None));
                 }
                 keep
             });
-            st.legacy.push_back(LegacyReq {
+            let r = LegacyReq {
                 item,
                 action: action.into(),
                 params,
                 at_ms: now,
-            });
+            };
+            rec.append(legacy_line(&r, "queued", None));
+            st.legacy.push_back(r);
         }
         self.kick_legacy();
     }
@@ -689,6 +731,7 @@ impl<D: Device> Engine<D> {
                     let now = e.now();
                     let ttl = e.inner.cfg.legacy_ttl_ms;
                     let mut st = e.lock();
+                    let rec = &e.inner.record;
                     if st.active.is_some() {
                         None
                     } else {
@@ -696,6 +739,7 @@ impl<D: Device> Engine<D> {
                             let fresh = now.saturating_sub(r.at_ms) < ttl;
                             if !fresh {
                                 eprintln!("ops: dropped legacy {} after {ttl} ms", r.action);
+                                rec.append(legacy_line(r, "dropped", Some("expired")));
                             }
                             fresh
                         });

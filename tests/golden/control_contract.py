@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """旧触屏依赖的 /control 契约（E4 T1，D26），由 control_golden.sh 在 golden 比完后调用。
 
-  control_contract.py PORT FAIL_FILE WRITE_LOCK
+  control_contract.py PORT FAIL_FILE WRITE_LOCK DATA_OFF_FILE OPS_DIR
 
 请求按触屏 data.c control_send 的原样发（HTTP/1.1 + Connection: close，写完不关，等回复）：
 1. 挂起到回复：动作做完之前一个字节都不回，做完回 200 和结果。
@@ -14,6 +14,7 @@ E4 有意改变的行为（write-op-layer.md「旧客户端」、D14，T2），�
 6. 事务进行中：同一项的旧请求当覆盖写，回复逐字节同今天；别的来源的新写回 409 busy，说清谁在做什么。
 7. 「立即退回」：退回写下去并确认，终态 rolled_back/user_revert；数据开着、蜂窝接口探测不通时不确认（T4）。
 8. 跨进程写锁（D29）：别人（应急直写脚本）拿着 flock 时，datad 的写等它放；只读的不等。
+9. 流水账（T5）：旧请求直接执行的写记一行、密码不落盘；journal.append 的 skipped 合并；journal.list 新的在前。
 SPDX-License-Identifier: MIT
 """
 import fcntl
@@ -30,6 +31,7 @@ PORT = int(sys.argv[1])
 FAIL_FILE = sys.argv[2]
 WRITE_LOCK = sys.argv[3]
 DATA_OFF = sys.argv[4]
+OPS_DIR = sys.argv[5]
 SET_MODE = '{"action":"network.set_mode","params":{"mode":"WL_AND_5G"}}'
 BAND = '{"action":"band.set_lte","params":{"bands":"1,3"}}'
 BUSY_BODY = b'{"action":"band.set_lte","error":{"code":"busy","message":"control queue full"},"ok":false}'
@@ -264,6 +266,34 @@ def set_interval_applies() -> None:
     read_all(send('{"action":"state.set_interval","params":{"milliseconds":5000}}'), 10)
 
 
+def journal() -> None:
+    secret = "Contract-Secret-9917"
+    status, _ = post({"action": "wifi.configure", "params": {"section": "main_2g", "ssid": "Golden", "key": secret}})
+    if status != b"HTTP/1.1 200 OK":
+        fail("wifi.configure 没成功：%r" % status)
+    for _ in range(100):
+        status, raw = post({"action": "journal.append", "source": "scenario",
+                            "params": {"item": "network.mode", "result": "skipped", "reason": "user_hold"}})
+        if status != b"HTTP/1.1 200 OK":
+            fail("journal.append 回复不对：%r %r" % (status, raw))
+    status, raw = post({"action": "journal.append", "params": {"item": "esim", "result": "ok"}})
+    if status != b"HTTP/1.1 400 Bad Request":
+        fail("没有 source 的 journal.append 应该 400：%r %r" % (status, raw))
+    post({"action": "journal.append", "source": "web",
+          "params": {"action": "esim.switch", "result": "ok", "confirm_code": secret}})
+    status, raw = post({"action": "journal.list", "params": {"limit": 3}})
+    entries = json.loads(raw)["result"]["entries"]
+    got = [(e.get("source"), e.get("action") or e.get("item"), e.get("result"), e.get("skip")) for e in entries]
+    want = [("web", "esim.switch", "ok", None),
+            ("scenario", "network.mode", "skipped", "start"),
+            ("legacy", "wifi.configure", "ok", None)]
+    if got != want:
+        fail("journal.list 不对：%r" % entries)
+    with open(os.path.join(OPS_DIR, "journal.jsonl"), encoding="utf-8") as f:
+        if secret in f.read():
+            fail("密码写进了流水账")
+
+
 def main() -> int:
     try:
         hang_until_done()
@@ -274,6 +304,7 @@ def main() -> int:
         user_revert()
         write_lock_is_shared()
         set_interval_applies()
+        journal()
     finally:
         clear()
     return 0

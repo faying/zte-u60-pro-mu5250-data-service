@@ -98,6 +98,6 @@ esac
 
 # D18：pid 文件写的是这个 datad
 [ "$(cat "$ZWRT_DATAD_PID_FILE")" = "$PID" ] || { echo "control golden: pid 文件不对" >&2; exit 1; }
-python3 "$HERE/control_contract.py" "$PORT" "$GOLDEN_FAIL_FILE" "$ZWRT_DATAD_WRITE_LOCK" "$MOCK_DATA_OFF_FILE" ||
+python3 "$HERE/control_contract.py" "$PORT" "$GOLDEN_FAIL_FILE" "$ZWRT_DATAD_WRITE_LOCK" "$MOCK_DATA_OFF_FILE" "$ZWRT_DATAD_OPS_DIR" ||
     { tail -n 20 "$TMP/server.log" >&2; exit 1; }
 echo "control golden: $n 条回复一致，契约通过"
