@@ -90,6 +90,19 @@ fn connected(status: &str) -> bool {
     status.ends_with("connected") && !status.contains("disconnect")
 }
 
+/// 移动数据开关。`enable` 是最近一次写进去的值，开机后默认 0，自动拨号照样连上（T12 真机，B31），
+/// 所以 0 但正在连或已连上也算开着；0 且断着才算关了；状态读空不猜。
+pub(crate) fn data_switch(wwan: &Value) -> Option<bool> {
+    if flag(wwan, "enable")? {
+        return Some(true);
+    }
+    let status = text(wwan, "connect_status");
+    if status.is_empty() {
+        return None;
+    }
+    Some(connected(&status) || status == "connecting")
+}
+
 fn flag(v: &Value, key: &str) -> Option<bool> {
     if let Some(b) = v.get(key).and_then(Value::as_bool) {
         return Some(b);
@@ -110,11 +123,7 @@ fn data_path(
     uci_dns: Option<String>,
     now_ms: u64,
 ) -> DataPath {
-    let expected = match (
-        flag(wwan, "enable"),
-        flag(wwan, "roam_enable"),
-        roaming(net),
-    ) {
+    let expected = match (data_switch(wwan), flag(wwan, "roam_enable"), roaming(net)) {
         (Some(false), _, _) => Some(false),
         (Some(true), _, Some(false)) => Some(true),
         (Some(true), Some(roam_on), Some(true)) => Some(roam_on),
@@ -313,7 +322,29 @@ mod tests {
     }
 
     fn wwan(enable: i64, roam: i64) -> Value {
-        json!({"enable":enable,"roam_enable":roam,"connect_status":"ipv4_ipv6_connected","ipv4_dev_name":"rmnet_data0"})
+        // 写 0 关数据之后读到的就是断开（T12）
+        let status = if enable == 1 {
+            "ipv4_ipv6_connected"
+        } else {
+            "disconnected"
+        };
+        json!({"enable":enable,"roam_enable":roam,"connect_status":status,"ipv4_dev_name":"rmnet_data0"})
+    }
+
+    #[test]
+    fn data_switch_reads_a_boot_default_enable_as_on() {
+        let w = |e: Value, s: &str| data_switch(&json!({"enable":e,"connect_status":s}));
+        assert_eq!(w(json!(1), "disconnected"), Some(true));
+        // 开机后没人写过：enable 0，自动拨号连着（10-04 真机）
+        assert_eq!(w(json!(0), "ipv4_ipv6_connected"), Some(true));
+        assert_eq!(w(json!(0), "connecting"), Some(true));
+        assert_eq!(w(json!(0), "disconnected"), Some(false));
+        assert_eq!(w(json!(0), "disconnecting"), Some(false));
+        assert_eq!(w(json!(0), ""), None);
+        assert_eq!(
+            data_switch(&json!({"connect_status":"ipv4_connected"})),
+            None
+        );
     }
 
     fn wan() -> Value {

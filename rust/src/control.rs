@@ -560,7 +560,7 @@ async fn cellular_set(params: &Value) -> Outcome {
         Ok(_) => return Outcome::Invalid("no cellular fields supplied".into()),
         Err(e) => return Outcome::Invalid(e),
     };
-    let mut current = match state::ubus(
+    let current = match state::ubus(
         "zwrt_data",
         "get_wwaniface",
         json!({"source_module":"web","cid":1,"connect_status":""}),
@@ -571,10 +571,23 @@ async fn cellular_set(params: &Value) -> Outcome {
         Ok(_) => return Outcome::Failed("invalid get_wwaniface response".into()),
         Err(e) => return Outcome::Failed(e),
     };
+    call(
+        "zwrt_data",
+        "set_wwaniface",
+        cellular_args(current, overrides),
+    )
+    .await
+}
+
+/// 读回的整份 + 要改的。读回的 `enable` 不带回去：它是最近一次写进去的值，开机后默认 0，
+/// 自动拨号照样连着；带回去就是一次「关数据」，改漫游会把数据断掉（T12 真机，B31）。
+/// 原厂只改写了的键（T12：只写 `enable` 时漫游、拨号方式都没动）。
+fn cellular_args(mut current: Map<String, Value>, overrides: Map<String, Value>) -> Value {
+    current.remove("enable");
     current.extend(overrides);
     current.insert("source_module".into(), json!("WEBUI"));
     current.insert("cid".into(), json!(1));
-    call("zwrt_data", "set_wwaniface", Value::Object(current)).await
+    Value::Object(current)
 }
 fn at_outcome(r: Result<String, String>) -> Outcome {
     match r {
@@ -2404,6 +2417,26 @@ async fn qos_clear() -> Outcome {
 #[cfg(test)]
 mod wifi_apply_tests {
     use super::*;
+
+    #[test]
+    fn cellular_args_never_carry_the_read_enable() {
+        let read = |v: Value| match v {
+            Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        // 开机后读到 enable 0、数据连着；只改漫游时不能把 0 带回去
+        let now = read(
+            json!({"enable":0,"roam_enable":0,"connect_mode":1,"connect_status":"ipv4_ipv6_connected","cid":1}),
+        );
+        let a = cellular_args(now.clone(), read(json!({"roam_enable":1})));
+        assert_eq!(a.get("enable"), None);
+        assert_eq!(a["roam_enable"], json!(1));
+        assert_eq!(a["connect_mode"], json!(1));
+        assert_eq!(a["source_module"], json!("WEBUI"));
+        // 要改数据开关时照写
+        let a = cellular_args(now, read(json!({"enable":0})));
+        assert_eq!(a["enable"], json!(0));
+    }
 
     #[tokio::test]
     async fn vendor_call_only_listed_pairs() {
