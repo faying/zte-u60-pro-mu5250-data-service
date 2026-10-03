@@ -190,6 +190,11 @@ print(json.dumps({"messages": rows}))' "$args" "$n"
         printf '%s\n' '{"result":"success"}'
         ;;
     zwrt_data:get_wwaniface)
+        # MOCK_DATA_OFF_FILE 存在时数据开关是关的（E4 确认：不应当有数据时不探测）。
+        if [ -n "${MOCK_DATA_OFF_FILE:-}" ] && [ -f "$MOCK_DATA_OFF_FILE" ]; then
+            printf '%s\n' '{"enable":0,"roam_enable":0,"connect_mode":"auto","connect_status":"disconnected","ipv4_dev_name":"fixture0","ipv6_dev_name":"fixture0","pdp_type":"IPV4V6","profile_id":7}'
+            exit 0
+        fi
         printf '%s\n' '{"enable":1,"roam_enable":0,"connect_mode":"auto","connect_status":"ipv4_ipv6_connected","ipv4_dev_name":"fixture0","ipv6_dev_name":"fixture0","pdp_type":"IPV4V6","profile_id":7}'
         ;;
     zwrt_data:get_wwandst)

@@ -2,6 +2,7 @@
 //! 目标值从哪个参数来、确认时限多长。T2 先只接网络模式；其余动作照旧走 `control::execute`。
 //! 读回和写怎么做在 `UbusDevice`（按 `item` 分）。
 
+use super::txn::Confirm;
 use serde_json::Value;
 
 pub struct Spec {
@@ -14,6 +15,8 @@ pub struct Spec {
     pub deadline_ms: u64,
     /// 覆盖确认时限的环境变量（毫秒）。
     pub deadline_env: &'static str,
+    /// 确认规则（D34：只有 APN 要求写之后的新连接）。
+    pub confirm: Confirm,
 }
 
 pub const NETWORK_MODE: &str = "network.mode";
@@ -24,6 +27,7 @@ pub static SPECS: &[Spec] = &[Spec {
     param: "mode",
     deadline_ms: 120_000,
     deadline_env: "ZWRT_DATAD_DEADLINE_NETWORK_MODE_MS",
+    confirm: Confirm::Registered,
 }];
 
 pub fn find(action: &str) -> Option<&'static Spec> {

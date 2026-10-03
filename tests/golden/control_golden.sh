@@ -40,6 +40,7 @@ export ZWRT_DATAD_SMS_V3E1_URL="http://127.0.0.1:1/goform/goform_set_cmd_process
 export GOLDEN_FAIL_FILE="$TMP/fail"
 # E4 事务：契约测试里锁被占的那段要够长，但结束得快
 export ZWRT_DATAD_DEADLINE_NETWORK_MODE_MS=20000 ZWRT_DATAD_OP_POLL_MS=300
+export MOCK_DATA_OFF_FILE="$TMP/data-off"
 : >"$GOLDEN_FAIL_FILE"
 UCI_MODE=show
 . "$HERE/fixture.sh"
@@ -97,6 +98,6 @@ esac
 
 # D18：pid 文件写的是这个 datad
 [ "$(cat "$ZWRT_DATAD_PID_FILE")" = "$PID" ] || { echo "control golden: pid 文件不对" >&2; exit 1; }
-python3 "$HERE/control_contract.py" "$PORT" "$GOLDEN_FAIL_FILE" "$ZWRT_DATAD_WRITE_LOCK" ||
+python3 "$HERE/control_contract.py" "$PORT" "$GOLDEN_FAIL_FILE" "$ZWRT_DATAD_WRITE_LOCK" "$MOCK_DATA_OFF_FILE" ||
     { tail -n 20 "$TMP/server.log" >&2; exit 1; }
 echo "control golden: $n 条回复一致，契约通过"

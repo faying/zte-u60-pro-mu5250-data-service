@@ -12,7 +12,7 @@
 use super::{
     pending::Store,
     spec::{self, Spec},
-    txn::{self, NewTxn, Phase, Reading, Reason, Source, Txn},
+    txn::{self, NewTxn, Phase, ProbeTarget, Reading, Reason, Source, Txn},
 };
 use serde_json::{Value, json};
 use std::{
@@ -31,8 +31,10 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// 引擎对设备的全部读写和时钟。真机是 `UbusDevice`，测试是假基带。
 pub trait Device: Send + Sync + 'static {
-    /// 一次新鲜读数（不用缓存）：这一项的配置读回、是否已注册、完整 SIM 身份。
+    /// 一次新鲜读数（不用缓存）：这一项的配置读回、是否已注册、完整 SIM 身份、数据通路。
     fn read(&self, spec: &'static Spec) -> impl Future<Output = Result<Reading, String>> + Send;
+    /// 一次 DNS 探测（D25、D33）：绑定到蜂窝接口，问运营商 DNS，有回答就算通。
+    fn probe(&self, target: &ProbeTarget) -> impl Future<Output = Result<(), String>> + Send;
     fn write(
         &self,
         spec: &'static Spec,
@@ -335,12 +337,13 @@ impl<D: Device> Engine<D> {
         }
 
         // 写之前读当前值和 SIM（退回目标、R3 的「旧值」、D32 的 SIM 身份）。
-        let (old, sim) = match self.inner.dev.read(req.spec).await {
+        let (old, sim, conn) = match self.inner.dev.read(req.spec).await {
             Ok(Reading {
                 value: Some(v),
                 sim,
+                data,
                 ..
-            }) => (v, sim),
+            }) => (v, sim, data.map(|d| d.conn).filter(|c| !c.ipv4.is_empty())),
             Ok(_) => {
                 return Submit::NoCapture("cannot read current value: not reported".into());
             }
@@ -372,6 +375,8 @@ impl<D: Device> Engine<D> {
                     rollback_to: inherit.unwrap_or_else(|| old.clone()),
                     old,
                     sim,
+                    conn,
+                    confirm: req.spec.confirm,
                     // legacy 来源的写不带自动退回。
                     rollback_enabled: self.inner.cfg.rollback && req.source != Source::Legacy,
                     deadline_ms: req.spec.deadline_ms(),
@@ -442,10 +447,25 @@ impl<D: Device> Engine<D> {
                 _ = tokio::time::sleep(self.inner.cfg.poll) => {}
                 _ = self.inner.wake.notified() => continue,
             }
-            let reading = match spec {
+            let mut reading = match spec {
                 Some(s) => Some(self.inner.dev.read(s).await),
                 None => None,
             };
+            // 读数别的条件都齐了：在锁外做一次 DNS 探测（不经执行者、不拿写锁）。
+            if let Some(Ok(r)) = &mut reading {
+                let target = {
+                    let mut st = self.lock();
+                    let Some(t) = st.live(&op_id) else { break };
+                    t.wants_probe(r, self.now())
+                };
+                if let Some(target) = target {
+                    let result = self.inner.dev.probe(&target).await;
+                    if let Err(e) = &result {
+                        self.log_probe_failure(&op_id, &target, e);
+                    }
+                    r.probe = Some(result.is_ok());
+                }
+            }
             let now = self.now();
             let mut st = self.lock();
             let Some(t) = st.live(&op_id) else { break };
@@ -463,6 +483,34 @@ impl<D: Device> Engine<D> {
             self.finish(&mut st);
         }
         self.kick_legacy();
+    }
+
+    /// 探测失败只在一条连接上第一次失败、和失败满次数时各记一行（契约测试里每拍都会失败）。
+    fn log_probe_failure(&self, op_id: &str, target: &ProbeTarget, e: &str) {
+        let fails = {
+            let mut st = self.lock();
+            match st.live(op_id) {
+                Some(t) => t.probe_fails,
+                None => return,
+            }
+        };
+        // 这次失败还没记进事务，fails 是之前的次数。满次数的连接不会再探测，所以 fails 已满 = 换了连接。
+        let first = fails == 0 || fails >= txn::PROBE_TRIES;
+        if first || fails + 1 == txn::PROBE_TRIES {
+            eprintln!(
+                "ops: {op_id} DNS probe on {} failed ({e}){}",
+                if target.iface.is_empty() {
+                    "no interface"
+                } else {
+                    &target.iface
+                },
+                if fails + 1 == txn::PROBE_TRIES {
+                    "; no more probes on this connection"
+                } else {
+                    ""
+                }
+            );
+        }
     }
 
     /// 发退回（意图已经在事务里）。发之前先读一次核对 SIM（D32）：换了卡就放弃、不写；

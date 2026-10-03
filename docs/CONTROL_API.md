@@ -57,10 +57,10 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 {"action":"network.set_mode","source":"screen","op_id":"screen-42","params":{"mode":"Only_LTE"}}
 ```
 
-- 写之前读当前值和 SIM（完整 ICCID + 卡槽），写之后按新鲜读数确认：配置读回 = 目标值且已注册。成功回 200 `{"ok":true,"action":…,"result":<原厂回复>,"op":<状态>}`；写调用报错回 502，`op` 照样带上（事务按读回判断）；写之前读不到当前值回 502，没动设备。
+- 写之前读当前值和 SIM（完整 ICCID + 卡槽），写之后按新鲜读数确认：配置读回 = 目标值且已注册；「应当有数据」（`get_wwaniface` 数据开关开，且不在漫游或漫游开关开）时还要数据通：`connect_status` 已连接、`zte_wan` 有 IPv4，并且一次绑定蜂窝接口（`get_wwaniface` 的 `ipv4_dev_name`）的 DNS 查询有回答（问运营商 DNS，同一条连接最多失败 3 次、间隔至少 5 秒，换了连接重新计）。不应当有数据时不发任何探测。退回也按同一条规则确认。成功回 200 `{"ok":true,"action":…,"result":<原厂回复>,"op":<状态>}`；写调用报错回 502，`op` 照样带上（事务按读回判断）；写之前读不到当前值回 502，没动设备。
 - 同一时刻只有一个进行中的事务。别的写回 **409** `{"error":{"code":"busy"},"doing":{op_id,action,source,phase,age_ms}}`。能插队的：同一项的用户写（screen/web/legacy）和 guard（旧事务记 `superseded`，新事务的退回目标继承旧事务的）、关数据/关漫游（`cellular.set` 只含 `enabled`/`roaming` 且都为关，旧事务记 `preempted`）。
 - 到点没确认：自动退回默认关（`ZWRT_DATAD_ROLLBACK=1` 才开），关着时以 `unverified/no_rollback` 结束；读回从没变成目标值以 `not_applied/ignored` 结束（不退回）。
-- 状态（`op`）：`phase` 为 `accepted`、`applying`、`verifying`、`rolling_back` 或终态 `confirmed`、`unverified`、`rolled_back`、`not_applied`、`rollback_failed`、`cancelled`；`reason` 见设计稿「状态表」，另有 `sim_changed`（D32）、`reboot_loop`（D13）。
+- 状态（`op`）：`phase` 为 `accepted`、`applying`、`verifying`、`rolling_back` 或终态 `confirmed`、`unverified`、`rolled_back`、`not_applied`、`rollback_failed`、`cancelled`；`reason` 见设计稿「状态表」，另有 `sim_changed`（D32）、`reboot_loop`（D13）。`ever_matched` = 读回对上过目标值（对上过、数据一直不通，到点按没通处理，不算 `not_applied`），`data_ok` = 数据这一关过了。
 
 | action | params | 说明 |
 |---|---|---|

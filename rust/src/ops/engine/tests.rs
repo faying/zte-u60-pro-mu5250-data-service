@@ -4,7 +4,7 @@
 use super::*;
 use crate::ops::{
     spec::{NETWORK_MODE, SPECS},
-    txn::SimId,
+    txn::{Conn, DataPath, SimId},
 };
 use std::path::PathBuf;
 use tokio::time::Instant;
@@ -34,6 +34,13 @@ struct DevState {
     boot: String,
     clock_base: Instant,
     write_delay: Duration,
+    /// 数据通路：应当有数据（None = 读不到）、已连接、连接身份、DNS 探测通不通。
+    expected: Option<bool>,
+    connected: bool,
+    conn: Conn,
+    probe_ok: bool,
+    /// 每次探测绑定的接口。
+    probes: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -59,6 +66,14 @@ impl Dev {
             boot: "boot-a".into(),
             clock_base: Instant::now(),
             write_delay: Duration::ZERO,
+            expected: Some(true),
+            connected: true,
+            conn: Conn {
+                ipv4: "10.0.0.1".into(),
+                up_since_ms: Some(1),
+            },
+            probe_ok: true,
+            probes: vec![],
         })))
     }
     fn s(&self) -> MutexGuard<'_, DevState> {
@@ -83,7 +98,24 @@ impl Device for Dev {
             value: Some(s.net_select.clone()),
             registered: s.registered,
             sim: s.sim.clone(),
+            data: Some(DataPath {
+                expected: s.expected,
+                connected: s.connected,
+                conn: s.conn.clone(),
+                iface: "rmnet_data0".into(),
+                dns: vec!["192.0.2.53".into()],
+            }),
+            probe: None,
         })
+    }
+    async fn probe(&self, target: &ProbeTarget) -> Result<(), String> {
+        let mut s = self.s();
+        s.probes.push(target.iface.clone());
+        if s.probe_ok {
+            Ok(())
+        } else {
+            Err("no answer".into())
+        }
     }
     async fn write(&self, _spec: &'static Spec, value: &str) -> Result<Value, WriteError> {
         let (apply, delay) = {
@@ -219,7 +251,66 @@ async fn confirms_when_readback_matches_and_registered() {
     assert_eq!(op["old"], "WL_AND_5G");
     let fin = settle(&e, &id(&op)).await;
     assert_eq!(end(&fin), pair("confirmed", "verified"));
+    assert_eq!(fin["data_ok"], true);
     assert_eq!(dev.s().writes, ["Only_LTE"]);
+    // 数据通是在蜂窝接口上探测出来的
+    assert_eq!(dev.s().probes, ["rmnet_data0"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn connected_but_dns_dead_rolls_back() {
+    let dev = Dev::new();
+    dev.s().probe_ok = false;
+    let e = engine(&dev, true, None);
+    let op = op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
+    let d = dev.clone();
+    tokio::spawn(async move {
+        // 退回发出去以后旧设置是通的
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let mut s = d.s();
+            if s.writes.len() == 2 {
+                s.probe_ok = true;
+                break;
+            }
+        }
+    });
+    let fin = settle(&e, &id(&op)).await;
+    assert_eq!(end(&fin), pair("rolled_back", "timeout"));
+    assert_eq!(fin["ever_matched"], true);
+    assert_eq!(dev.s().writes, ["Only_LTE", "WL_AND_5G"]);
+    // 新设置上最多探测 3 次（同一条连接），退回后再探测一次就通了
+    assert_eq!(dev.s().probes.len(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn roaming_with_roaming_off_confirms_without_a_single_probe() {
+    let dev = Dev::new();
+    dev.s().expected = Some(false);
+    dev.s().connected = false;
+    let e = engine(&dev, true, None);
+    let op = op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
+    assert_eq!(
+        end(&settle(&e, &id(&op)).await),
+        pair("confirmed", "verified")
+    );
+    assert!(dev.s().probes.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_data_path_does_not_confirm() {
+    let dev = Dev::new();
+    dev.s().expected = None;
+    let e = engine(&dev, false, None);
+    let op = op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(e.status(Some(&id(&op)))["phase"], "verifying");
+    dev.s().expected = Some(true);
+    assert_eq!(
+        end(&settle(&e, &id(&op)).await),
+        pair("confirmed", "verified")
+    );
+    assert!(dev.s().probes.len() == 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -836,5 +927,8 @@ async fn timed_out_write_is_unknown_and_confirmed_by_readback() {
     // 前几拍读回还是旧值：不判 not_applied
     let fin = settle(&e, &id(&op)).await;
     assert_eq!(end(&fin), pair("confirmed", "verified"));
+    assert_eq!(fin["data_ok"], true);
     assert_eq!(dev.s().writes, ["Only_LTE"]);
+    // 数据通是在蜂窝接口上探测出来的
+    assert_eq!(dev.s().probes, ["rmnet_data0"]);
 }

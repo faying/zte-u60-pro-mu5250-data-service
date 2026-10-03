@@ -8,11 +8,15 @@
 //! | 终态 | 原因 |
 //! |---|---|
 //! | confirmed | verified / user_keep |
-//! | unverified | no_rollback（自动退回关着，到点没通） |
+//! | unverified | no_rollback（自动退回关着，到点没通）/ apn_no_data（APN 在不该有数据时写入） |
 //! | rolled_back | timeout / user_revert / reboot_loop |
 //! | not_applied | ignored（读回从没变成过目标值） |
 //! | rollback_failed | rollback_timeout |
 //! | cancelled | superseded / preempted / manual_change / takeover / sim_changed |
+//!
+//! 确认（T4，D25、D33、D34）：配置读回 = 目标 + 已注册；「应当有数据」时还要数据通：
+//! 已连接、有 IPv4、在蜂窝接口上一次 DNS 探测成功。APN 另外要求「写之后的新连接」。
+//! 退回也按同一条规则确认。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -95,7 +99,65 @@ pub enum Reason {
     ManualChange,
     Takeover,
     SimChanged,
+    ApnNoData,
 }
+
+/// 确认规则（D34）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confirm {
+    /// 制式、锁频、锁小区、卡槽：读回 = 目标 + 已注册；应当有数据时还要数据通。
+    #[default]
+    Registered,
+    /// APN：应当有数据时要写之后的新连接 + 数据通；不应当有数据时没法证明，记 unverified/apn_no_data。
+    Apn,
+}
+
+/// 一条数据连接的身份：IPv4 地址 + 从什么时候起（BOOTTIME 毫秒，按 netifd 的 uptime 秒数推算，
+/// 前后两次读数会差不到 1 秒）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Conn {
+    pub ipv4: String,
+    pub up_since_ms: Option<u64>,
+}
+
+/// netifd 的 uptime 只到秒，推算出的起点前后会抖不到 1 秒。
+const CONN_JITTER_MS: u64 = 2_000;
+
+impl Conn {
+    fn same(&self, other: &Conn) -> bool {
+        self.ipv4 == other.ipv4
+            && match (self.up_since_ms, other.up_since_ms) {
+                (Some(a), Some(b)) => a.abs_diff(b) <= CONN_JITTER_MS,
+                _ => true,
+            }
+    }
+}
+
+/// 数据通路的读数。读不到的部分为 None：这一拍不拿来判断数据。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DataPath {
+    /// 「应当有数据」：数据开关开，且（不在漫游或漫游开关开）。没读全为 None。
+    pub expected: Option<bool>,
+    /// `get_wwaniface` 的 connect_status 是已连接。
+    pub connected: bool,
+    pub conn: Conn,
+    /// 蜂窝数据接口（`get_wwaniface` 的 ipv4_dev_name，空时用 netifd 的 l3_device）。
+    pub iface: String,
+    /// 运营商 DNS（IPv4 的在前）。
+    pub dns: Vec<String>,
+}
+
+/// 一次 DNS 探测要用的：绑定哪个接口、问哪几个 DNS。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeTarget {
+    pub iface: String,
+    pub dns: Vec<String>,
+}
+
+/// D25：同一条连接最多探测失败 3 次，两次之间至少隔 5 秒。换了连接（重新拨号）重新算。
+pub const PROBE_TRIES: u32 = 3;
+pub const PROBE_GAP_MS: u64 = 5_000;
 
 /// 完整 SIM 身份（D32）：完整 ICCID + 卡槽。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,12 +192,25 @@ pub fn sim_check(captured: &SimId, now: &SimId) -> SimCheck {
     }
 }
 
-/// 一次新鲜读数：配置读回（读不到为 None）、是否已注册、当前 SIM。
+/// 一次新鲜读数：配置读回（读不到为 None）、是否已注册、当前 SIM、数据通路。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reading {
     pub value: Option<String>,
     pub registered: bool,
     pub sim: SimId,
+    /// 读不到为 None（应当有数据时就不能确认，等下一拍）。
+    pub data: Option<DataPath>,
+    /// 驱动按 [`Txn::wants_probe`] 做了探测时填结果；没做为 None。
+    pub probe: Option<bool>,
+}
+
+/// 数据这一关的判断。
+#[derive(Debug, PartialEq, Eq)]
+enum DataJudge {
+    Ok,
+    /// 不应当有数据，APN 没法证明。
+    ApnNoData,
+    NotYet,
 }
 
 /// 落盘的「意图」：先落意图、再动手、再落结果（D31）。重启时遇到意图没清，不重做，按读回判断。
@@ -179,6 +254,9 @@ pub struct NewTxn {
     /// 退回目标：没覆盖别的事务时等于 old；覆盖写继承被覆盖事务的退回目标（D35）。
     pub rollback_to: String,
     pub sim: SimId,
+    /// 写之前的数据连接（APN 的「新连接」拿它比）。
+    pub conn: Option<Conn>,
+    pub confirm: Confirm,
     pub rollback_enabled: bool,
     pub deadline_ms: u64,
     pub boot_id: String,
@@ -206,6 +284,27 @@ pub struct Txn {
     pub apply_failed: bool,
     pub intent: Option<Intent>,
     pub sim: SimId,
+    #[serde(default)]
+    pub confirm: Confirm,
+    /// 「新连接」的参照（D34）：这条之后建立的、或 IP 变了的连接才算新的。写的时候是写之前的连接和
+    /// 事务开始的时刻；发了退回以后换成退回那一刻看到的连接和时刻；整机重启后时刻归 0（都算新的）。
+    #[serde(default)]
+    pub ref_conn: Option<Conn>,
+    #[serde(default)]
+    pub ref_ms: u64,
+    /// 最近一次读到的连接（发退回时拿来当参照）。
+    #[serde(default)]
+    pub last_conn: Option<Conn>,
+    /// DNS 探测（D25）：在哪条连接上、失败了几次、上一次什么时候。
+    #[serde(default)]
+    pub probe_conn: Option<Conn>,
+    #[serde(default)]
+    pub probe_fails: u32,
+    #[serde(default)]
+    pub probe_last_ms: Option<u64>,
+    /// 数据通过了（探测成功、或不应当有数据）。只给 status 看。
+    #[serde(default)]
+    pub data_ok: bool,
     pub rollback_enabled: bool,
     pub deadline_ms: u64,
     pub boot_id: String,
@@ -241,6 +340,14 @@ impl Txn {
             apply_failed: false,
             intent: None,
             sim: n.sim,
+            confirm: n.confirm,
+            ref_conn: n.conn.clone(),
+            ref_ms: now,
+            last_conn: n.conn,
+            probe_conn: None,
+            probe_fails: 0,
+            probe_last_ms: None,
+            data_ok: false,
             rollback_enabled: n.rollback_enabled,
             deadline_ms: n.deadline_ms,
             boot_id: n.boot_id,
@@ -302,7 +409,124 @@ impl Txn {
         self.intent = None;
         self.wait_start_ms = now;
         self.seen_ms = now;
+        // 退回也走确认：新连接从这一刻算，探测重新计数。
+        self.ref_conn = self.last_conn.clone();
+        self.ref_ms = now;
+        self.reset_probe();
         self.generation += 1;
+    }
+
+    fn reset_probe(&mut self) {
+        self.probe_conn = None;
+        self.probe_fails = 0;
+        self.probe_last_ms = None;
+        self.data_ok = false;
+    }
+
+    /// 这条连接是不是写（或退回）之后的新连接。
+    fn new_conn(&self, c: &Conn) -> bool {
+        if self.ref_ms == 0 {
+            return true;
+        }
+        if let Some(r) = &self.ref_conn
+            && r.ipv4 != c.ipv4
+        {
+            return true;
+        }
+        c.up_since_ms.is_some_and(|t| t > self.ref_ms)
+    }
+
+    /// 这一拍正在等的值：确认时是目标值，退回时是退回目标。
+    fn goal(&self) -> &str {
+        if self.phase == Phase::RollingBack {
+            &self.rollback_to
+        } else {
+            &self.target
+        }
+    }
+
+    /// 除了探测，数据这一关的其他条件。`Err` 里是还要不要探测（条件都齐了只差探测）。
+    fn data_gate(&self, r: &Reading) -> Result<DataJudge, Option<ProbeTarget>> {
+        let Some(d) = &r.data else {
+            return Err(None);
+        };
+        match d.expected {
+            None => return Err(None),
+            Some(false) => {
+                return Ok(match (self.confirm, self.phase) {
+                    (Confirm::Apn, Phase::Verifying) => DataJudge::ApnNoData,
+                    _ => DataJudge::Ok,
+                });
+            }
+            Some(true) => {}
+        }
+        if !d.connected || d.conn.ipv4.is_empty() {
+            return Err(None);
+        }
+        if self.confirm == Confirm::Apn && !self.new_conn(&d.conn) {
+            return Err(None);
+        }
+        Err(Some(ProbeTarget {
+            iface: d.iface.clone(),
+            dns: d.dns.clone(),
+        }))
+    }
+
+    /// 这个读数要不要先做一次 DNS 探测（驱动在锁外做，结果填进 `Reading::probe` 再喂进来）。
+    /// 只在别的条件都齐了才探测：读回 = 正在等的值、已注册、SIM 没变、应当有数据、已连接有 IPv4
+    /// （APN 还要新连接）。同一条连接失败满 3 次就不再探测；两次之间至少隔 5 秒。
+    pub fn wants_probe(&self, r: &Reading, now: u64) -> Option<ProbeTarget> {
+        if !self.waiting() || self.intent.is_some() || !r.registered {
+            return None;
+        }
+        if r.value.as_deref() != Some(self.goal()) {
+            return None;
+        }
+        if sim_check(&self.sim, &r.sim) != SimCheck::Same {
+            return None;
+        }
+        let target = match self.data_gate(r) {
+            Err(Some(t)) => t,
+            _ => return None,
+        };
+        let conn = &r.data.as_ref()?.conn;
+        if self.probe_conn.as_ref().is_some_and(|c| c.same(conn)) && self.probe_fails >= PROBE_TRIES
+        {
+            return None;
+        }
+        if self
+            .probe_last_ms
+            .is_some_and(|t| now.saturating_sub(t) < PROBE_GAP_MS)
+        {
+            return None;
+        }
+        Some(target)
+    }
+
+    /// 记下探测结果；换了连接就重新计数。
+    fn note_probe(&mut self, r: &Reading, now: u64) {
+        let (Some(ok), Some(d)) = (r.probe, &r.data) else {
+            return;
+        };
+        if !self.probe_conn.as_ref().is_some_and(|c| c.same(&d.conn)) {
+            self.probe_conn = Some(d.conn.clone());
+            self.probe_fails = 0;
+        }
+        self.probe_last_ms = Some(now);
+        if !ok {
+            self.probe_fails += 1;
+        }
+    }
+
+    /// 数据这一关过没过（读回已经对上、已注册时才问）。
+    fn data_judge(&mut self, r: &Reading) -> DataJudge {
+        let j = match self.data_gate(r) {
+            Ok(j) => j,
+            Err(Some(_)) if r.probe == Some(true) => DataJudge::Ok,
+            Err(_) => DataJudge::NotYet,
+        };
+        self.data_ok = j != DataJudge::NotYet;
+        j
     }
 
     /// 到点没确认：自动退回开着就退，关着就以 unverified/no_rollback 结束（D30）。
@@ -323,19 +547,34 @@ impl Txn {
             return Next::Wait;
         }
         self.seen_ms = now;
+        if let Some(d) = &r.data
+            && !d.conn.ipv4.is_empty()
+        {
+            self.last_conn = Some(d.conn.clone());
+        }
         // D32：SIM 变了就放弃，不往别的卡上写旧卡的值；身份临时读空的这一拍只看时限。
         match sim_check(&self.sim, &r.sim) {
             SimCheck::Changed => return self.finish(Phase::Cancelled, Reason::SimChanged),
             SimCheck::Unknown => return self.on_tick(now),
             SimCheck::Same => {}
         }
+        self.note_probe(r, now);
         if let Some(v) = r.value.as_deref() {
             self.read_ok = true;
             if self.phase == Phase::Verifying {
                 if v == self.target {
+                    // 读回对上就记下（数据通不通另算）：对上过、数据一直不通，到点按没通处理，不算 not_applied。
                     self.ever_matched = true;
                     if r.registered {
-                        return self.finish(Phase::Confirmed, Reason::Verified);
+                        match self.data_judge(r) {
+                            DataJudge::Ok => {
+                                return self.finish(Phase::Confirmed, Reason::Verified);
+                            }
+                            DataJudge::ApnNoData => {
+                                return self.finish(Phase::Unverified, Reason::ApnNoData);
+                            }
+                            DataJudge::NotYet => {}
+                        }
                     }
                 } else if v == self.old {
                     // R3：对上过又回到旧值是带外改回；从没对上过、写又报了错，就是没写进去。
@@ -350,7 +589,7 @@ impl Txn {
                     return self.finish(Phase::Cancelled, Reason::ManualChange);
                 }
             } else if v == self.rollback_to {
-                if r.registered {
+                if r.registered && self.data_judge(r) != DataJudge::NotYet {
                     let why = self.rollback_reason.unwrap_or(Reason::Timeout);
                     return self.finish(Phase::RolledBack, why);
                 }
@@ -428,6 +667,9 @@ impl Txn {
             }
             self.boots += 1;
             self.boot_id = boot_id.to_owned();
+            // 时钟归零了：之前记的时刻都作废，开机后的连接都算新的。
+            self.ref_ms = 0;
+            self.reset_probe();
         }
         match (self.phase, self.intent) {
             (Phase::Accepted, _) => {
@@ -480,6 +722,8 @@ impl Txn {
             "old": self.old,
             "rollback_to": self.rollback_to,
             "rollback_enabled": self.rollback_enabled,
+            "ever_matched": self.ever_matched,
+            "data_ok": self.data_ok,
             "age_ms": now.saturating_sub(self.created_ms),
             "remaining_ms": remaining,
         })

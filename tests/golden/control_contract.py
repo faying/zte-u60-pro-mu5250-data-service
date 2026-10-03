@@ -12,7 +12,7 @@ E4 有意改变的行为（write-op-layer.md「旧客户端」、D14，T2），�
 4. 描述表里的动作（network.set_mode）的旧请求在执行者队列满时不回 503：回和今天一样的成功、排队执行。
 5. 事务进行中（锁被占）：旧请求「关数据」马上生效、回复逐字节同锁空时；进行中的事务记 preempted。
 6. 事务进行中：同一项的旧请求当覆盖写，回复逐字节同今天；别的来源的新写回 409 busy，说清谁在做什么。
-7. 「立即退回」：退回写下去并确认，终态 rolled_back/user_revert。
+7. 「立即退回」：退回写下去并确认，终态 rolled_back/user_revert；数据开着、蜂窝接口探测不通时不确认（T4）。
 8. 跨进程写锁（D29）：别人（应急直写脚本）拿着 flock 时，datad 的写等它放；只读的不等。
 SPDX-License-Identifier: MIT
 """
@@ -29,6 +29,7 @@ import urllib.request
 PORT = int(sys.argv[1])
 FAIL_FILE = sys.argv[2]
 WRITE_LOCK = sys.argv[3]
+DATA_OFF = sys.argv[4]
 SET_MODE = '{"action":"network.set_mode","params":{"mode":"WL_AND_5G"}}'
 BAND = '{"action":"band.set_lte","params":{"bands":"1,3"}}'
 BUSY_BODY = b'{"action":"band.set_lte","error":{"code":"busy","message":"control queue full"},"ok":false}'
@@ -196,13 +197,23 @@ def legacy_same_item_and_busy() -> None:
 
 
 def user_revert() -> None:
-    """E4（7）：mock 的读回永远是 WL_AND_5G，所以退回一写就能确认。"""
+    """E4（7）：mock 的读回永远是 WL_AND_5G，所以退回一写读回就对上了。
+    数据开着时还要在蜂窝接口上探测通，mock 的接口 fixture0 不存在、探测永远失败，退回确认不了；
+    把数据关掉（不应当有数据）才按读回 + 注册确认，也不发探测。"""
     op_id = take_lock()
-    status, raw = post({"action": "op.revert", "params": {"op_id": op_id}})
-    if status != b"HTTP/1.1 200 OK" or json.loads(raw)["result"]["phase"] != "rolling_back":
-        fail("op.revert 回复不对：%r %r" % (status, raw))
-    s = wait_final(op_id)
-    if (s["phase"], s["reason"]) != ("rolled_back", "user_revert"):
+    time.sleep(1)
+    s = op_status(op_id)
+    if s["phase"] != "verifying" or s["data_ok"] is not False:
+        fail("数据开着、探测不通时不该确认：%r" % s)
+    open(DATA_OFF, "w").close()
+    try:
+        status, raw = post({"action": "op.revert", "params": {"op_id": op_id}})
+        if status != b"HTTP/1.1 200 OK" or json.loads(raw)["result"]["phase"] != "rolling_back":
+            fail("op.revert 回复不对：%r %r" % (status, raw))
+        s = wait_final(op_id)
+    finally:
+        os.remove(DATA_OFF)
+    if (s["phase"], s["reason"]) != ("rolled_back", "user_revert") or s["data_ok"] is not True:
         fail("立即退回的终态不对：%r" % s)
     status, raw = post({"action": "op.revert", "params": {"op_id": op_id}})
     if status != b"HTTP/1.1 409 Conflict":

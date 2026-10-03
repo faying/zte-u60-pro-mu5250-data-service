@@ -2,6 +2,7 @@
 //!
 //! - `txn`：事务状态机（纯逻辑）。
 //! - `spec`：动作描述表（T2 只有网络模式）和安全类写的判断。
+//! - `probe`：确认用的 DNS 探测，绑定蜂窝接口（T4）。
 //! - `pending`：`pending.json` 落盘和 `takeover` 标记。
 //! - `engine`：锁、覆盖/插队、确认驱动、续跑、旧请求队列。
 //! - `write_lock`：跨进程写锁（flock，和应急直写脚本互斥，D29）。
@@ -12,6 +13,7 @@
 
 pub mod engine;
 pub mod pending;
+pub mod probe;
 pub mod spec;
 pub mod txn;
 pub mod write_lock;
@@ -20,7 +22,7 @@ use crate::executor::Executor;
 use serde_json::{Value, json};
 use spec::{NETWORK_MODE, Spec};
 use std::{path::PathBuf, time::Instant};
-use txn::{Reading, SimId};
+use txn::{Conn, DataPath, ProbeTarget, Reading, SimId};
 
 pub use engine::{Config, Engine, LegacyGate, Request, Submit, WriteError};
 pub use txn::Source;
@@ -71,10 +73,123 @@ fn registered(network_type: &str) -> bool {
         .any(|w| u.contains(w))
 }
 
+/// 和首页（`screen.rs`）同一个判断：空、`Home`、`home`、`0` 都不算漫游；空的另外算「不知道」。
+fn roaming(net: &Value) -> Option<bool> {
+    let r = text(net, "simcard_roam");
+    (!r.is_empty()).then(|| r != "Home" && r != "home" && r != "0")
+}
+
+/// `connect_status` 是已连接：`ipv4_connected`、`ipv4_ipv6_connected` 这类；`disconnected` 不算
+/// （和 agent netwatch 的 `wan_connected` 一致）。
+fn connected(status: &str) -> bool {
+    status.ends_with("connected") && !status.contains("disconnect")
+}
+
+fn flag(v: &Value, key: &str) -> Option<bool> {
+    match text(v, key).as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// 数据通路：`get_wwaniface`（开关、连接状态、接口）+ netifd 的 `zte_wan`（IPv4、连上多久、DNS）+
+/// nwinfo 的漫游。`now_ms` 用来把 uptime 秒数换成连接的起点。
+fn data_path(
+    net: &Value,
+    wwan: &Value,
+    wan: &Value,
+    uci_dns: Option<String>,
+    now_ms: u64,
+) -> DataPath {
+    let expected = match (
+        flag(wwan, "enable"),
+        flag(wwan, "roam_enable"),
+        roaming(net),
+    ) {
+        (Some(false), _, _) => Some(false),
+        (Some(true), _, Some(false)) => Some(true),
+        (Some(true), Some(roam_on), Some(true)) => Some(roam_on),
+        _ => None,
+    };
+    let ipv4 = wan
+        .get("ipv4-address")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .map(|a| text(a, "address"))
+        .unwrap_or_default();
+    let up_since_ms = wan
+        .get("uptime")
+        .and_then(Value::as_u64)
+        .map(|secs| now_ms.saturating_sub(secs * 1000));
+    let mut iface = text(wwan, "ipv4_dev_name");
+    if iface.is_empty() {
+        iface = text(wan, "l3_device");
+    }
+    let mut dns: Vec<String> = wan
+        .get("dns-server")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if dns.is_empty() {
+        // uci 里是 `'a' 'b'` 或空格分开的一串。
+        dns = uci_dns
+            .unwrap_or_default()
+            .split(|c: char| c == '\'' || c.is_whitespace())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    DataPath {
+        expected,
+        connected: connected(&text(wwan, "connect_status")),
+        conn: Conn { ipv4, up_since_ms },
+        iface,
+        dns,
+    }
+}
+
 fn sim_id(sim: &Value) -> SimId {
     SimId {
         iccid: text(sim, "sim_iccid"),
         slot: text(sim, "current_sim_slot").parse().unwrap_or(0),
+    }
+}
+
+impl UbusDevice {
+    /// 读不到 `get_wwaniface` 或 `zte_wan` 就是 None（这一拍不判断数据）。
+    async fn data(&self, net: &Value) -> Option<DataPath> {
+        let wwan = crate::state::ubus(
+            "zwrt_data",
+            "get_wwaniface",
+            json!({"source_module":"web","cid":1,"connect_status":""}),
+        )
+        .await
+        .ok()?;
+        let wan = crate::state::ubus("network.interface.zte_wan", "status", json!({}))
+            .await
+            .ok()?;
+        let no_dns = wan
+            .get("dns-server")
+            .and_then(Value::as_array)
+            .is_none_or(|a| a.is_empty());
+        let uci_dns = if no_dns {
+            Some(crate::state::uci_read("network.zte_wan.dns").await)
+        } else {
+            None
+        };
+        Some(data_path(
+            net,
+            &wwan,
+            &wan,
+            uci_dns,
+            engine::Device::now_ms(self),
+        ))
     }
 }
 
@@ -90,6 +205,8 @@ impl engine::Device for UbusDevice {
                     value: (!value.is_empty()).then_some(value),
                     registered: registered(&text(&net, "network_type")),
                     sim: sim_id(&sim),
+                    data: self.data(&net).await,
+                    probe: None,
                 })
             }
             other => Err(format!("no reader for {other}")),
@@ -133,6 +250,10 @@ impl engine::Device for UbusDevice {
         }
     }
 
+    async fn probe(&self, target: &ProbeTarget) -> Result<(), String> {
+        probe::dns(target).await
+    }
+
     fn now_ms(&self) -> u64 {
         let path =
             std::env::var("ZWRT_DATAD_UPTIME_PATH").unwrap_or_else(|_| "/proc/uptime".into());
@@ -171,6 +292,73 @@ mod tests {
         ] {
             assert!(!registered(t), "{t}");
         }
+    }
+
+    #[test]
+    fn connected_words() {
+        for s in ["ipv4_connected", "ipv6_connected", "ipv4_ipv6_connected"] {
+            assert!(connected(s), "{s}");
+        }
+        for s in ["", "disconnected", "ipv4_disconnected", "connecting"] {
+            assert!(!connected(s), "{s}");
+        }
+    }
+
+    fn wwan(enable: i64, roam: i64) -> Value {
+        json!({"enable":enable,"roam_enable":roam,"connect_status":"ipv4_ipv6_connected","ipv4_dev_name":"rmnet_data0"})
+    }
+
+    fn wan() -> Value {
+        json!({"uptime":30,"l3_device":"rmnet_data9","ipv4-address":[{"address":"10.1.2.3","mask":30}],"dns-server":["192.0.2.53","2001:db8::53"]})
+    }
+
+    #[test]
+    fn data_is_expected_only_with_the_switches_that_allow_it() {
+        let home = json!({"simcard_roam":"Home"});
+        let away = json!({"simcard_roam":"Roaming"});
+        let unknown = json!({});
+        let e = |net: &Value, w: Value| data_path(net, &w, &wan(), None, 100_000).expected;
+        assert_eq!(e(&home, wwan(1, 0)), Some(true));
+        assert_eq!(e(&home, wwan(0, 1)), Some(false));
+        assert_eq!(e(&away, wwan(1, 0)), Some(false));
+        assert_eq!(e(&away, wwan(1, 1)), Some(true));
+        assert_eq!(e(&away, wwan(0, 1)), Some(false));
+        // 不知道在不在漫游：不猜。
+        assert_eq!(e(&unknown, wwan(1, 0)), None);
+        assert_eq!(e(&home, json!({"roam_enable":0})), None);
+    }
+
+    #[test]
+    fn data_path_fields() {
+        let d = data_path(
+            &json!({"simcard_roam":"Home"}),
+            &wwan(1, 0),
+            &wan(),
+            None,
+            100_000,
+        );
+        assert!(d.connected);
+        assert_eq!(
+            d.conn,
+            Conn {
+                ipv4: "10.1.2.3".into(),
+                up_since_ms: Some(70_000)
+            }
+        );
+        // 接口按 get_wwaniface 报的，不是 netifd 的 l3_device。
+        assert_eq!(d.iface, "rmnet_data0");
+        assert_eq!(d.dns, ["192.0.2.53", "2001:db8::53"]);
+        let bare = data_path(
+            &json!({}),
+            &json!({"connect_status":"disconnected"}),
+            &json!({"l3_device":"rmnet_data0"}),
+            Some("'222.66.251.8' '116.236.159.8'".into()),
+            1_000,
+        );
+        assert!(!bare.connected);
+        assert_eq!(bare.iface, "rmnet_data0");
+        assert_eq!(bare.conn, Conn::default());
+        assert_eq!(bare.dns, ["222.66.251.8", "116.236.159.8"]);
     }
 
     #[test]
