@@ -829,7 +829,10 @@ async fn ops_route(app: &App, action: &str, body: &Value) -> Option<Response> {
         }
         _ => {}
     }
-    if let Err(e) = ops.session_gate(action, session_id(body).as_deref()) {
+    // 关数据 / 关漫游（D14）在会话期间也照做：在国外这是最要紧的写
+    if !crate::ops::spec::is_safety(action, params)
+        && let Err(e) = ops.session_gate(action, session_id(body).as_deref())
+    {
         return Some(session_err(e));
     }
     let spec = crate::ops::spec::find(action)?;

@@ -323,6 +323,12 @@ def netselect_session() -> None:
     status, raw = post({"action": "netselect.scan", "params": {}})
     if status != b"HTTP/1.1 400 Bad Request":
         fail("没有 source 的搜网应该 400：%r %r" % (status, raw))
+    status, raw = post({"action": "cellular.set", "source": "web", "params": {"enabled": 0}})
+    if status == b"HTTP/1.1 409 Conflict":
+        fail("会话期间关数据不该被挡（D14）：%r" % raw)
+    status, raw = post({"action": "cellular.set", "source": "web", "params": {"enabled": 1}})
+    if status != b"HTTP/1.1 409 Conflict":
+        fail("会话期间开数据应该 409：%r %r" % (status, raw))
     status, raw = post({"action": "sms.mark_read", "source": "auto", "params": {"ids": "1", "tag": 0}})
     if status == b"HTTP/1.1 409 Conflict":
         fail("会话期间短信已读不该被挡：%r" % raw)
