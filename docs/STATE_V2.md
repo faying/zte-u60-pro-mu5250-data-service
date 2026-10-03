@@ -281,7 +281,7 @@ datad 启动时把 pid 写进 `ZWRT_DATAD_PID_FILE`（默认 `/var/run/zwrt-data
 - `next_zh/_en`：倒计时那行，`{t}` 是占位，客户端按 `remaining_ms` 换成 `m:ss`（自动退回开：「{t} 后没通就退回到 X」；关：「还剩 {t} · 自动退回没开」；退回中：「退回到 X · 还剩 {t}」）；没有为 null。
 - `note_zh/_en`：「重启过 · 重新确认」（写之后整机重启过、还在等），否则 null。
 - `steps`：三行进度 `[{"key":"applied"|"registered"|"data","zh","en","done"}]`（设置已生效 / 已注册 / 数据）；退回中看的是退回目标。
-- `can_revert`、`can_keep`：现在点「退回 X」「保留 Y」有没有用（在等确认、没有在途的写）。
+- `can_revert`、`can_keep`：现在点「退回 X」「保留 Y」有没有用（在等确认、没有在途的写）；按钮文字 `revert_label_zh/_en`（退回自动 / Revert to Auto）、`keep_label_zh/_en`（保留只用 4G / Keep 4G only）。
 - `undo`：进行中为 null；结束了是 `{"ok", "label_zh/_en"（撤销/重做）, "why_zh/_en"（不能撤时的原因）, "value"}`（V2-36）。
 英文都是 ASCII、没有句号；首页大字 ≤ 10 个字符，所以进行中的英文不带省略号（Switching / Checking / Reverting）。
 `brief` 的结果只在这次连接里亲眼看到它结束时显示 3 秒（这个 op_id 在 `active` 里出现过，或者 `last.op_id` 在连接期间变了）；刚连上、刚重启拿到的第一份里的 `brief` 不显示（块里不带结束了多久）。
@@ -307,5 +307,9 @@ cancelled 里 sim_changed 不能（「换过卡」）、superseded 不能（「�
 
 **V2-39** busy 回复的 `doing` 加 `say_zh/_en`：「正在换制式（触屏发起，32 秒），稍等」/「Busy: network mode (Screen)」；搜网会话是「正在搜网」/「network search」。
 测试：`busy_reply_says_who_and_what`
+
+**V2-40** `/v2/screen` 顶层带 `exec_age_ms`（同心跳里的，V2-32）。触屏只轮询 `/v2/screen`、看不到心跳；这个请求读现成的快照、不经执行者，datad 卡住时照样回。
+触屏超过 20 秒就显示「数据服务没响应」、写控件变灰；没有这个字段（旧 datad）当不知道，不当卡住。
+测试：`screen_reply_carries_executor_age`
 
 不在 datad 的几行（客户端自己判断的）：「数据服务没响应」（心跳 `exec_age_ms`，V2-32）、「和设备断开了 · 操作结果未知」（网页）、改动记录的空和读不到，归触屏 T8、网页 T9 和术语表 T14。

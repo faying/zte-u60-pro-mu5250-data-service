@@ -265,6 +265,11 @@ pub fn view(t: &Txn, now: u64, ctx: Ctx) -> Value {
     put("note_zh", json!(note.map(|n| n.0)));
     put("note_en", json!(note.map(|n| n.1)));
     put("steps", steps);
+    // DD13：按钮写具体值（「退回自动」「保留只用 4G」），中文拼接规则只在这里。
+    put("revert_label_zh", json!(cat("退回", &x.0)));
+    put("revert_label_en", json!(format!("Revert to {}", x.1)));
+    put("keep_label_zh", json!(cat("保留", &y.0)));
+    put("keep_label_en", json!(format!("Keep {}", y.1)));
     put("can_revert", json!(can));
     put("can_keep", json!(can));
     put("undo", undo);

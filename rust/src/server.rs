@@ -508,12 +508,20 @@ async fn v2_screen(State(app): State<App>) -> Json<Value> {
     let state = serde_json::to_value(&snap).unwrap_or(Value::Null);
     // E4 T13（V2-34、V2-38）：叠在首页的和 op 在同一把锁里算。
     let (screen_op, op) = app.inner.ops.screen();
-    Json(serde_json::json!({
+    let net = crate::screen::net_view_op(&state, crate::cell_window::current(), screen_op.as_ref());
+    Json(screen_json(ts, net, op, app.inner.exec.exec_age_ms()))
+}
+
+/// `/v2/screen` 的回复。`exec_age_ms`（V2-40）：触屏不订阅 `/v2/events`、看不到心跳，
+/// 从这里判断 datad 卡没卡（这个请求读的是现成的快照，不经执行者，卡住时照样回）。
+fn screen_json(ts: i64, net: crate::screen::NetView, op: Value, exec_age_ms: u64) -> Value {
+    serde_json::json!({
         "v": crate::screen::SCREEN_VERSION,
         "ts": ts,
-        "net": crate::screen::net_view_op(&state, crate::cell_window::current(), screen_op.as_ref()),
+        "net": net,
         "op": op,
-    }))
+        "exec_age_ms": exec_age_ms,
+    })
 }
 
 async fn control(
@@ -1318,6 +1326,19 @@ async fn shutdown() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn screen_reply_carries_executor_age() {
+        let v = super::screen_json(
+            7,
+            crate::screen::NetView::default(),
+            serde_json::json!({"active": null}),
+            21_000,
+        );
+        assert_eq!(v["exec_age_ms"], 21_000);
+        assert_eq!(v["ts"], 7);
+        assert!(v["op"].is_object() && v["net"].is_object());
+    }
+
     use super::*;
     use std::collections::HashSet;
     #[test]

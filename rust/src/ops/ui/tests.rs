@@ -82,6 +82,14 @@ fn every_text_row_has_zh_and_en_within_budget() {
     assert_eq!(v["remaining_ms"], 102_000);
     assert_eq!(v["can_revert"], true);
     assert_eq!(v["can_keep"], true);
+    assert_eq!(
+        (s(&v, "revert_label_zh"), s(&v, "revert_label_en")),
+        ("退回自动", "Revert to Auto")
+    );
+    assert_eq!(
+        (s(&v, "keep_label_zh"), s(&v, "keep_label_en")),
+        ("保留只用 4G", "Keep 4G only")
+    );
     // DD6：自动退回关着
     let v = view(&txn(false), 2_000, Ctx::default());
     assert_eq!(s(&v, "next_zh"), "还剩 {t} · 自动退回没开");
