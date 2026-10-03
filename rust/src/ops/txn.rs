@@ -155,9 +155,12 @@ pub struct ProbeTarget {
     pub dns: Vec<String>,
 }
 
-/// D25：同一条连接最多探测失败 3 次，两次之间至少隔 5 秒。换了连接（重新拨号）重新算。
+/// D25：一轮最多探测失败 3 次，两次之间至少隔 5 秒。一轮都失败后，隔 30 秒再来一轮；换了连接
+/// （重新拨号）马上重新算。切换时 PDP 不断开的话连接身份不变，只靠时间重来，免得数据晚通就永远确认不了。
+/// 120 秒里最多约 4 轮 12 个查询（约 1.5 KB），通了就停。
 pub const PROBE_TRIES: u32 = 3;
 pub const PROBE_GAP_MS: u64 = 5_000;
+pub const PROBE_ROUND_GAP_MS: u64 = 30_000;
 
 /// 完整 SIM 身份（D32）：完整 ICCID + 卡槽。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -474,7 +477,7 @@ impl Txn {
 
     /// 这个读数要不要先做一次 DNS 探测（驱动在锁外做，结果填进 `Reading::probe` 再喂进来）。
     /// 只在别的条件都齐了才探测：读回 = 正在等的值、已注册、SIM 没变、应当有数据、已连接有 IPv4
-    /// （APN 还要新连接）。同一条连接失败满 3 次就不再探测；两次之间至少隔 5 秒。
+    /// （APN 还要新连接）。一轮失败满 3 次，同一条连接上要隔 30 秒才来下一轮；两次之间至少隔 5 秒。
     pub fn wants_probe(&self, r: &Reading, now: u64) -> Option<ProbeTarget> {
         if !self.waiting() || self.intent.is_some() || !r.registered {
             return None;
@@ -490,25 +493,30 @@ impl Txn {
             _ => return None,
         };
         let conn = &r.data.as_ref()?.conn;
-        if self.probe_conn.as_ref().is_some_and(|c| c.same(conn)) && self.probe_fails >= PROBE_TRIES
-        {
-            return None;
-        }
+        let round_over = self.probe_conn.as_ref().is_some_and(|c| c.same(conn))
+            && self.probe_fails >= PROBE_TRIES;
+        let gap = if round_over {
+            PROBE_ROUND_GAP_MS
+        } else {
+            PROBE_GAP_MS
+        };
         if self
             .probe_last_ms
-            .is_some_and(|t| now.saturating_sub(t) < PROBE_GAP_MS)
+            .is_some_and(|t| now.saturating_sub(t) < gap)
         {
             return None;
         }
         Some(target)
     }
 
-    /// 记下探测结果；换了连接就重新计数。
+    /// 记下探测结果；换了连接、或上一轮已经用完（这是新的一轮），就重新计数。
     fn note_probe(&mut self, r: &Reading, now: u64) {
         let (Some(ok), Some(d)) = (r.probe, &r.data) else {
             return;
         };
-        if !self.probe_conn.as_ref().is_some_and(|c| c.same(&d.conn)) {
+        if !self.probe_conn.as_ref().is_some_and(|c| c.same(&d.conn))
+            || self.probe_fails >= PROBE_TRIES
+        {
             self.probe_conn = Some(d.conn.clone());
             self.probe_fails = 0;
         }

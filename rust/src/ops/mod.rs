@@ -86,6 +86,9 @@ fn connected(status: &str) -> bool {
 }
 
 fn flag(v: &Value, key: &str) -> Option<bool> {
+    if let Some(b) = v.get(key).and_then(Value::as_bool) {
+        return Some(b);
+    }
     match text(v, key).as_str() {
         "1" | "true" => Some(true),
         "0" | "false" => Some(false),
@@ -326,6 +329,15 @@ mod tests {
         // 不知道在不在漫游：不猜。
         assert_eq!(e(&unknown, wwan(1, 0)), None);
         assert_eq!(e(&home, json!({"roam_enable":0})), None);
+        // 布尔、字符串写法都认
+        assert_eq!(
+            e(&away, json!({"enable":true,"roam_enable":false})),
+            Some(false)
+        );
+        assert_eq!(
+            e(&away, json!({"enable":"1","roam_enable":"1"})),
+            Some(true)
+        );
     }
 
     #[test]

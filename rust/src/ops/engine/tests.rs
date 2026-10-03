@@ -279,8 +279,9 @@ async fn connected_but_dns_dead_rolls_back() {
     assert_eq!(end(&fin), pair("rolled_back", "timeout"));
     assert_eq!(fin["ever_matched"], true);
     assert_eq!(dev.s().writes, ["Only_LTE", "WL_AND_5G"]);
-    // 新设置上最多探测 3 次（同一条连接），退回后再探测一次就通了
-    assert_eq!(dev.s().probes.len(), 4);
+    // 新设置上：每拍 2 秒，第 2、8、14 秒一轮，隔 30 秒在 44、50、56 秒，再在 86、92、98 秒，
+    // 下一轮 128 秒已过 120 秒的时限 → 9 次；退回后再探测一次就通了
+    assert_eq!(dev.s().probes.len(), 10);
 }
 
 #[tokio::test(start_paused = true)]

@@ -485,7 +485,7 @@ impl<D: Device> Engine<D> {
         self.kick_legacy();
     }
 
-    /// 探测失败只在一条连接上第一次失败、和失败满次数时各记一行（契约测试里每拍都会失败）。
+    /// 探测失败每轮只在第一次失败、和失败满次数时各记一行（契约测试里每拍都会失败）。
     fn log_probe_failure(&self, op_id: &str, target: &ProbeTarget, e: &str) {
         let fails = {
             let mut st = self.lock();
@@ -494,7 +494,7 @@ impl<D: Device> Engine<D> {
                 None => return,
             }
         };
-        // 这次失败还没记进事务，fails 是之前的次数。满次数的连接不会再探测，所以 fails 已满 = 换了连接。
+        // 这次失败还没记进事务，fails 是之前的次数；已满 = 新的一轮或换了连接（会重新计数）。
         let first = fails == 0 || fails >= txn::PROBE_TRIES;
         if first || fails + 1 == txn::PROBE_TRIES {
             eprintln!(
@@ -505,7 +505,7 @@ impl<D: Device> Engine<D> {
                     &target.iface
                 },
                 if fails + 1 == txn::PROBE_TRIES {
-                    "; no more probes on this connection"
+                    "; next round in 30 s"
                 } else {
                     ""
                 }

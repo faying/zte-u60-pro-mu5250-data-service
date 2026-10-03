@@ -538,7 +538,7 @@ fn connected_but_probe_fails_is_not_confirmed() {
         feed(&mut t, live("Only_LTE", c.clone()), false, 13_000),
         (Next::Wait, true)
     );
-    // 同一条连接失败满 3 次，不再探测
+    // 一轮失败满 3 次：同一条连接上 30 秒内不再探测
     assert_eq!(t.probe_fails, PROBE_TRIES);
     assert_eq!(
         feed(&mut t, live("Only_LTE", c.clone()), true, 30_000),
@@ -547,6 +547,28 @@ fn connected_but_probe_fails_is_not_confirmed() {
     // 对上过、数据一直不通：到点按没通处理，不算 not_applied
     assert_eq!(t.on_tick(1_000 + D), Next::Done);
     assert_eq!(end(&t), (Phase::Unverified, Some(Reason::NoRollback)));
+}
+
+#[test]
+fn pdp_kept_and_data_late_still_confirms() {
+    // 换制式时 PDP 没断（连接身份一直不变），前十几秒基带在重新附着、探测不通，过一会才通
+    let mut t = txn(false);
+    let kept = conn("10.0.0.1", 500);
+    for now in [3_000, 8_000, 13_000] {
+        assert_eq!(
+            feed(&mut t, live("Only_LTE", kept.clone()), false, now),
+            (Next::Wait, true)
+        );
+    }
+    assert_eq!(
+        feed(&mut t, live("Only_LTE", kept.clone()), true, 20_000),
+        (Next::Wait, false)
+    );
+    assert_eq!(
+        feed(&mut t, live("Only_LTE", kept.clone()), true, 43_000),
+        (Next::Done, true)
+    );
+    assert_eq!(end(&t), (Phase::Confirmed, Some(Reason::Verified)));
 }
 
 #[test]
