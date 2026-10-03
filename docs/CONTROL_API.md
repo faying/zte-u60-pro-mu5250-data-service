@@ -100,6 +100,13 @@ Wi-Fi（E4 T7b，zte-agent 的 Wi-Fi 页、热点开关、情景、家庭模式�
 | `wifi.apply` | `set`（uci 路径 → 值，1–32 项）、`reload?`（默认 true）、`best_effort?` | 只认 `wireless.{main,guest}_{2g,5g}.{ssid,key,encryption,hidden,isolate,disabled,guest_active_time}`、`wireless.wifi{0,1}.{country,channel,txpowerpercent,htmode,disabled}`、`zte_mbb.wifi.{wifi_onoff,wifi6_switch}`。值和 uci 一样也照写，每个包 commit 一次，再 reload 一次（agent 靠「总是写 + reload + 自己轮询 hostapd」重试修复，不看这里的回复判断成没成）。`best_effort` 时设不上的项跳过并列在 `skipped`。回 `{committed, skipped, reloaded, reload_error}` |
 | `wifi.reload` | — | 只 `zwrt_wlan reload` |
 
+其余原厂设置（E4 T7c，zte-agent 的路由、SIM PIN、STC、省电、快速开机、充电宝、自动休眠、恢复出厂、原样发短信）：
+
+| action | params | 说明 |
+|---|---|---|
+| `vendor.call` | `object`、`method`、`args?`（对象，≤ 8 KB） | 只做 `control.rs` 的 `VENDOR_CALLS` 表里的 (对象, 方法)，`args` 原样交给原厂（和 agent 以前直接调的一样）。流水账里 PIN/PUK/NCK 类字段写 `(changed)`，短信方法不记参数；恢复出厂、`system reboot` 先记 requested 并落盘再做。会话期间不挡（短信转发不能被挡）。FOTA 相关的永远不进表 |
+| `dns.doh` | `enabled`（布尔） | agent 的 DoH：写 / 删 `/tmp/dnsmasq.d/doh.conf`（转发到 127.0.0.1:5353），关的时候再去掉 `dhcp.lan_dns` 的 server/noresolv，重启 dnsmasq |
+
 AT 只发这两条固定命令。AT 口和 zte-agent 共用，两边都拿 `ZWRT_DATAD_AT_LOCK`（默认 `/var/run/u60-at.lock`，flock）；口是 `ZWRT_DATAD_AT_PORT`，没设就按 agent 的顺序找第一个回 OK 的。等到 OK/ERROR 就停，最多 6 秒。
 
 **流水账**（T5）：`ZWRT_DATAD_OPS_DIR` 下的 `journal.jsonl`，每行一个 JSON，带 `ts`（unix 秒）和 `t`（设备时钟的年月日时分秒，设备时钟本来就是当地时间）。会改设备的 `/control` 动作都记一行（`sms.mark_read` 不记）：事务结束时记 op_id、来源、SIM（ICCID 后 4 位/卡槽）、旧值、新值、退回目标、读回、终态和原因；不走事务的写记动作、来源（没有 source 记 `legacy`）、参数、`ok`/`failed` 和 HTTP 状态；旧请求队列的排队、被替换、丢掉也各记一行；重启、关机在执行前先记 `requested` 并等它写进闪存。密码类字段（Wi-Fi 密码、APN 用户名/密码、eSIM 激活码/确认码、PIN 等）只写 `(changed)`；ICCID、EID、IMSI、号码类字段只留后 4 位；短信动作不记参数。同一来源 + 同一项 + 同一原因的 `skipped` 只记开头一行（`skip:start`）和结束一行（`skip:end`，`count` = 一共跳过几次；原因变了，或这个来源对这一项有了别的记录时结束；计数在内存里，datad 重启时进行中的那段丢掉）。文件超过 `ZWRT_DATAD_JOURNAL_MAX_BYTES`（默认 262144）就改名为 `journal.1.jsonl`，两份合计不超过约 2 倍上限；单行最长 2 KB。`owners.json` 记每一项最后是谁写的（screen/web/legacy 的 `user` 为 true），流水账滚掉也不丢。

@@ -144,6 +144,30 @@ fn redaction_rules() {
     );
     assert_eq!(p["apn"], "internet");
     assert_eq!(redact("sms.delete", &json!({"ids":"1,2"})), Value::Null);
+    // SIM PIN / 网络锁码（vendor.call 原样带的原厂字段名）
+    let p = redact(
+        "vendor.call",
+        &json!({"object":"zwrt_zte_mdm.api","method":"sim_change_pin","args":{"pin_num":"1234","new_pin_num":"5678","pin_num_m":"1111","nck":"99887766","pin_mode":"1","pin_encode_flag":"0"}}),
+    );
+    for k in ["pin_num", "new_pin_num", "pin_num_m", "nck"] {
+        assert_eq!(p["args"][k], REDACTED, "{k}");
+    }
+    assert_eq!(
+        (
+            p["args"]["pin_mode"].as_str(),
+            p["args"]["pin_encode_flag"].as_str()
+        ),
+        (Some("1"), Some("0"))
+    );
+    assert_eq!(p["method"], "sim_change_pin");
+    // 原样发的短信：号码、内容都不记
+    assert_eq!(
+        redact(
+            "vendor.call",
+            &json!({"object":"zwrt_wms","method":"zte_libwms_send_sms","args":{"number":"+8613800000000","message_body":"x"}})
+        ),
+        Value::Null
+    );
     // 空值不写成「已改」
     assert_eq!(
         redact("apn.add", &json!({"password":null}))["password"],

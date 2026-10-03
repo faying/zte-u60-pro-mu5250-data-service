@@ -85,6 +85,46 @@ pub const E4_ACTIONS: &[&str] = &[
     "apn.set_pdp_type",
     "wifi.apply",
     "wifi.reload",
+    "vendor.call",
+    "dns.doh",
+];
+
+/// E4 T7c：其余原厂设置的写，参数原样交给原厂（和 agent 以前直接调的一样），
+/// 只是改由 datad 一家写、记流水账。一个 (对象, 方法) 一行，不在表里的一律拒。
+pub const VENDOR_CALLS: &[(&str, &str)] = &[
+    // 路由（网页的路由页）
+    ("zwrt_router.api", "router_set_lan_para"),
+    ("zwrt_router.api", "router_set_wan_dns"),
+    ("zwrt_router.api", "router_set_firewall_switch"),
+    ("zwrt_router.api", "router_set_firewall_level"),
+    ("zwrt_router.api", "router_set_nat_switch"),
+    ("zwrt_router.api", "router_set_dmz"),
+    ("zwrt_router.api", "router_set_upnp_switch"),
+    ("zwrt_router.api", "router_set_portforward"),
+    ("zwrt_router.api", "router_set_portforward_switch"),
+    ("zwrt_router.api", "router_set_alg_switch"),
+    ("zwrt_router.api", "router_set_qos_switch"),
+    ("zwrt_router.api", "router_set_domain_filter"),
+    // SIM PIN / 网络锁（流水账里 PIN、PUK、NCK 只写已改）
+    ("zwrt_zte_mdm.api", "sim_verify_pin_puk"),
+    ("zwrt_zte_mdm.api", "sim_change_pin"),
+    ("zwrt_zte_mdm.api", "sim_change_pin_mode"),
+    ("zwrt_zte_mdm.api", "set_simlock_nck"),
+    // STC 小区锁、信号检测
+    ("zte_nwinfo_api", "nwinfo_set_stc_white_list_par"),
+    ("zte_nwinfo_api", "nwinfo_stc_cell_lock_enable"),
+    ("zte_nwinfo_api", "nwinfo_stc_cell_lock_disable"),
+    ("zte_nwinfo_api", "nwinfo_stc_cell_lock_reset"),
+    ("zte_nwinfo_api", "nwinfo_start_detect_signal_quality"),
+    ("zte_nwinfo_api", "nwinfo_end_detect_signal_quality"),
+    // 设备
+    ("zwrt_mc.device.manager", "set_device_info"),
+    ("zwrt_mc.device.manager", "device_reset"),
+    ("system", "reboot"),
+    ("zwrt_bsp.powerbank", "set"),
+    ("zwrt_zte_sleep_faw.wakelock", "enableAutoSleep"),
+    // 短信：agent 原样发的那种（sms.send_raw 会加密、固定 UNICODE，和它不一样）
+    ("zwrt_wms", "zte_libwms_send_sms"),
 ];
 
 fn object(params: &Value) -> &Map<String, Value> {
@@ -262,6 +302,8 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         "apn.set_pdp_type" => apn_pdp_type(params).await,
         "wifi.apply" => wifi_apply(params).await,
         "wifi.reload" => call("zwrt_wlan", "reload", json!({})).await,
+        "vendor.call" => vendor_call(params).await,
+        "dns.doh" => dns_doh(params).await,
         "band.reset" => {
             call(
                 "zte_nwinfo_api",
@@ -991,6 +1033,48 @@ async fn wifi_apply(params: &Value) -> Outcome {
         "reloaded": reload && !packages.is_empty() && reload_error.is_null(),
         "reload_error": reload_error,
     }))
+}
+
+/// `vendor.call {object, method, args}`：表里的原厂调用，`args`（对象）原样交过去。
+async fn vendor_call(params: &Value) -> Outcome {
+    let (object_name, method) = match (
+        string(params, "object", true),
+        string(params, "method", true),
+    ) {
+        (Ok(Some(o)), Ok(Some(m))) => (o, m),
+        (Err(e), _) | (_, Err(e)) => return Outcome::Invalid(e),
+        _ => return Outcome::Invalid("missing object or method".into()),
+    };
+    if !VENDOR_CALLS.contains(&(object_name.as_str(), method.as_str())) {
+        return Outcome::Invalid(format!(
+            "not a vendor call datad makes: {object_name} {method}"
+        ));
+    }
+    let args = match object(params).get("args") {
+        None | Some(Value::Null) => json!({}),
+        Some(v @ Value::Object(_)) if v.to_string().len() <= 8192 => v.clone(),
+        Some(_) => return Outcome::Invalid("args must be an object (at most 8 KB)".into()),
+    };
+    call(&object_name, &method, args).await
+}
+
+/// DoH 转发（agent 的 DoH 代理在 127.0.0.1:5353）：打开 = 写 dnsmasq 的 drop-in 再重启
+/// dnsmasq；关掉 = 删掉它、去掉 `dhcp.lan_dns` 的 server/noresolv、重启。命令全是固定的。
+async fn dns_doh(params: &Value) -> Outcome {
+    let enabled = match boolean(params, "enabled") {
+        Ok(v) => v,
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let script = if enabled {
+        "printf 'server=127.0.0.1#5353\\nno-resolv\\n' > /tmp/dnsmasq.d/doh.conf; /etc/init.d/dnsmasq restart"
+    } else {
+        "rm -f /tmp/dnsmasq.d/doh.conf; uci delete dhcp.lan_dns.server 2>/dev/null; uci delete dhcp.lan_dns.noresolv 2>/dev/null; uci commit dhcp; /etc/init.d/dnsmasq restart"
+    };
+    match crate::command::run("sh", ["-c", script], std::time::Duration::from_secs(8)).await {
+        Ok(_) => Outcome::Ok(json!({"enabled": enabled})),
+        // agent 以前也不看结果：配置文件写了就算，dnsmasq 重启失败如实说
+        Err(e) => Outcome::Failed(format!("dnsmasq: {e}")),
+    }
 }
 
 async fn revert_wireless(error: String) -> Outcome {
@@ -2205,6 +2289,35 @@ async fn qos_clear() -> Outcome {
 #[cfg(test)]
 mod wifi_apply_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn vendor_call_only_listed_pairs() {
+        for (o, m) in [
+            ("zwrt_router.api", "router_get_dmz"),
+            ("zte_nwinfo_api", "nwinfo_set_netselect"),
+            ("zwrt_zte_dm", "set_update_mode"),
+            ("system", "exec"),
+        ] {
+            assert!(
+                matches!(
+                    vendor_call(&json!({"object":o,"method":m,"args":{}})).await,
+                    Outcome::Invalid(_)
+                ),
+                "{o} {m}"
+            );
+        }
+        assert!(matches!(
+            vendor_call(&json!({"object":"zwrt_router.api","method":"router_set_dmz","args":"x"}))
+                .await,
+            Outcome::Invalid(_)
+        ));
+        // FOTA 永远不在表里（硬规则）
+        assert!(
+            !VENDOR_CALLS
+                .iter()
+                .any(|(o, m)| o.contains("_dm") || m.contains("update"))
+        );
+    }
 
     #[test]
     fn only_listed_options() {

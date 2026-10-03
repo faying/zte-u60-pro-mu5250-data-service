@@ -391,7 +391,13 @@ fn civil(secs: u64) -> String {
 
 /// 密码类字段只写 `(changed)`，SIM 身份类字段只留后 4 位；短信动作不记参数（号码、内容）。
 pub fn redact(action: &str, params: &Value) -> Value {
-    if action.starts_with("sms.") {
+    if action.starts_with("sms.")
+        || (action == "vendor.call"
+            && params
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains("sms")))
+    {
         return Value::Null;
     }
     redact_value(params)
@@ -414,6 +420,12 @@ fn secret(key: &str) -> bool {
         ]
         .iter()
         .any(|w| k.contains(w))
+        // SIM PIN 和网络锁码：pin_num、new_pin_num、pin_num_m、nck（pin_mode、
+        // pin_encode_flag 这类说明不是码）
+        || k.split('_').any(|seg| seg == "nck")
+        || (k.split('_').any(|seg| seg == "pin")
+            && !k.ends_with("_mode")
+            && !k.ends_with("_flag"))
 }
 
 /// SIM 身份类字段（ICCID、EID、IMSI、号码）只留后 4 位（D32：流水账只显示后 4 位）。

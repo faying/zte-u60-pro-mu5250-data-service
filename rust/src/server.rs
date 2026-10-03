@@ -605,16 +605,17 @@ async fn control_job(app: App, action: String, body: Value) -> Response {
         None
     };
     let journal = writes.then(|| JournalWrite::new(&action, &body)).flatten();
-    // 重启、关机：先把这一行写进闪存再做（之后没机会了）。
+    let ends = ends_device(&action, &body);
+    // 重启、关机、恢复出厂：先把这一行写进闪存再做（之后没机会了）。
     if let Some(j) = &journal
-        && matches!(action.as_str(), "device.reboot" | "device.poweroff")
+        && ends
     {
         j.line(&app, "requested", None);
         app.inner.ops.record().flush().await;
     }
     let response = control_task(app.clone(), &action, body).await;
     if let Some(j) = &journal
-        && !matches!(action.as_str(), "device.reboot" | "device.poweroff")
+        && !ends
     {
         let ok = response.status().is_success();
         j.line(
@@ -900,6 +901,20 @@ fn op_error(
         body[k] = v;
     }
     (status, Json(body)).into_response()
+}
+
+/// 做完设备就没了（重启、关机、恢复出厂）：流水账先记 requested 并落盘。
+fn ends_device(action: &str, body: &Value) -> bool {
+    if matches!(action, "device.reboot" | "device.poweroff") {
+        return true;
+    }
+    let p = &body["params"];
+    action == "vendor.call"
+        && matches!(
+            (p["object"].as_str(), p["method"].as_str()),
+            (Some("zwrt_mc.device.manager"), Some("device_reset"))
+                | (Some("system"), Some("reboot"))
+        )
 }
 
 /// 只读、不改设备的动作：不清慢数据缓存、不标块（`sms.list_after` 翻页时每页一次，清缓存会让下一轮全部重读）。
