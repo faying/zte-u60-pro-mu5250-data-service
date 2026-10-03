@@ -176,9 +176,16 @@ fn mapped(params: &Value, specs: &[(&str, &str, bool, bool)]) -> Result<Value, S
     Ok(Value::Object(args))
 }
 async fn call(service: &str, method: &str, args: Value) -> Outcome {
-    match state::ubus(service, method, args).await {
+    write_outcome(crate::executor::call(service, method, &args).await)
+}
+
+/// 原厂有的写成功时什么都不回（`nwinfo_set_netselect`、`zwrt_wlan reload`，E4 T12 真机 B31），
+/// 这不算失败：结果靠之后的读回（事务）或调用方自己回读。
+fn write_outcome(reply: Result<Value, crate::ubus::client::UbusError>) -> Outcome {
+    match reply {
         Ok(value) => Outcome::Ok(value),
-        Err(error) => Outcome::Failed(error),
+        Err(crate::ubus::client::UbusError::NoData { .. }) => Outcome::Ok(json!({})),
+        Err(error) => Outcome::Failed(error.to_string()),
     }
 }
 async fn mapped_call(
@@ -2633,6 +2640,19 @@ mod tests {
             );
         }
         assert!(direct_supply_enabled(&json!({})).is_err());
+    }
+    #[test]
+    fn empty_write_reply_is_ok() {
+        use crate::ubus::client::UbusError;
+        let no_data = Err(UbusError::NoData {
+            object: "zte_nwinfo_api".into(),
+            detail: "invalid ubus JSON".into(),
+        });
+        assert!(matches!(write_outcome(no_data), Outcome::Ok(v) if v == json!({})));
+        assert!(matches!(
+            write_outcome(Err(UbusError::Io("exited with exit status: 1".into()))),
+            Outcome::Failed(_)
+        ));
     }
     #[test]
     fn direct_supply_write_reply_empty_ok_errors_fail() {
