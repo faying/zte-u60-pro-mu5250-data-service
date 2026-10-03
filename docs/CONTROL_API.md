@@ -47,6 +47,31 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
 `cellular.set` 会先读取完整 `get_wwaniface` 对象，再覆盖调用方提供的字段，避免固件清空未指定的 PDP、配置档案等属性。
 
+## 事务（E4 写操作层）
+
+设计见 manager `docs/designs/write-op-layer.md`。目前只有 `network.set_mode` 走事务（`rust/src/ops/spec.rs` 的描述表），其余动作照旧。
+
+**新客户端**在请求顶层带 `source`（`screen`、`web`、`legacy`、`guard`、`scenario`、`scheduler`、`auto`），可选 `op_id`（1–64 个字母、数字、`.`、`_`、`-`；同一个 op_id 重发只回现有状态）和 `undo`：
+
+```json
+{"action":"network.set_mode","source":"screen","op_id":"screen-42","params":{"mode":"Only_LTE"}}
+```
+
+- 写之前读当前值和 SIM（完整 ICCID + 卡槽），写之后按新鲜读数确认：配置读回 = 目标值且已注册。成功回 200 `{"ok":true,"action":…,"result":<原厂回复>,"op":<状态>}`；写调用报错回 502，`op` 照样带上（事务按读回判断）；写之前读不到当前值回 502，没动设备。
+- 同一时刻只有一个进行中的事务。别的写回 **409** `{"error":{"code":"busy"},"doing":{op_id,action,source,phase,age_ms}}`。能插队的：同一项的用户写（screen/web/legacy）和 guard（旧事务记 `superseded`，新事务的退回目标继承旧事务的）、关数据/关漫游（`cellular.set` 只含 `enabled`/`roaming` 且都为关，旧事务记 `preempted`）。
+- 到点没确认：自动退回默认关（`ZWRT_DATAD_ROLLBACK=1` 才开），关着时以 `unverified/no_rollback` 结束；读回从没变成目标值以 `not_applied/ignored` 结束（不退回）。
+- 状态（`op`）：`phase` 为 `accepted`、`applying`、`verifying`、`rolling_back` 或终态 `confirmed`、`unverified`、`rolled_back`、`not_applied`、`rollback_failed`、`cancelled`；`reason` 见设计稿「状态表」，另有 `sim_changed`（D32）、`reboot_loop`（D13）。
+
+| action | params | 说明 |
+|---|---|---|
+| `op.status` | `op_id?` | 指定的，或当前/最近结束的事务；没有为 `null` |
+| `op.revert` | `op_id` | 立即退回（自动退回关着也能用）；不在等确认时回 409 `invalid_state` |
+| `op.keep` | `op_id` | 保留现状，取消退回，记 `confirmed/user_keep` |
+
+**旧请求**（没有 `source`）回复和以前逐字节相同。事务进行中：同一项的旧请求当覆盖写照常执行；描述表里的其他旧请求回成功（`{"result":"success"}`）并进旧请求队列，锁空出来再执行（每项只留最新、120 秒过期、关数据或重启时清空）。描述表里的动作在执行者队列满时也这样处理，不回 503；旧的关数据请求在队列满时作为内部任务马上执行。
+
+进行中的事务落盘在 `ZWRT_DATAD_OPS_DIR`（默认 `/data/u60-ops`，空串 = 不落盘）的 `pending.json`：datad 重启接着确认；整机重启后时限重新计，第 2 次开机仍未确认或累计等待超过时限就马上退回；目录里有 `takeover` 标记（应急直写留下的）就放弃。其他环境变量：`ZWRT_DATAD_OP_POLL_MS`（确认时读设备的间隔，默认 2000）、`ZWRT_DATAD_LEGACY_TTL_MS`（默认 120000）、`ZWRT_DATAD_DEADLINE_NETWORK_MODE_MS`（默认 120000）。
+
 ## WiFi, LAN And Clients
 
 | action | params |

@@ -9,6 +9,7 @@ mod extra_wifi;
 mod model;
 mod neighbor;
 mod neighbor_manager;
+mod ops;
 mod qos;
 mod screen;
 mod server;

@@ -13,6 +13,9 @@ jobs:
     defaults:
       run:
         working-directory: rust
+    env:
+      # E4 事务落盘目录：测试里不落盘（各脚本需要时自己指定临时目录）
+      ZWRT_DATAD_OPS_DIR: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0

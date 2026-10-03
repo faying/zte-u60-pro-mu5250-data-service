@@ -8,7 +8,7 @@
 # 发每个 /control 请求：每个动作的成功回复、参数不对的回复、ubus 调用失败时的回复，外加请求层面的错误。
 # 旧触屏只靠这些回复工作（data.c 的 control_reap 看状态码 503），E4 改 /control 时它们不能变。
 # 只把临时目录路径和时间字段（normalize.py）换成占位符，其余原样比。
-# 之后再跑两条契约（control_contract.py）：请求挂起到做完才回复；队列满时 503 的回复体。
+# 之后跑 control_contract.py：挂起到做完才回复、队列满时 503 的回复体，以及 E4 有意改变的几条旧请求行为。
 # 依赖：sh、curl、python3、openssl。
 # SPDX-License-Identifier: MIT
 set -eu
@@ -38,6 +38,8 @@ export ZWRT_DATAD_HOSTAPD_BIN="$ROOT/tests/mock_hostapd.py"
 export ZWRT_DATAD_HOSTAPD_CLI_BIN="$ROOT/tests/mock_hostapd_cli.sh"
 export ZWRT_DATAD_SMS_V3E1_URL="http://127.0.0.1:1/goform/goform_set_cmd_process"
 export GOLDEN_FAIL_FILE="$TMP/fail"
+# E4 事务：契约测试里锁被占的那段要够长，但结束得快
+export ZWRT_DATAD_DEADLINE_NETWORK_MODE_MS=20000 ZWRT_DATAD_OP_POLL_MS=300
 : >"$GOLDEN_FAIL_FILE"
 UCI_MODE=show
 . "$HERE/fixture.sh"

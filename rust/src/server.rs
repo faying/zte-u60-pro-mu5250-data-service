@@ -43,6 +43,8 @@ struct Inner {
     /// `/v2` 的流（epoch + broadcast），事件由 `Hub` 在锁里发进来。
     feed: Arc<v2::Feed>,
     neighbor: Mutex<NeighborManager>,
+    /// E4 写操作层：事务引擎（`ops/`）。
+    ops: crate::ops::Engine<crate::ops::UbusDevice>,
 }
 
 struct DeviceSession {
@@ -86,6 +88,11 @@ impl App {
             .await;
         initial.fields.insert("neighbor".into(), neighbor.status());
         let (tx, _) = watch::channel(initial.clone());
+        let ops = crate::ops::Engine::new(
+            crate::ops::UbusDevice::new(exec.clone()),
+            crate::ops::Config::from_env(),
+            crate::ops::pending::Store::open(crate::ops::ops_dir()),
+        );
         let app = Self {
             inner: Arc::new(Inner {
                 snapshot: RwLock::new(initial),
@@ -98,9 +105,23 @@ impl App {
                 device_session: Mutex::new(None),
                 sse_slots: Arc::new(Semaphore::new(16)),
                 feed,
+                ops,
             }),
         };
         app.inner.exec.start_rounds(Arc::new(app.clone()));
+        // 排队的旧请求锁空出来后照原来的 /control 处理执行（返回 false = 执行者队列满）。
+        let runner_app = app.clone();
+        app.inner
+            .ops
+            .set_legacy_runner(Arc::new(move |action, params| {
+                let app = runner_app.clone();
+                Box::pin(async move {
+                    let body = json!({"action": action, "params": params});
+                    run_control(app, action, body).await.is_ok()
+                })
+            }));
+        // 有落盘的事务就接着确认（没有就不读设备）。
+        app.inner.ops.start().await;
         // V2-31：监听短信事件，收到后短信读取立即重读、执行者立即开一轮（只订阅，不发请求）。
         let exec = app.inner.exec.clone();
         crate::ubus::listen::spawn_if_enabled(
@@ -491,25 +512,176 @@ async fn control(
         )
             .into_response();
     }
-    // 整个处理过程作为一个控制任务交给执行者（V2-24）：排队中的满 8 个立即 503（V2-25），
-    // 否则挂到做完才回复（和原来一样；请求方断开了任务也做完）。
     let action = action.to_owned();
-    let exec = app.inner.exec.clone();
-    let marker = exec.clone();
-    let task_action = action.clone();
-    let task = async move {
-        let response = control_task(app, &task_action, body).await;
-        // V2-27：成功后相关块下一轮立即读（没有映射就全部块），不另起一轮采集。
-        if response.status().is_success() && !read_only(&task_action) {
-            crate::state::invalidate_cache();
-            marker.mark_immediate(blocks_for_action(&task_action));
+    if let Some(response) = ops_route(&app, &action, &body).await {
+        return response;
+    }
+    let params = body.get("params").cloned().unwrap_or_else(|| json!({}));
+    let safety = crate::ops::spec::is_safety(&action, &params);
+    let has_source = body.get("source").is_some();
+    // 没有 source 的旧请求：锁被占时（描述表里的动作）回成功、排队；同一项当覆盖；关数据马上插队（D14）。
+    let legacy_item = (!has_source)
+        .then(|| crate::ops::spec::find(&action))
+        .flatten()
+        .filter(|s| s.target(&params).is_ok())
+        .map(|s| s.item);
+    if has_source {
+        if safety {
+            app.inner.ops.preempt();
         }
-        response
-    };
-    match exec.control(task).await {
+    } else if app.inner.ops.legacy_gate(legacy_item, safety) == crate::ops::LegacyGate::Queue {
+        let item = legacy_item.expect("only described actions queue");
+        app.inner.ops.enqueue_legacy(item, &action, params);
+        return legacy_queued(&action);
+    }
+    if matches!(action.as_str(), "device.reboot" | "device.poweroff") {
+        app.inner.ops.clear_legacy(&action);
+    }
+    match run_control(app.clone(), action.clone(), body.clone()).await {
         Ok(response) => response,
+        // 执行者队列满（V2-25）。旧请求不回 503：描述表里的动作回成功、排队，关数据作为内部任务马上做。
+        Err(executor::Busy) if !has_source => {
+            if let Some(item) = legacy_item {
+                app.inner.ops.enqueue_legacy(item, &action, params);
+                legacy_queued(&action)
+            } else if safety {
+                let exec = app.inner.exec.clone();
+                exec.task(control_job(app, action, body)).await
+            } else {
+                control_busy(&action)
+            }
+        }
         Err(executor::Busy) => control_busy(&action),
     }
+}
+
+/// 排进旧请求队列的旧请求：回和今天一样形状的成功（原厂设置调用回 `{"result":"success"}`）。
+fn legacy_queued(action: &str) -> Response {
+    control_ok(action, json!({"result":"success"}))
+}
+
+/// 整个处理过程作为一个控制任务交给执行者（V2-24）：排队中的满 8 个立即 `Busy`（V2-25），
+/// 否则挂到做完才回复（和原来一样；请求方断开了任务也做完）。
+async fn run_control(app: App, action: String, body: Value) -> Result<Response, executor::Busy> {
+    let exec = app.inner.exec.clone();
+    exec.control(control_job(app, action, body)).await
+}
+
+async fn control_job(app: App, action: String, body: Value) -> Response {
+    let marker = app.inner.exec.clone();
+    let response = control_task(app, &action, body).await;
+    // V2-27：成功后相关块下一轮立即读（没有映射就全部块），不另起一轮采集。
+    if response.status().is_success() && !read_only(&action) {
+        crate::state::invalidate_cache();
+        marker.mark_immediate(blocks_for_action(&action));
+    }
+    response
+}
+
+/// E4：`op.status` / `op.revert` / `op.keep`，以及带 source 的、描述表里的写（走事务）。
+/// 其他请求返回 None，照原来的处理。
+async fn ops_route(app: &App, action: &str, body: &Value) -> Option<Response> {
+    let ops = &app.inner.ops;
+    let empty = json!({});
+    let params = body.get("params").unwrap_or(&empty);
+    let op_id = params.get("op_id").and_then(Value::as_str);
+    match action {
+        "op.status" => return Some(control_ok(action, ops.status(op_id))),
+        "op.revert" | "op.keep" => {
+            let Some(op_id) = op_id else {
+                return Some(invalid_parameter(action, "missing parameter: op_id"));
+            };
+            let r = if action == "op.revert" {
+                ops.revert(op_id).await
+            } else {
+                ops.keep(op_id)
+            };
+            return Some(match r {
+                Ok(v) => control_ok(action, v),
+                Err(e) => op_error(action, StatusCode::CONFLICT, "invalid_state", &e, None),
+            });
+        }
+        _ => {}
+    }
+    let source = body.get("source")?;
+    let Some(source) = source.as_str().and_then(crate::ops::Source::parse) else {
+        return Some(op_error(
+            action,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "unknown source",
+            None,
+        ));
+    };
+    let spec = crate::ops::spec::find(action)?;
+    let target = match spec.target(params) {
+        Ok(v) => v,
+        Err(e) => return Some(invalid_parameter(action, &e)),
+    };
+    let op_id = match body.get("op_id") {
+        None => None,
+        Some(Value::String(s)) if crate::ops::engine::valid_op_id(s) => Some(s.clone()),
+        Some(_) => {
+            return Some(op_error(
+                action,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "op_id must be 1-64 letters, digits, '.', '_' or '-'",
+                None,
+            ));
+        }
+    };
+    let undo = body.get("undo").and_then(Value::as_bool).unwrap_or(false);
+    let submitted = ops
+        .submit(crate::ops::Request {
+            spec,
+            target,
+            source,
+            op_id,
+            undo,
+        })
+        .await;
+    Some(match submitted {
+        crate::ops::Submit::Existing(op) => (
+            StatusCode::OK,
+            Json(json!({"ok":true,"action":action,"op":op})),
+        )
+            .into_response(),
+        crate::ops::Submit::Busy(doing) => op_error(
+            action,
+            StatusCode::CONFLICT,
+            "busy",
+            "another change is in progress",
+            Some(("doing", doing)),
+        ),
+        crate::ops::Submit::NoCapture(e) => control_failed(action, e),
+        crate::ops::Submit::Applied { result: Ok(v), op } => (
+            StatusCode::OK,
+            Json(json!({"ok":true,"action":action,"result":v,"op":op})),
+        )
+            .into_response(),
+        crate::ops::Submit::Applied { result: Err(e), op } => op_error(
+            action,
+            StatusCode::BAD_GATEWAY,
+            "device_call_failed",
+            &e,
+            Some(("op", op)),
+        ),
+    })
+}
+
+fn op_error(
+    action: &str,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    extra: Option<(&str, Value)>,
+) -> Response {
+    let mut body = json!({"ok":false,"action":action,"error":{"code":code,"message":message}});
+    if let Some((k, v)) = extra {
+        body[k] = v;
+    }
+    (status, Json(body)).into_response()
 }
 
 /// 只读、不改设备的动作：不清慢数据缓存、不标块（`sms.list_after` 翻页时每页一次，清缓存会让下一轮全部重读）。

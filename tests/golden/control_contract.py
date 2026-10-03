@@ -5,8 +5,14 @@
 
 请求按触屏 data.c control_send 的原样发（HTTP/1.1 + Connection: close，写完不关，等回复）：
 1. 挂起到回复：动作做完之前一个字节都不回，做完回 200 和结果。
-2. 队列满：多出来的请求立即回 503，回复体逐字节固定（触屏 ui_control_should_fallback 只认 503）。
+2. 队列满：不在事务描述表里的动作多出来的请求立即回 503，回复体逐字节固定（触屏 ui_control_should_fallback 只认 503）。
 3. state.set_interval：回复之后采样间隔真的变了（/state 的 ts 在新间隔内前进）。
+
+E4 有意改变的行为（write-op-layer.md「旧客户端」、D14，T2），各一条：
+4. 描述表里的动作（network.set_mode）的旧请求在执行者队列满时不回 503：回和今天一样的成功、排队执行。
+5. 事务进行中（锁被占）：旧请求「关数据」马上生效、回复逐字节同锁空时；进行中的事务记 preempted。
+6. 事务进行中：同一项的旧请求当覆盖写，回复逐字节同今天；别的来源的新写回 409 busy，说清谁在做什么。
+7. 「立即退回」：退回写下去并确认，终态 rolled_back/user_revert。
 SPDX-License-Identifier: MIT
 """
 import json
@@ -20,7 +26,9 @@ import urllib.request
 PORT = int(sys.argv[1])
 FAIL_FILE = sys.argv[2]
 SET_MODE = '{"action":"network.set_mode","params":{"mode":"WL_AND_5G"}}'
-BUSY_BODY = b'{"action":"network.set_mode","error":{"code":"busy","message":"control queue full"},"ok":false}'
+BAND = '{"action":"band.set_lte","params":{"bands":"1,3"}}'
+BUSY_BODY = b'{"action":"band.set_lte","error":{"code":"busy","message":"control queue full"},"ok":false}'
+LEGACY_OK = b'{"action":"network.set_mode","ok":true,"result":{"result":"success"}}'
 
 
 def request(body: str) -> bytes:
@@ -54,9 +62,9 @@ def split(raw: bytes):
     return head.split(b"\r\n", 1)[0], body
 
 
-def delay(seconds: float) -> None:
+def delay(seconds: float, method: str = "nwinfo_set_netselect") -> None:
     with open(FAIL_FILE, "w") as f:
-        f.write("delay zte_nwinfo_api nwinfo_set_netselect %s\n" % seconds)
+        f.write("delay zte_nwinfo_api %s %s\n" % (method, seconds))
 
 
 def clear() -> None:
@@ -82,10 +90,9 @@ def hang_until_done() -> None:
         fail("挂起后的回复体不对：%r" % body)
 
 
-def queue_full() -> None:
-    delay(0.4)
-    results = [None] * 12
-    socks = [send(SET_MODE) for _ in results]
+def parallel(body: str, n: int):
+    results = [None] * n
+    socks = [send(body) for _ in results]
 
     def collect(i):
         try:
@@ -93,11 +100,17 @@ def queue_full() -> None:
         except OSError as e:
             results[i] = (b"error", str(e).encode())
 
-    threads = [threading.Thread(target=collect, args=(i,)) for i in range(len(socks))]
+    threads = [threading.Thread(target=collect, args=(i,)) for i in range(n)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    return results
+
+
+def queue_full() -> None:
+    delay(0.4, "nwinfo_set_lte_ext_band")
+    results = parallel(BAND, 12)
     busy = [r for r in results if r[0].startswith(b"HTTP/1.1 503")]
     if not busy:
         fail("12 个并发请求一个 503 都没有：%r" % [r[0] for r in results])
@@ -107,6 +120,89 @@ def queue_full() -> None:
                 fail("503 回复体变了：%r" % body)
         elif status != b"HTTP/1.1 200 OK":
             fail("队列没满的请求没回 200：%r %r" % (status, body))
+
+
+def legacy_described_never_503() -> None:
+    """E4 有意改变（4）：描述表里的动作，旧请求在执行者队列满时回成功、排队，不回 503。"""
+    delay(0.4)
+    for status, body in parallel(SET_MODE, 12):
+        if status != b"HTTP/1.1 200 OK" or body != LEGACY_OK:
+            fail("队列满时旧的 network.set_mode 回复不对：%r %r" % (status, body))
+    clear()
+    time.sleep(2)
+
+
+def post(body: dict):
+    status, raw = split(read_all(send(json.dumps(body, separators=(",", ":"))), 15))
+    return status, raw
+
+
+def op_status(op_id: str) -> dict:
+    status, raw = post({"action": "op.status", "params": {"op_id": op_id}})
+    if status != b"HTTP/1.1 200 OK":
+        fail("op.status 没回 200：%r" % raw)
+    return json.loads(raw)["result"]
+
+
+def take_lock() -> str:
+    """新客户端把网络模式切到 mock 永远不会报的值：事务停在 verifying，锁一直被占着。"""
+    status, raw = post({"action": "network.set_mode", "source": "screen", "params": {"mode": "Only_LTE"}})
+    reply = json.loads(raw)
+    if status != b"HTTP/1.1 200 OK" or reply["op"]["phase"] != "verifying" or reply["op"]["old"] != "WL_AND_5G":
+        fail("新客户端切网络模式的回复不对：%r %r" % (status, raw))
+    return reply["op"]["op_id"]
+
+
+def wait_final(op_id: str) -> dict:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        s = op_status(op_id)
+        if s["phase"] not in ("accepted", "applying", "verifying", "rolling_back"):
+            return s
+        time.sleep(0.2)
+    fail("%s 10 秒没结束：%r" % (op_id, op_status(op_id)))
+
+
+def legacy_data_off_preempts() -> None:
+    """E4 有意改变（5，D14）。"""
+    data_off = '{"action":"cellular.set","params":{"enabled":0}}'
+    free = split(read_all(send(data_off), 10))
+    op_id = take_lock()
+    held = split(read_all(send(data_off), 10))
+    if held != free:
+        fail("锁被占时旧请求关数据的回复变了：%r != %r" % (held, free))
+    s = op_status(op_id)
+    if (s["phase"], s["reason"]) != ("cancelled", "preempted"):
+        fail("关数据没有打断进行中的事务：%r" % s)
+
+
+def legacy_same_item_and_busy() -> None:
+    """E4 有意改变（6）。"""
+    op_id = take_lock()
+    status, raw = post({"action": "network.set_mode", "source": "scenario", "params": {"mode": "Only_5G"}})
+    reply = json.loads(raw)
+    if status != b"HTTP/1.1 409 Conflict" or reply["error"]["code"] != "busy" or reply["doing"]["source"] != "screen" or reply["doing"]["op_id"] != op_id:
+        fail("锁被占时别的来源没收到 busy：%r %r" % (status, raw))
+    status, body = split(read_all(send(SET_MODE), 10))
+    if status != b"HTTP/1.1 200 OK" or body != LEGACY_OK:
+        fail("同一项的旧请求回复变了：%r %r" % (status, body))
+    s = op_status(op_id)
+    if (s["phase"], s["reason"]) != ("cancelled", "superseded"):
+        fail("同一项的旧请求没有覆盖进行中的事务：%r" % s)
+
+
+def user_revert() -> None:
+    """E4（7）：mock 的读回永远是 WL_AND_5G，所以退回一写就能确认。"""
+    op_id = take_lock()
+    status, raw = post({"action": "op.revert", "params": {"op_id": op_id}})
+    if status != b"HTTP/1.1 200 OK" or json.loads(raw)["result"]["phase"] != "rolling_back":
+        fail("op.revert 回复不对：%r %r" % (status, raw))
+    s = wait_final(op_id)
+    if (s["phase"], s["reason"]) != ("rolled_back", "user_revert"):
+        fail("立即退回的终态不对：%r" % s)
+    status, raw = post({"action": "op.revert", "params": {"op_id": op_id}})
+    if status != b"HTTP/1.1 409 Conflict":
+        fail("已结束的事务还能退回：%r %r" % (status, raw))
 
 
 def state_ts() -> float:
@@ -132,6 +228,10 @@ def main() -> int:
     try:
         hang_until_done()
         queue_full()
+        legacy_described_never_503()
+        legacy_data_off_preempts()
+        legacy_same_item_and_busy()
+        user_revert()
         set_interval_applies()
     finally:
         clear()

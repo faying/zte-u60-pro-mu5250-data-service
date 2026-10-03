@@ -76,7 +76,7 @@ pub const ACTIONS: &[&str] = &[
 fn object(params: &Value) -> &Map<String, Value> {
     params.as_object().expect("server validates params")
 }
-fn string(params: &Value, name: &str, required: bool) -> Result<Option<String>, String> {
+pub(crate) fn string(params: &Value, name: &str, required: bool) -> Result<Option<String>, String> {
     match object(params).get(name) {
         Some(Value::String(value)) if value.len() <= 8192 => Ok(Some(value.clone())),
         Some(_) => Err(format!("{name} must be a string")),
