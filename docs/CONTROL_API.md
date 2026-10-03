@@ -110,6 +110,7 @@ Wi-Fi（E4 T7b，zte-agent 的 Wi-Fi 页、热点开关、情景、家庭模式�
 | `vendor.call` | `object`、`method`、`args?`（对象，≤ 8 KB） | 只做 `control.rs` 的 `VENDOR_CALLS` 表里的 (对象, 方法)，`args` 原样交给原厂（和 agent 以前直接调的一样）。流水账里 PIN/PUK/NCK 类字段写 `(changed)`，短信方法不记参数；恢复出厂、`system reboot` 先记 requested 并落盘再做。会话期间不挡（短信转发不能被挡）。FOTA 相关的永远不进表 |
 | `sms.db_delete` | `ids`（数字和 `;`） | 原厂 `zwrt_wms_delete_sms` 删不掉 SIM 里的短信时，agent 用它在原厂的 sms.db 里直接删（固定 SQL）。不记参数 |
 | `dns.doh` | `enabled`（布尔） | agent 的 DoH：写 / 删 `/tmp/dnsmasq.d/doh.conf`（转发到 127.0.0.1:5353），关的时候再去掉 `dhcp.lan_dns` 的 server/noresolv，重启 dnsmasq |
+| `wifi.power_save` | `enabled`（布尔） | MU5250 的 Wi-Fi 节能（触屏和网页共用）：写 `/etc/hotplug.d/iface/99-disable-powersave`（ifup 时对 wlan0–3 套用，留得住），删掉旧的 `psm`，马上对 wlan0–3 `iw set power_save`，再读回 wlan0（没有就 wlan2）。回 `{enabled, saved, live}`，Wi-Fi 关着读不到时 `live` 为 null；读回和要的不一样算失败。`wifi.psm.set` 是 MU5252 按 SSID 的旧接口，不动 |
 
 AT 只发这两条固定命令。AT 口和 zte-agent 共用，两边都拿 `ZWRT_DATAD_AT_LOCK`（默认 `/var/run/u60-at.lock`，flock）；口是 `ZWRT_DATAD_AT_PORT`，没设就按 agent 的顺序找第一个回 OK 的。等到 OK/ERROR 就停，最多 6 秒。
 

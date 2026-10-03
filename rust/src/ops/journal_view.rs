@@ -46,6 +46,7 @@ fn name(key: &str) -> Words {
         "wifi.apply" | "wifi.configure" | "wifi.reload" | "wifi.set_dual_band"
         | "wifi.set_module" | "wifi.set_chip" => ("Wi-Fi", "Wi-Fi"),
         "wifi.psm.set" => ("Wi-Fi 省电", "Wi-Fi power save"),
+        "wifi.power_save" => ("Wi-Fi 节能", "Wi-Fi power save"),
         "nfc.set" => ("碰一碰", "NFC"),
         "power.direct_supply.set" => ("直供电", "Direct power"),
         "usb.set" => ("USB", "USB"),
@@ -131,7 +132,12 @@ fn change_of(action: &str, params: &Value) -> Words {
             .get("bands")
             .and_then(Value::as_str)
             .map(|b| (b.to_owned(), b.to_owned())),
-        "nfc.set" | "power.direct_supply.set" | "usb.set" | "sleep.set" | "wifi.psm.set" => params
+        "nfc.set"
+        | "power.direct_supply.set"
+        | "usb.set"
+        | "sleep.set"
+        | "wifi.psm.set"
+        | "wifi.power_save" => params
             .get("enabled")
             .and_then(|v| on("打开", "关掉", "on", "off", v)),
         "wifi.apply" => params.get("set").and_then(Value::as_object).and_then(|m| {

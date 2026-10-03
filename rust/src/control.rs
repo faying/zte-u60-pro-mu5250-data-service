@@ -2,6 +2,7 @@ use crate::state;
 use serde_json::{Map, Value, json};
 use std::{net::IpAddr, time::Duration};
 
+#[derive(Debug)]
 pub enum Outcome {
     NotHandled,
     Invalid(String),
@@ -88,6 +89,7 @@ pub const E4_ACTIONS: &[&str] = &[
     "vendor.call",
     "dns.doh",
     "sms.db_delete",
+    "wifi.power_save",
 ];
 
 /// E4 T7c：其余原厂设置的写，参数原样交给原厂（和 agent 以前直接调的一样），
@@ -306,6 +308,7 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         "vendor.call" => vendor_call(params).await,
         "dns.doh" => dns_doh(params).await,
         "sms.db_delete" => sms_db_delete(params).await,
+        "wifi.power_save" => wifi_power_save(params).await,
         "band.reset" => {
             call(
                 "zte_nwinfo_api",
@@ -1076,6 +1079,82 @@ async fn dns_doh(params: &Value) -> Outcome {
         Ok(_) => Outcome::Ok(json!({"enabled": enabled})),
         // agent 以前也不看结果：配置文件写了就算，dnsmasq 重启失败如实说
         Err(e) => Outcome::Failed(format!("dnsmasq: {e}")),
+    }
+}
+
+/// Wi-Fi 节能（MU5250，E4：触屏以前自己写，10-04 用户定改经 datad）。和触屏原来的做法一样：
+/// 选择落在 hotplug 脚本里（ifup 时重新套用，换机重启都留得住），再马上套到在用的接口上，
+/// 读回 wlan0（没有就 wlan2）。`wifi.psm.set` 是 MU5252 按 SSID 的旧接口，冻结不动。
+async fn wifi_power_save(params: &Value) -> Outcome {
+    let enabled = match boolean(params, "enabled") {
+        Ok(v) => v,
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let dir =
+        std::env::var("ZWRT_DATAD_HOTPLUG_DIR").unwrap_or_else(|_| "/etc/hotplug.d/iface".into());
+    power_save_apply(std::path::Path::new(&dir), &iw_bin(), enabled).await
+}
+
+const PSM_IFACES: [&str; 4] = ["wlan0", "wlan1", "wlan2", "wlan3"];
+
+fn psm_script(enabled: bool) -> String {
+    let m = if enabled { "on" } else { "off" };
+    let mut s = String::from(
+        "#!/bin/sh\n# written by zwrt-datad (wifi.power_save)\n[ \"$ACTION\" = ifup ] && {\n",
+    );
+    for w in PSM_IFACES {
+        s.push_str(&format!("  iw dev {w} set power_save {m} 2>/dev/null\n"));
+    }
+    s.push_str("}\n");
+    s
+}
+
+async fn power_save_apply(dir: &std::path::Path, iw: &str, enabled: bool) -> Outcome {
+    use std::os::unix::fs::PermissionsExt;
+    let file = dir.join("99-disable-powersave");
+    let tmp = dir.join(".99-disable-powersave.tmp");
+    let saved = std::fs::create_dir_all(dir)
+        .and_then(|_| std::fs::write(&tmp, psm_script(enabled)))
+        .and_then(|_| std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|_| std::fs::rename(&tmp, &file));
+    if let Err(e) = saved {
+        let _ = std::fs::remove_file(&tmp);
+        return Outcome::Failed(format!("could not save Wi-Fi power save: {e}"));
+    }
+    // 很早的触屏版本写过的另一份，留着会和这份打架
+    let _ = std::fs::remove_file(dir.join("psm"));
+    let m = if enabled { "on" } else { "off" };
+    for w in PSM_IFACES {
+        // 关着的接口会报错，照旧忽略：下次 ifup 由脚本套用
+        let _ = crate::command::run(
+            iw,
+            ["dev", w, "set", "power_save", m],
+            Duration::from_secs(3),
+        )
+        .await;
+    }
+    let mut live = None;
+    for w in ["wlan0", "wlan2"] {
+        if let Ok(out) =
+            crate::command::run(iw, ["dev", w, "get", "power_save"], Duration::from_secs(3)).await
+        {
+            let out = String::from_utf8_lossy(&out);
+            if out.contains("Power save: on") {
+                live = Some(true);
+            } else if out.contains("Power save: off") {
+                live = Some(false);
+            }
+            if live.is_some() {
+                break;
+            }
+        }
+    }
+    match live {
+        Some(v) if v != enabled => Outcome::Failed(format!(
+            "Wi-Fi power save still {}",
+            if v { "on" } else { "off" }
+        )),
+        _ => Outcome::Ok(json!({"enabled": enabled, "saved": true, "live": live})),
     }
 }
 
@@ -2392,6 +2471,70 @@ mod wifi_apply_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn power_save_saves_applies_and_reads_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("datad-psm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("psm"), "old").unwrap();
+        // 假 iw：set 记下来，get 回最后一次 set 的值
+        let iw = d.join("iw");
+        let state = d.join("state");
+        std::fs::write(
+            &iw,
+            format!(
+                "#!/bin/sh\ncase \"$3\" in set) echo \"$5\" > {s};; get) echo \"Power save: $(cat {s})\";; esac\n",
+                s = state.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&iw, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hp = d.join("hotplug");
+        let out = power_save_apply(&hp, iw.to_str().unwrap(), false).await;
+        assert!(
+            matches!(&out, Outcome::Ok(v) if v["live"] == json!(false)),
+            "{out:?}"
+        );
+        let script = std::fs::read_to_string(hp.join("99-disable-powersave")).unwrap();
+        assert!(script.contains("iw dev wlan3 set power_save off"));
+        assert!(script.starts_with("#!/bin/sh"));
+        assert_eq!(
+            std::fs::metadata(hp.join("99-disable-powersave"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        // 读回不对就如实说没改成
+        let stuck = d.join("iw-stuck");
+        std::fs::write(
+            &stuck,
+            "#!/bin/sh\n[ \"$3\" = get ] && echo 'Power save: on'\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            power_save_apply(&hp, stuck.to_str().unwrap(), false).await,
+            Outcome::Failed(_)
+        ));
+        // Wi-Fi 关着读不到：存了就算，live 为空
+        let none = d.join("iw-none");
+        std::fs::write(&none, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&none, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = power_save_apply(&hp, none.to_str().unwrap(), true).await;
+        assert!(
+            matches!(&out, Outcome::Ok(v) if v["live"].is_null() && v["enabled"] == json!(true)),
+            "{out:?}"
+        );
+        assert!(
+            std::fs::read_to_string(hp.join("99-disable-powersave"))
+                .unwrap()
+                .contains("power_save on")
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
     #[test]
     fn rejects_non_hex_mac() {
         assert!(!valid_mac("00:11:22:33:44:zz"));
