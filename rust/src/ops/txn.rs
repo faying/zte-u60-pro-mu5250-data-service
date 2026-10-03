@@ -340,6 +340,10 @@ pub struct Txn {
     /// 最近一次喂读数或落盘时的时钟（整机重启后据此算上一次开机等了多久）。
     pub seen_ms: u64,
     pub created_ms: u64,
+    /// 确认通用了多久（开始确认到数据通，跨重启累计；只在 confirmed/verified 时有）。
+    /// 记进流水账，上机后按动作统计定 D24 时限（E4 T11）。
+    #[serde(default)]
+    pub took_ms: Option<u64>,
     /// 每次阶段变化 +1：驱动丢掉阶段变化之前发出去的读数。
     pub generation: u64,
 }
@@ -378,6 +382,7 @@ impl Txn {
             boot_id: n.boot_id,
             boots: 0,
             elapsed_prev_ms: 0,
+            took_ms: None,
             wait_start_ms: now,
             seen_ms: now,
             created_ms: now,
@@ -600,6 +605,9 @@ impl Txn {
                     if r.registered {
                         match self.data_judge(r) {
                             DataJudge::Ok => {
+                                self.took_ms = Some(
+                                    self.elapsed_prev_ms + now.saturating_sub(self.wait_start_ms),
+                                );
                                 return self.finish(Phase::Confirmed, Reason::Verified);
                             }
                             DataJudge::ApnNoData => {

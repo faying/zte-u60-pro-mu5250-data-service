@@ -95,6 +95,8 @@ fn readback_and_registered_confirms() {
     assert_eq!(t.on_reading(&read("Only_LTE", true), 7_000), Next::Done);
     assert_eq!(end(&t), (Phase::Confirmed, Some(Reason::Verified)));
     assert!(t.phase.is_final());
+    // T11：开始确认（1 s 下发完）到数据通用了 6 s
+    assert_eq!(t.took_ms, Some(6_000));
 }
 
 #[test]

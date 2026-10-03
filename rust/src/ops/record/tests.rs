@@ -328,4 +328,6 @@ fn txn_line_has_only_the_iccid_tail() {
         (l["old"].as_str(), l["rollback_to"].as_str()),
         (Some("WL_AND_5G"), Some("TCHGWL_5G"))
     );
+    // 没确认通的不记用时
+    assert!(l["took_ms"].is_null());
 }

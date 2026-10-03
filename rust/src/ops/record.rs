@@ -482,6 +482,7 @@ pub fn txn_line(t: &Txn) -> Value {
         "result": t.phase,
         "reason": t.reason,
         "rollback_reason": t.rollback_reason,
+        "took_ms": t.took_ms,
     })
 }
 
