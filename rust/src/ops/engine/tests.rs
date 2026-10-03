@@ -390,7 +390,7 @@ async fn user_revert_and_keep() {
     tokio::time::sleep(Duration::from_secs(5)).await;
     dev.s().registered = true;
     // 自动退回关着，「立即退回」照样能用
-    let v = e.revert(&id(&a)).await.unwrap();
+    let v = e.revert(&id(&a)).unwrap();
     assert_eq!(v["phase"], "rolling_back");
     assert_eq!(v["rollback_reason"], "user_revert");
     assert_eq!(
@@ -398,7 +398,7 @@ async fn user_revert_and_keep() {
         pair("rolled_back", "user_revert")
     );
     assert_eq!(dev.s().writes, ["Only_LTE", "WL_AND_5G"]);
-    assert!(e.revert(&id(&a)).await.is_err());
+    assert!(e.revert(&id(&a)).is_err());
 
     dev.s().registered = false;
     let b = op_of(&e.submit(req("Only_LTE", Source::Web)).await);
@@ -711,4 +711,87 @@ fn op_ids() {
     assert!(!valid_op_id(""));
     assert!(!valid_op_id("a b"));
     assert!(!valid_op_id(&"x".repeat(65)));
+}
+
+// ---- D32：退回之前也核对 SIM；身份临时读空不算换卡 ----
+
+#[tokio::test(start_paused = true)]
+async fn second_boot_with_another_sim_does_not_roll_back() {
+    let dir = temp_dir();
+    let dev = Dev::new();
+    dev.s().registered = false;
+    let e = engine(&dev, true, Some(dir.clone()));
+    let op = op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let mut t: Txn =
+        serde_json::from_slice(&std::fs::read(dir.join("pending.json")).unwrap()).unwrap();
+    t.boots = 1;
+    std::fs::write(dir.join("pending.json"), serde_json::to_vec(&t).unwrap()).unwrap();
+
+    // 第 2 次开机，卡换了：不往新卡上写旧卡的值
+    let dev2 = Dev::new();
+    dev2.reboot("boot-c");
+    dev2.s().sim = sim(2);
+    let e2 = engine(&dev2, true, Some(dir.clone()));
+    e2.start().await;
+    let fin = settle(&e2, &id(&op)).await;
+    assert_eq!(end(&fin), pair("cancelled", "sim_changed"));
+    assert!(dev2.s().writes.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn revert_after_sim_change_does_not_write() {
+    let dev = Dev::new();
+    dev.s().registered = false;
+    let e = engine(&dev, false, None);
+    let a = op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
+    // 读不到设备的那几拍里换了卡
+    dev.s().read_fail = true;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    dev.s().sim = sim(2);
+    e.revert(&id(&a)).unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    dev.s().read_fail = false;
+    let fin = settle(&e, &id(&a)).await;
+    assert_eq!(end(&fin), pair("cancelled", "sim_changed"));
+    assert_eq!(dev.s().writes, ["Only_LTE"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn sim_identity_blank_for_a_while_is_not_a_sim_change() {
+    let dev = Dev::new();
+    dev.s().registered = false;
+    let e = engine(&dev, true, None);
+    let a = op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
+    // 重新注册时 ICCID 和卡槽临时读空两拍
+    dev.s().sim = SimId {
+        iccid: String::new(),
+        slot: 0,
+    };
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(e.status(Some(&id(&a)))["phase"], "verifying");
+    {
+        let mut s = dev.s();
+        s.sim = sim(1);
+        s.registered = true;
+    }
+    assert_eq!(
+        end(&settle(&e, &id(&a)).await),
+        pair("confirmed", "verified")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_sim_device_still_confirms() {
+    let dev = Dev::new();
+    dev.s().sim = SimId {
+        iccid: String::new(),
+        slot: 0,
+    };
+    let e = engine(&dev, true, None);
+    let a = op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
+    assert_eq!(
+        end(&settle(&e, &id(&a)).await),
+        pair("confirmed", "verified")
+    );
 }

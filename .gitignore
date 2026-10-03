@@ -39,3 +39,6 @@ scripts/_*.sh
 
 /rust/target/
 /rust/target-zig/
+
+# Python bytecode from tests
+__pycache__/

@@ -539,19 +539,19 @@ async fn control(
     }
     match run_control(app.clone(), action.clone(), body.clone()).await {
         Ok(response) => response,
-        // 执行者队列满（V2-25）。旧请求不回 503：描述表里的动作回成功、排队，关数据作为内部任务马上做。
-        Err(executor::Busy) if !has_source => {
-            if let Some(item) = legacy_item {
+        // 执行者队列满（V2-25）。关数据（新旧客户端一样，D14）作为内部任务马上做；
+        // 旧请求不回 503：描述表里的动作回成功、排队。
+        Err(executor::Busy) if safety => {
+            let exec = app.inner.exec.clone();
+            exec.task(control_job(app, action, body)).await
+        }
+        Err(executor::Busy) => match legacy_item {
+            Some(item) => {
                 app.inner.ops.enqueue_legacy(item, &action, params);
                 legacy_queued(&action)
-            } else if safety {
-                let exec = app.inner.exec.clone();
-                exec.task(control_job(app, action, body)).await
-            } else {
-                control_busy(&action)
             }
-        }
-        Err(executor::Busy) => control_busy(&action),
+            None => control_busy(&action),
+        },
     }
 }
 
@@ -592,7 +592,7 @@ async fn ops_route(app: &App, action: &str, body: &Value) -> Option<Response> {
                 return Some(invalid_parameter(action, "missing parameter: op_id"));
             };
             let r = if action == "op.revert" {
-                ops.revert(op_id).await
+                ops.revert(op_id)
             } else {
                 ops.keep(op_id)
             };

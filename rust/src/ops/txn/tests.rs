@@ -412,3 +412,41 @@ fn sources() {
     assert!(!Source::Scenario.may_override());
     assert_eq!(Source::parse("touch"), None);
 }
+
+#[test]
+fn sim_check_only_a_different_identity_is_a_change() {
+    let blank = SimId {
+        iccid: String::new(),
+        slot: 0,
+    };
+    let no_slot = SimId {
+        iccid: sim().iccid,
+        slot: 0,
+    };
+    let other = SimId {
+        iccid: "89860000000000000002".into(),
+        slot: 1,
+    };
+    assert_eq!(sim_check(&sim(), &sim()), SimCheck::Same);
+    assert_eq!(sim_check(&sim(), &other), SimCheck::Changed);
+    assert_eq!(sim_check(&sim(), &blank), SimCheck::Unknown);
+    assert_eq!(sim_check(&sim(), &no_slot), SimCheck::Unknown);
+    assert_eq!(sim_check(&blank, &blank), SimCheck::Same);
+    // 写之前没卡、现在插了卡
+    assert_eq!(sim_check(&blank, &sim()), SimCheck::Changed);
+}
+
+#[test]
+fn blank_sim_reading_only_counts_time() {
+    let mut t = txn(true);
+    let blank = Reading {
+        sim: SimId {
+            iccid: String::new(),
+            slot: 0,
+        },
+        ..read("WL_AND_5G", true)
+    };
+    assert_eq!(t.on_reading(&blank, 3_000), Next::Wait);
+    assert!(!t.read_ok);
+    assert_eq!(t.phase, Phase::Verifying);
+}

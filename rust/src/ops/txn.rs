@@ -104,6 +104,32 @@ pub struct SimId {
     pub slot: i64,
 }
 
+impl SimId {
+    /// ICCID 空或卡槽没报：没卡，或者基带重新注册时字段临时空着。
+    fn blank(&self) -> bool {
+        self.iccid.is_empty() || self.slot == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimCheck {
+    Same,
+    Changed,
+    /// 这次读到的身份是空的（写之前有卡）：这个读数不拿来判断，等下一拍。
+    Unknown,
+}
+
+/// D32：写之前的 SIM 身份和这次读到的比。只有「读到一个不同的非空身份」才算换卡
+/// （写之前没卡、现在有卡也算）；读到空的不算换卡，只是这一拍不判断。
+pub fn sim_check(captured: &SimId, now: &SimId) -> SimCheck {
+    match (captured.blank(), now.blank()) {
+        (true, true) => SimCheck::Same,
+        (false, true) => SimCheck::Unknown,
+        _ if captured == now => SimCheck::Same,
+        _ => SimCheck::Changed,
+    }
+}
+
 /// 一次新鲜读数：配置读回（读不到为 None）、是否已注册、当前 SIM。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reading {
@@ -287,9 +313,11 @@ impl Txn {
             return Next::Wait;
         }
         self.seen_ms = now;
-        // D32：SIM 变了就放弃，不往别的卡上写旧卡的值。
-        if r.sim != self.sim {
-            return self.finish(Phase::Cancelled, Reason::SimChanged);
+        // D32：SIM 变了就放弃，不往别的卡上写旧卡的值；身份临时读空的这一拍只看时限。
+        match sim_check(&self.sim, &r.sim) {
+            SimCheck::Changed => return self.finish(Phase::Cancelled, Reason::SimChanged),
+            SimCheck::Unknown => return self.on_tick(now),
+            SimCheck::Same => {}
         }
         if let Some(v) = r.value.as_deref() {
             self.read_ok = true;
