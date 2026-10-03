@@ -74,6 +74,7 @@ struct HeartbeatMsg<'a> {
     epoch: &'a str,
     seq: u64,
     blocks: BTreeMap<&'a str, u64>,
+    exec_age_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -120,12 +121,17 @@ fn frame(epoch: &str, event: &Event) -> Bytes {
                 data,
             }),
         ),
-        Event::Heartbeat(Heartbeat { seq, blocks }) => sse(
+        Event::Heartbeat(Heartbeat {
+            seq,
+            blocks,
+            exec_age_ms,
+        }) => sse(
             "heartbeat",
             &to_json(&HeartbeatMsg {
                 epoch,
                 seq: *seq,
                 blocks: blocks.iter().copied().collect(),
+                exec_age_ms: *exec_age_ms,
             }),
         ),
     }

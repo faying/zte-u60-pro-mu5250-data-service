@@ -273,11 +273,12 @@ pub struct BlockEvent {
     pub data: Value,
 }
 
-/// 一条 `heartbeat` 事件：每块的 observed_at（从没读成功过是 0）。
+/// 一条 `heartbeat` 事件：每块的 observed_at（从没读成功过是 0），执行者多久没前进（D12，V2-32）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Heartbeat {
     pub seq: u64,
     pub blocks: Vec<(&'static str, u64)>,
+    pub exec_age_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -370,6 +371,8 @@ impl Block {
 struct Inner {
     seq: u64,
     blocks: Vec<Block>,
+    /// 最近一次发心跳的时间（轮末或独立定时器）。
+    last_heartbeat: Option<Instant>,
 }
 
 /// 采集调度的开关（`executor::Config` 里的同名字段）。
@@ -398,6 +401,7 @@ impl Hub {
             inner: Mutex::new(Inner {
                 seq: 0,
                 blocks: specs.into_iter().map(Block::new).collect(),
+                last_heartbeat: None,
             }),
             sink,
         }
@@ -616,7 +620,18 @@ impl Hub {
                 Self::publish(&mut g.seq, b, &*self.sink, decision, false, now);
             }
         }
+        // 执行者刚跑完一轮：它在前进。
+        Self::emit_heartbeat(g, &*self.sink, now, 0)
+    }
+
+    fn emit_heartbeat(
+        g: &mut Inner,
+        sink: &dyn EventSink,
+        now: Instant,
+        exec_age_ms: u64,
+    ) -> Heartbeat {
         g.seq += 1;
+        g.last_heartbeat = Some(now);
         let hb = Heartbeat {
             seq: g.seq,
             blocks: g
@@ -624,9 +639,27 @@ impl Hub {
                 .iter()
                 .map(|b| (b.spec.name, b.observed_at))
                 .collect(),
+            exec_age_ms,
         };
-        self.sink.emit(&Event::Heartbeat(hb.clone()));
+        sink.emit(&Event::Heartbeat(hb.clone()));
         hb
+    }
+
+    /// 独立定时器的心跳（V2-22、V2-32）：距上一条心跳满 `quiet` 才发，带执行者多久没前进。
+    /// 执行者被长任务占着、或者卡住时，心跳照样有，订阅方看 `exec_age_ms` 判断它是不是卡了。
+    pub fn heartbeat_if_quiet(
+        &self,
+        now: Instant,
+        exec_age_ms: u64,
+        quiet: Duration,
+    ) -> Option<Heartbeat> {
+        let mut g = self.lock();
+        if g.last_heartbeat
+            .is_some_and(|t| now.saturating_duration_since(t) < quiet)
+        {
+            return None;
+        }
+        Some(Self::emit_heartbeat(&mut g, &*self.sink, now, exec_age_ms))
     }
 
     /// 切点 `seq` 和全部块（V2-4）。

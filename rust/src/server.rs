@@ -47,6 +47,25 @@ struct Inner {
     ops: crate::ops::Engine<crate::ops::UbusDevice>,
 }
 
+/// V2-22：距上一条心跳满这么久，独立定时器就补一条。
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
+
+/// D18：应急直写脚本据此判断 datad 在不在（pid + /proc/<pid>/comm 前缀）。
+/// `ZWRT_DATAD_PID_FILE`，默认 `/var/run/zwrt-datad.pid`，空串 = 不写。
+fn write_pid_file() {
+    let path = match std::env::var("ZWRT_DATAD_PID_FILE") {
+        Ok(v) if v.is_empty() => return,
+        Ok(v) => PathBuf::from(v),
+        Err(_) => PathBuf::from("/var/run/zwrt-datad.pid"),
+    };
+    let tmp = path.with_extension("pid.tmp");
+    let r = std::fs::write(&tmp, format!("{}\n", std::process::id()))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(e) = r {
+        eprintln!("cannot write pid file {}: {e}", path.display());
+    }
+}
+
 struct DeviceSession {
     _token: String,
     _password_hash: String,
@@ -109,6 +128,12 @@ impl App {
             }),
         };
         app.inner.exec.start_rounds(Arc::new(app.clone()));
+        // V2-22：独立定时器补心跳（带 exec_age_ms）；V2-32：看门狗。
+        app.inner.exec.start_heartbeat(HEARTBEAT_EVERY);
+        if let Some(limit) = crate::watchdog::limit_from_env() {
+            crate::watchdog::spawn(app.inner.exec.clone(), limit);
+        }
+        write_pid_file();
         // 排队的旧请求锁空出来后照原来的 /control 处理执行（返回 false = 执行者队列满）。
         let runner_app = app.clone();
         app.inner
@@ -569,6 +594,12 @@ async fn run_control(app: App, action: String, body: Value) -> Result<Response, 
 
 async fn control_job(app: App, action: String, body: Value) -> Response {
     let marker = app.inner.exec.clone();
+    // D29：会改设备的动作在执行者里拿着跨进程写锁做（和应急直写脚本互斥）。
+    let _lock = if crate::control::ACTIONS.contains(&action.as_str()) && !read_only(&action) {
+        Some(crate::ops::write_lock::acquire().await)
+    } else {
+        None
+    };
     let response = control_task(app, &action, body).await;
     // V2-27：成功后相关块下一轮立即读（没有映射就全部块），不另起一轮采集。
     if response.status().is_success() && !read_only(&action) {

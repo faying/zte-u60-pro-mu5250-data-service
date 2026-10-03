@@ -4,15 +4,17 @@
 //! - `spec`：动作描述表（T2 只有网络模式）和安全类写的判断。
 //! - `pending`：`pending.json` 落盘和 `takeover` 标记。
 //! - `engine`：锁、覆盖/插队、确认驱动、续跑、旧请求队列。
+//! - `write_lock`：跨进程写锁（flock，和应急直写脚本互斥，D29）。
 //!
 //! 环境变量：`ZWRT_DATAD_OPS_DIR`（落盘目录，默认 `/data/u60-ops`，空 = 不落盘）、
 //! `ZWRT_DATAD_ROLLBACK`（`1` 才打开自动退回，D30）、`ZWRT_DATAD_OP_POLL_MS`、
-//! `ZWRT_DATAD_LEGACY_TTL_MS`、各动作的 `deadline_env`；时钟 `ZWRT_DATAD_UPTIME_PATH`（默认 `/proc/uptime`）。
+//! `ZWRT_DATAD_LEGACY_TTL_MS`、各动作的 `deadline_env`、`ZWRT_DATAD_WRITE_LOCK`；时钟 `ZWRT_DATAD_UPTIME_PATH`（默认 `/proc/uptime`）。
 
 pub mod engine;
 pub mod pending;
 pub mod spec;
 pub mod txn;
+pub mod write_lock;
 
 use crate::executor::Executor;
 use serde_json::{Value, json};
@@ -20,7 +22,7 @@ use spec::{NETWORK_MODE, Spec};
 use std::{path::PathBuf, time::Instant};
 use txn::{Reading, SimId};
 
-pub use engine::{Config, Engine, LegacyGate, Request, Submit};
+pub use engine::{Config, Engine, LegacyGate, Request, Submit, WriteError};
 pub use txn::Source;
 
 pub fn ops_dir() -> Option<PathBuf> {
@@ -94,24 +96,41 @@ impl engine::Device for UbusDevice {
         }
     }
 
-    async fn write(&self, spec: &'static Spec, value: &str) -> Result<Value, String> {
-        let r = match spec.item {
-            NETWORK_MODE => {
-                crate::state::ubus(
-                    "zte_nwinfo_api",
-                    "nwinfo_set_netselect",
-                    json!({"net_select": value}),
-                )
-                .await
+    async fn write(&self, spec: &'static Spec, value: &str) -> Result<Value, WriteError> {
+        let (object, method, args) = match spec.item {
+            NETWORK_MODE => (
+                "zte_nwinfo_api",
+                "nwinfo_set_netselect",
+                json!({"net_select": value}),
+            ),
+            other => {
+                return Err(WriteError {
+                    message: format!("no writer for {other}"),
+                    timed_out: false,
+                });
             }
-            other => Err(format!("no writer for {other}")),
         };
+        // 一个执行者任务：在执行者里拿跨进程写锁（D29）再调，锁不会和别的任务互等。
+        let r = self
+            .exec
+            .task(async move {
+                let _lock = write_lock::acquire().await;
+                crate::executor::call(object, method, &args).await
+            })
+            .await;
         // 和 `/control` 一样：写过之后慢数据缓存作废，全部块下一轮立即读。
         crate::state::invalidate_cache();
-        if r.is_ok() {
-            self.exec.mark_immediate(None);
+        match r {
+            Ok(v) => {
+                self.exec.mark_immediate(None);
+                Ok(v)
+            }
+            Err(e) => Err(WriteError {
+                // D28：我们这边超时不代表原厂那边没做，结果未知，交给读回判断。
+                timed_out: matches!(e, crate::ubus::client::UbusError::Timeout { .. }),
+                message: e.to_string(),
+            }),
         }
-        r
     }
 
     fn now_ms(&self) -> u64 {

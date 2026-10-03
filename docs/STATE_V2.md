@@ -69,14 +69,14 @@ event: block
 data: {"epoch":"5f2c9a1e","seq":42,"name":"battery","revision":8,"observed_at":1782396735,"stale":false,"data":{...}}
 
 event: heartbeat
-data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782396735,"live":1782396736}}
+data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782396735,"live":1782396736},"exec_age_ms":0}
 ```
 
 **V2-10** 各字段含义：
 
 - `block`：`{ epoch, seq, name, revision, observed_at, stale, data }`，只有一块。
 - `snapshot`：`{ epoch, seq, blocks: { name: { revision, observed_at, stale, data } } }`，`seq` 是切点。
-- `heartbeat`：`{ epoch, seq, blocks: { name: observed_at } }`。
+- `heartbeat`：`{ epoch, seq, blocks: { name: observed_at }, exec_age_ms }`；`exec_age_ms` 是执行者多久没前进（V2-32）。
 - `observed_at`：这块最后一次**读成功**的时间，单位秒，时间基准和 `/state` 的 `ts` 相同（设备时钟）。
   读失败或 stale 时保留上一次成功的时间，不更新。
   设备时钟会被 SNTP 调整，订阅方判断「多久没收到」要用自己的单调时钟，不能用 `observed_at` 相减。
@@ -169,8 +169,9 @@ stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 测试（T4）：`block_interval_respected`、`block_failure_retried_within_5s`、`block_cache_off_reads_every_round`
 
 **V2-22** 每轮结束时（包括超出预算的那一轮）执行者发一条 `heartbeat`，没有任何变化也照发。
-心跳只由执行者自己发，不另开定时器：执行者卡住，心跳就会停，订阅方靠这个发现 datad 卡了。
-测试（T4）：`heartbeat_sent_after_over_budget_round`
+另有一个独立定时器（E4 D12，不经执行者）：距上一条心跳满 5 秒就补一条。所以执行者被长任务占着（比如短信发送、
+原厂 reload 的短轮询）或者卡住时心跳照样有；订阅方看心跳里的 `exec_age_ms` 判断执行者是不是卡了（V2-32），不再只靠「心跳停了」。
+测试（T4）：`heartbeat_sent_after_over_budget_round`；测试（E4 T3）：`long_reload_short_polls_keep_heartbeat_and_no_stall`、`idle_executor_is_never_stalled`
 
 **V2-23** 所有 `/v2` 订阅方统一用 **M = 20 秒**：超过 20 秒没收到任何事件，就当作连接断了，按 V2-3 重连。
 没有 `/control` 时，心跳最长间隔 = 5 秒采样间隔 + 5 秒最长一轮 = 10 秒，M 留出一倍余量。
@@ -239,3 +240,21 @@ stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 只用子进程方式（`ZWRT_DATAD_UBUS=socket` 时也是），直连 ubusd 的订阅等 socket 后端上机（Gate 0）后再做。`ZWRT_DATAD_SMS_LISTEN=0` 关闭，默认开。
 例：新短信到达 → 事件 → 300 ms 后开一轮 → 约 1 秒内 `sms` 块的 `max_id` 变化发到 `/v2`（原来最多等 10 秒列表缓存）。
 测试（T10）：`sms_event_updates_block_within_one_round`、`sms_events_coalesced`、`sms_event_kicks_at_least_2s_apart`、`sms_listener_restarts_after_exit`、`sms_listen_disabled_by_env`、`sms_event_invalidates_only_sms_cache`
+
+## 11. 活性和写操作的闸（E4 T3）
+
+**V2-32** 执行者的「前进」= 完成一次 ubus 调用、一个任务、一轮，或者闲着在等活（闲着时 `exec_age_ms` 是 0）。
+心跳里的 `exec_age_ms` 是最近一次前进距今的毫秒数。订阅方（触屏、agent）超过 **20 秒**就当 datad 卡了：触屏显示「数据服务没响应」、不写，agent 切退路（D12）。
+datad 自己有看门狗（独立系统线程，每秒看一次）：超过 **30 秒**没前进、而且不是一个还在它自己超时里的调用（单次调用上限 10 秒），就记一行退出，由 procd 拉起。
+`ZWRT_DATAD_WATCHDOG_S` 改上限（秒，0 = 关），不会小于 11 秒。所有 ubus 和子进程调用的超时都必须小于它；
+原厂要拖几十秒的动作（`zwrt_wlan reload` 这类）先发、再用多次短调用轮询，不能在一次调用里等完。
+datad 启动时把 pid 写进 `ZWRT_DATAD_PID_FILE`（默认 `/var/run/zwrt-datad.pid`），应急直写脚本据此判断 datad 在不在（D18）。
+测试（E4 T3）：`stuck_call_is_reported_and_stalls_after_limit`
+
+**V2-33** 采集轮之外（控制任务、内部任务）的调用超时了，结果算「未知」：原厂那边可能还在做（D28）。
+执行者先把闸关上：下一个非采集轮的调用之前，用这个对象的只读请求探测（块表里读它的那个请求；块表里没有就是 `system board`），
+每次最多 8 秒、最多 4 次，对象回答了（成功或报错都算）才放行；4 次都超时也放行并记一行，写的结果交给事务按读回判断。
+采集轮里的读超时不关闸（照 V2-18 本轮跳过）。写事务遇到超时不判失败，只按读回判断。
+另有跨进程写锁 `ZWRT_DATAD_WRITE_LOCK`（默认 `/var/run/u60-write.lock`，flock，D29）：datad 的每个写（事务的写和退回、会改设备的 `/control`）
+和启动时处理 takeover/pending 的全过程都拿着它，和应急直写脚本互斥；拿不到就等，满 20 秒还拿不到就记一行照做。
+测试（E4 T3）：`timeout_holds_next_call_until_object_answers`、`gate_opens_after_four_failed_probes`、`round_timeouts_do_not_close_the_gate`、`timed_out_write_is_unknown_and_confirmed_by_readback`

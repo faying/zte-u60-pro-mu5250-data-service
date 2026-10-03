@@ -16,6 +16,8 @@ jobs:
     env:
       # E4 事务落盘目录：测试里不落盘（各脚本需要时自己指定临时目录）
       ZWRT_DATAD_OPS_DIR: ""
+      ZWRT_DATAD_WRITE_LOCK: ""
+      ZWRT_DATAD_PID_FILE: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.89.0

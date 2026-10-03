@@ -70,7 +70,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 
 **旧请求**（没有 `source`）回复和以前逐字节相同。事务进行中：同一项的旧请求当覆盖写照常执行；描述表里的其他旧请求回成功（`{"result":"success"}`）并进旧请求队列，锁空出来再执行（每项只留最新、120 秒过期、关数据或重启时清空）。描述表里的动作在执行者队列满时也这样处理，不回 503；旧的关数据请求在队列满时作为内部任务马上执行。
 
-进行中的事务落盘在 `ZWRT_DATAD_OPS_DIR`（默认 `/data/u60-ops`，空串 = 不落盘）的 `pending.json`：datad 重启接着确认；整机重启后时限重新计，第 2 次开机仍未确认或累计等待超过时限就马上退回；目录里有 `takeover` 标记（应急直写留下的）就放弃。其他环境变量：`ZWRT_DATAD_OP_POLL_MS`（确认时读设备的间隔，默认 2000）、`ZWRT_DATAD_LEGACY_TTL_MS`（默认 120000）、`ZWRT_DATAD_DEADLINE_NETWORK_MODE_MS`（默认 120000）。
+进行中的事务落盘在 `ZWRT_DATAD_OPS_DIR`（默认 `/data/u60-ops`，空串 = 不落盘）的 `pending.json`：datad 重启接着确认；整机重启后时限重新计，第 2 次开机仍未确认或累计等待超过时限就马上退回；目录里有 `takeover` 标记（应急直写留下的）就放弃。写调用超时也回 502，但事务不判失败，只按读回判断（STATE_V2.md V2-33）。datad 的每个写都拿着跨进程写锁 `ZWRT_DATAD_WRITE_LOCK`（默认 `/var/run/u60-write.lock`），和应急直写脚本互斥。其他环境变量：`ZWRT_DATAD_OP_POLL_MS`（确认时读设备的间隔，默认 2000）、`ZWRT_DATAD_LEGACY_TTL_MS`（默认 120000）、`ZWRT_DATAD_DEADLINE_NETWORK_MODE_MS`（默认 120000）。
 
 ## WiFi, LAN And Clients
 

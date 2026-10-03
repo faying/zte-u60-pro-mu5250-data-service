@@ -43,6 +43,11 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub const ROUND_BUDGET: Duration = Duration::from_secs(3);
 /// V2-25：排队中的控制任务上限。
 pub const CONTROL_QUEUE: usize = 8;
+/// 一次调用最长多久还算「在它自己的超时里」（cli、socket 的超时都是 8 秒，留 2 秒余量）。
+/// 看门狗的上限必须大于它（V2-32）。
+pub const CALL_LIMIT: Duration = Duration::from_secs(10);
+/// V2-33：调用超时后最多探测几次。
+pub const GATE_PROBES: u32 = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -114,6 +119,62 @@ struct RoundState {
     used: Duration,
 }
 
+/// 活性（D12、V2-32）：执行者最近一次「前进」= 完成一次调用、一个任务、一轮，或者闲着在等活。
+struct Liveness {
+    epoch: Instant,
+    /// 最近一次前进（距 epoch 的毫秒 + 1）。
+    last_ms: AtomicU64,
+    /// 正在干活（闲着等活时不算卡）。
+    busy: AtomicBool,
+    /// 在途调用的「自己的超时」到哪（距 epoch 的毫秒 + 1；0 = 没有在途调用）。
+    call_until_ms: AtomicU64,
+}
+
+impl Liveness {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            last_ms: AtomicU64::new(1),
+            // 刚起来就在干活（第一轮）；没活时主循环会标成闲着。
+            busy: AtomicBool::new(true),
+            call_until_ms: AtomicU64::new(0),
+        }
+    }
+    fn at(&self, t: Instant) -> u64 {
+        t.saturating_duration_since(self.epoch).as_millis() as u64 + 1
+    }
+    fn progress(&self) {
+        self.last_ms
+            .store(self.at(Instant::now()), Ordering::Relaxed);
+    }
+    fn set_busy(&self, busy: bool) {
+        if busy {
+            self.progress();
+        }
+        self.busy.store(busy, Ordering::Relaxed);
+    }
+    fn call_started(&self) {
+        self.call_until_ms
+            .store(self.at(Instant::now() + CALL_LIMIT), Ordering::Relaxed);
+    }
+    fn call_done(&self) {
+        self.call_until_ms.store(0, Ordering::Relaxed);
+        self.progress();
+    }
+    fn age_ms(&self, now: Instant) -> u64 {
+        if !self.busy.load(Ordering::Relaxed) {
+            return 0;
+        }
+        self.at(now)
+            .saturating_sub(self.last_ms.load(Ordering::Relaxed))
+    }
+    /// 看门狗：超过 `limit` 没前进，并且不是一个还在自己超时里的调用。
+    fn stalled(&self, now: Instant, limit: Duration) -> bool {
+        let until = self.call_until_ms.load(Ordering::Relaxed);
+        self.age_ms(now) > limit.as_millis() as u64 && !(until != 0 && self.at(now) < until)
+    }
+}
+
 /// 计数（测试和日志用）。
 #[derive(Debug, Default)]
 pub struct Stats {
@@ -135,6 +196,9 @@ struct Shared {
     /// 下一轮不等采样间隔、立即开始（短信事件，V2-31）。
     kick: AtomicBool,
     stats: Stats,
+    live: Liveness,
+    /// V2-33（D28）：采集轮之外的调用超时了，这是那个对象。下一个调用之前先探测它，回答了才放行。
+    gate: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -198,6 +262,68 @@ impl Shared {
         method: &str,
         args: &Value,
     ) -> Result<Value, UbusError> {
+        // V2-33：采集轮里的读不等闸（超时就本轮跳过这个对象，V2-18）。
+        if !round {
+            self.reopen_gate().await;
+        }
+        let r = self.raw_call(round, object, method, args).await;
+        if !round && matches!(r, Err(UbusError::Timeout { .. })) {
+            // 我们这边超时了，原厂那边可能还在做：结果未知，闸先关上。
+            eprintln!(
+                "executor: {object} {method} timed out; holding writes until {object} answers again"
+            );
+            *lock(&self.gate) = Some(object.to_owned());
+        }
+        r
+    }
+
+    /// 闸关着就用这个对象的只读请求探测（每次 ≤8 秒，最多 4 次）；回答了（成功或报错都算）就放闸。
+    /// 4 次都超时也放闸并记一行：原厂可能还没好，写的结果交给事务按读回判断。探测本身算前进。
+    async fn reopen_gate(&self) {
+        let Some(object) = lock(&self.gate).clone() else {
+            return;
+        };
+        let (o, m, a) = self.probe_for(&object);
+        for n in 1..=GATE_PROBES {
+            match self.raw_call(false, &o, &m, &a).await {
+                Err(UbusError::Timeout { .. }) => {
+                    eprintln!("executor: {object} probe {n}/{GATE_PROBES} timed out");
+                }
+                _ => {
+                    eprintln!("executor: {object} answers again");
+                    *lock(&self.gate) = None;
+                    return;
+                }
+            }
+        }
+        eprintln!(
+            "executor: {object} still not answering after {GATE_PROBES} probes, letting writes through"
+        );
+        *lock(&self.gate) = None;
+    }
+
+    /// 探测用的只读请求：块表里读这个对象的那个请求；块表里没有就问 ubusd 本身（`system board`）。
+    fn probe_for(&self, object: &str) -> (String, String, Value) {
+        for i in 0..self.hub.len() {
+            let (o, m, a) = self.hub.request(i);
+            if o == object {
+                return (o.into(), m.into(), a);
+            }
+        }
+        (
+            "system".into(),
+            "board".into(),
+            Value::Object(Default::default()),
+        )
+    }
+
+    async fn raw_call(
+        &self,
+        round: bool,
+        object: &str,
+        method: &str,
+        args: &Value,
+    ) -> Result<Value, UbusError> {
         if round && lock(&self.round).skips.is_skipped(object) {
             return Err(UbusError::Skipped {
                 object: object.into(),
@@ -206,11 +332,13 @@ impl Shared {
         self.stats.calls.fetch_add(1, Ordering::Relaxed);
         let start = Instant::now();
         // 采集轮里用短超时（socket 2 秒），控制任务和内部任务用长超时（8 秒，V2-19）。
+        self.live.call_started();
         let r = {
             let mut b = self.backend.lock().await;
             b.set_round(round);
             b.call(object, method, args).await
         };
+        self.live.call_done();
         if round {
             let mut rs = lock(&self.round);
             rs.used += start.elapsed();
@@ -240,6 +368,7 @@ impl Shared {
                 round: false,
             };
             CTX.scope(ctx, job.fut).await;
+            self.live.progress();
         }
     }
 
@@ -282,6 +411,7 @@ impl Shared {
             })
             .await;
         self.drain().await;
+        self.live.progress();
         self.hub.round_end(Instant::now(), self.sample_interval());
         self.stats.rounds.fetch_add(1, Ordering::Relaxed);
         out
@@ -346,13 +476,19 @@ impl Shared {
                 }
                 Some(_) if self.queued() => {}
                 Some(d) => {
+                    self.live.set_busy(false);
                     tokio::select! {
                         _ = self.wake.notified() => {}
                         _ = tokio::time::sleep_until(d) => {}
                     }
+                    self.live.set_busy(true);
                 }
                 None if self.queued() => {}
-                None => self.wake.notified().await,
+                None => {
+                    self.live.set_busy(false);
+                    self.wake.notified().await;
+                    self.live.set_busy(true);
+                }
             }
             self.drain().await;
             if deadline.is_none() && lock(&self.driver).is_some() {
@@ -383,6 +519,8 @@ impl Executor {
             driver: Mutex::new(None),
             kick: AtomicBool::new(false),
             stats: Stats::default(),
+            live: Liveness::new(),
+            gate: Mutex::new(None),
         });
         tokio::spawn(shared.clone().run());
         Self { shared }
@@ -395,6 +533,31 @@ impl Executor {
     #[cfg(test)]
     pub fn stats(&self) -> &Stats {
         &self.shared.stats
+    }
+
+    /// D12：执行者多久没前进（闲着等活时是 0）。
+    pub fn exec_age_ms(&self) -> u64 {
+        self.shared.live.age_ms(Instant::now())
+    }
+
+    /// 看门狗（V2-32）：超过 `limit` 没前进，并且不是一个还在自己超时里的调用。
+    pub fn stalled(&self, limit: Duration) -> bool {
+        self.shared.live.stalled(Instant::now(), limit)
+    }
+
+    /// V2-22：独立定时器的心跳。每 `every` 看一次，距上一条心跳满 `every` 就补一条（带 exec_age_ms）。
+    /// 不经执行者：执行者被长任务占着或卡住时照样发。
+    pub fn start_heartbeat(&self, every: Duration) {
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let now = Instant::now();
+                shared
+                    .hub
+                    .heartbeat_if_quiet(now, shared.live.age_ms(now), every);
+            }
+        });
     }
 
     pub fn interval_ms(&self) -> u64 {

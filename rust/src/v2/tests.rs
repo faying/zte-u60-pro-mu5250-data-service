@@ -443,7 +443,8 @@ fn v2_event_shapes_match_doc() {
     assert_eq!(block["data"], json!({"x":"y"}));
     let (e, hb) = parse(&f[2]);
     assert_eq!(e, "heartbeat");
-    assert_eq!(keys(&hb), ["blocks", "epoch", "seq"]);
+    assert_eq!(keys(&hb), ["blocks", "epoch", "exec_age_ms", "seq"]);
+    assert!(hb["exec_age_ms"].is_u64());
     assert_eq!(keys(&hb["blocks"]), ["a", "b"]);
     assert!(hb["blocks"]["a"].is_u64());
     // 字段顺序照文档（epoch、seq 在前）。

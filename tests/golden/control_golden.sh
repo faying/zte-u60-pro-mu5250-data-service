@@ -8,7 +8,7 @@
 # 发每个 /control 请求：每个动作的成功回复、参数不对的回复、ubus 调用失败时的回复，外加请求层面的错误。
 # 旧触屏只靠这些回复工作（data.c 的 control_reap 看状态码 503），E4 改 /control 时它们不能变。
 # 只把临时目录路径和时间字段（normalize.py）换成占位符，其余原样比。
-# 之后跑 control_contract.py：挂起到做完才回复、队列满时 503 的回复体，以及 E4 有意改变的几条旧请求行为。
+# 之后跑 control_contract.py：挂起到做完才回复、队列满时 503 的回复体、E4 有意改变的几条旧请求行为、写锁。
 # 依赖：sh、curl、python3、openssl。
 # SPDX-License-Identifier: MIT
 set -eu
@@ -95,6 +95,8 @@ case "$MODE" in
         ;;
 esac
 
-python3 "$HERE/control_contract.py" "$PORT" "$GOLDEN_FAIL_FILE" ||
+# D18：pid 文件写的是这个 datad
+[ "$(cat "$ZWRT_DATAD_PID_FILE")" = "$PID" ] || { echo "control golden: pid 文件不对" >&2; exit 1; }
+python3 "$HERE/control_contract.py" "$PORT" "$GOLDEN_FAIL_FILE" "$ZWRT_DATAD_WRITE_LOCK" ||
     { tail -n 20 "$TMP/server.log" >&2; exit 1; }
 echo "control golden: $n 条回复一致，契约通过"

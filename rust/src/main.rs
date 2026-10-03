@@ -18,6 +18,7 @@ mod state;
 mod ubus;
 mod uci;
 mod v2;
+mod watchdog;
 mod wifi;
 
 use anyhow::Result;

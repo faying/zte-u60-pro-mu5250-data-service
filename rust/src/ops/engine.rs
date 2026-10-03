@@ -37,10 +37,17 @@ pub trait Device: Send + Sync + 'static {
         &self,
         spec: &'static Spec,
         value: &str,
-    ) -> impl Future<Output = Result<Value, String>> + Send;
+    ) -> impl Future<Output = Result<Value, WriteError>> + Send;
     /// BOOTTIME 毫秒：datad 重启不归零、休眠时也走。所有时限都按它算，tokio 的计时只当节拍。
     fn now_ms(&self) -> u64;
     fn boot_id(&self) -> String;
+}
+
+/// 写调用失败。`timed_out` = 我们这边超时了，原厂那边做没做不知道（D28）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteError {
+    pub message: String,
+    pub timed_out: bool,
 }
 
 /// 执行一个排队的旧请求（走原来的 `/control` 处理）；返回 false = 执行者队列满，过一会再试。
@@ -268,7 +275,9 @@ impl<D: Device> Engine<D> {
     }
 
     /// datad 启动时：有落盘的事务就接着跑（D13、D18、D31）。没有就什么都不读（不多发 ubus）。
+    /// 整个过程拿着跨进程写锁（D29）：应急直写正在写时，等它写完再看 takeover 标记。
     pub async fn start(&self) {
+        let _lock = super::write_lock::acquire().await;
         let takeover = self.inner.store.take_takeover();
         let Some(mut t) = self.inner.store.load() else {
             if takeover {
@@ -380,7 +389,14 @@ impl<D: Device> Engine<D> {
             let mut st = self.lock();
             let live = match st.live(&op_id) {
                 Some(t) => {
-                    t.applied(result.is_ok(), now);
+                    t.applied(
+                        match &result {
+                            Ok(_) => txn::Applied::Done,
+                            Err(e) if e.timed_out => txn::Applied::Unknown,
+                            Err(_) => txn::Applied::Failed,
+                        },
+                        now,
+                    );
                     true
                 }
                 // 写调用在途时被安全类写打断了（preempted）。
@@ -394,7 +410,10 @@ impl<D: Device> Engine<D> {
         } else {
             self.kick_legacy();
         }
-        Submit::Applied { result, op }
+        Submit::Applied {
+            result: result.map_err(|e| e.message),
+            op,
+        }
     }
 
     fn spawn_driver(&self, op_id: String) {
@@ -480,7 +499,7 @@ impl<D: Device> Engine<D> {
             }
         }
         if let Err(e) = self.inner.dev.write(spec, &value).await {
-            eprintln!("ops: {op_id} rollback write failed: {e}");
+            eprintln!("ops: {op_id} rollback write failed: {}", e.message);
         }
         self.rollback_sent(op_id);
         true

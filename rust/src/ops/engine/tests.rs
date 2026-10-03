@@ -19,6 +19,8 @@ enum Apply {
     Fail,
     /// 写调用一直不回。
     Hang,
+    /// 写调用超时，原厂过一会才真改过去（D28）。
+    TimeoutThenTake,
 }
 
 struct DevState {
@@ -83,7 +85,7 @@ impl Device for Dev {
             sim: s.sim.clone(),
         })
     }
-    async fn write(&self, _spec: &'static Spec, value: &str) -> Result<Value, String> {
+    async fn write(&self, _spec: &'static Spec, value: &str) -> Result<Value, WriteError> {
         let (apply, delay) = {
             let mut s = self.s();
             s.writes.push(value.into());
@@ -96,8 +98,23 @@ impl Device for Dev {
                 Ok(json!({"result":"success"}))
             }
             Apply::Ignore => Ok(json!({"result":"success"})),
-            Apply::Fail => Err("ubus call failed".into()),
+            Apply::Fail => Err(WriteError {
+                message: "ubus call failed".into(),
+                timed_out: false,
+            }),
             Apply::Hang => std::future::pending().await,
+            Apply::TimeoutThenTake => {
+                let d = self.clone();
+                let v = value.to_owned();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    d.s().net_select = v;
+                });
+                Err(WriteError {
+                    message: "Request timed out".into(),
+                    timed_out: true,
+                })
+            }
         }
     }
     fn now_ms(&self) -> u64 {
@@ -123,6 +140,17 @@ fn temp_dir() -> PathBuf {
     let d = std::env::temp_dir().join(format!("datad-ops-{:016x}", rand::random::<u64>()));
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// 「进程没了」：把落盘的文件复制到一个新目录（旧引擎的驱动在测试里还活着，会继续往旧目录写）。
+fn crashed(dir: &std::path::Path) -> PathBuf {
+    let new = temp_dir();
+    for f in ["pending.json", "takeover"] {
+        if let Ok(b) = std::fs::read(dir.join(f)) {
+            std::fs::write(new.join(f), b).unwrap();
+        }
+    }
+    new
 }
 
 fn engine(dev: &Dev, rollback: bool, dir: Option<PathBuf>) -> Engine<Dev> {
@@ -615,11 +643,7 @@ async fn crash_mid_rollback_never_sends_a_second_rollback() {
     assert_eq!(saved.intent, Some(crate::ops::txn::Intent::Rollback));
 
     for boot in ["boot-a", "boot-b"] {
-        std::fs::write(
-            dir.join("pending.json"),
-            serde_json::to_vec(&saved).unwrap(),
-        )
-        .unwrap();
+        let dir = crashed(&dir);
         let dev2 = Dev::new();
         dev2.reboot(boot);
         dev2.s().net_select = "WL_AND_5G".into();
@@ -639,30 +663,30 @@ async fn reboot_restarts_the_clock_then_second_reboot_rolls_back() {
     let e = engine(&dev, true, Some(dir.clone()));
     let op = op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
     tokio::time::sleep(Duration::from_secs(30)).await;
-    let snap = std::fs::read(dir.join("pending.json")).unwrap();
+    let dir1 = crashed(&dir);
 
     // 第 1 次开机：接着等，时限从开机重新计
-    std::fs::write(dir.join("pending.json"), &snap).unwrap();
     let dev1 = Dev::new();
     dev1.reboot("boot-b");
     dev1.s().net_select = "Only_LTE".into();
     dev1.s().registered = false;
-    let e1 = engine(&dev1, true, Some(dir.clone()));
+    let e1 = engine(&dev1, true, Some(dir1.clone()));
     e1.start().await;
     let s = e1.status(Some(&id(&op)));
     assert_eq!(s["phase"], "verifying");
     assert_eq!(s["remaining_ms"], DEADLINE);
     assert!(dev1.s().writes.is_empty());
     tokio::time::sleep(Duration::from_secs(20)).await;
-    let snap1 = std::fs::read(dir.join("pending.json")).unwrap();
-    let t1: Txn = serde_json::from_slice(&snap1).unwrap();
+    let dir2 = crashed(&dir1);
+    let t1: Txn =
+        serde_json::from_slice(&std::fs::read(dir2.join("pending.json")).unwrap()).unwrap();
     assert_eq!(t1.boots, 1);
 
     // 第 2 次开机仍未确认：开机马上退回
     let dev2 = Dev::new();
     dev2.reboot("boot-c");
     dev2.s().net_select = "Only_LTE".into();
-    let e2 = engine(&dev2, true, Some(dir.clone()));
+    let e2 = engine(&dev2, true, Some(dir2.clone()));
     e2.start().await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(dev2.s().writes, ["WL_AND_5G"]);
@@ -679,6 +703,7 @@ async fn takeover_marker_abandons_the_pending_change() {
     let op = op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
     tokio::time::sleep(Duration::from_secs(5)).await;
     std::fs::write(dir.join("takeover"), b"").unwrap();
+    let dir = crashed(&dir);
 
     let dev2 = Dev::new();
     let e2 = engine(&dev2, true, Some(dir.clone()));
@@ -726,6 +751,7 @@ async fn second_boot_with_another_sim_does_not_roll_back() {
     let mut t: Txn =
         serde_json::from_slice(&std::fs::read(dir.join("pending.json")).unwrap()).unwrap();
     t.boots = 1;
+    let dir = crashed(&dir);
     std::fs::write(dir.join("pending.json"), serde_json::to_vec(&t).unwrap()).unwrap();
 
     // 第 2 次开机，卡换了：不往新卡上写旧卡的值
@@ -794,4 +820,21 @@ async fn no_sim_device_still_confirms() {
         end(&settle(&e, &id(&a)).await),
         pair("confirmed", "verified")
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn timed_out_write_is_unknown_and_confirmed_by_readback() {
+    let dev = Dev::new();
+    dev.s().apply = Apply::TimeoutThenTake;
+    let e = engine(&dev, true, None);
+    let s = e.submit(req("Only_LTE", Source::Screen)).await;
+    let Submit::Applied { result, op } = s else {
+        panic!("{s:?}")
+    };
+    assert_eq!(result, Err("Request timed out".into()));
+    assert_eq!(op["phase"], "verifying");
+    // 前几拍读回还是旧值：不判 not_applied
+    let fin = settle(&e, &id(&op)).await;
+    assert_eq!(end(&fin), pair("confirmed", "verified"));
+    assert_eq!(dev.s().writes, ["Only_LTE"]);
 }

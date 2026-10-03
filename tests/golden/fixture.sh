@@ -63,6 +63,8 @@ setup_fixture() {
     export ZWRT_DATAD_BOOT_ID_PATH="$F/boot-id"
     # E4 事务落盘目录（pending.json）：每个情形一个干净的
     export ZWRT_DATAD_OPS_DIR="$F/ops"
+    # E4 T3：跨进程写锁、pid 文件（真机在 /var/run）
+    export ZWRT_DATAD_WRITE_LOCK="$F/write.lock" ZWRT_DATAD_PID_FILE="$F/zwrt-datad.pid"
     if [ "$UCI_MODE" = parse ]; then
         # R19：/etc/config 由 mock 内容生成；savedir 里 wireless 是 0 字节（= 没有未保存改动，照样解析），
         # dhcp 非空（= 有未保存改动，退回 uci show）。

@@ -146,6 +146,16 @@ pub enum Intent {
     Rollback,
 }
 
+/// 写调用的结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applied {
+    Done,
+    /// 调用报错：读回仍是旧值就是没写进去。
+    Failed,
+    /// 调用超时（D28）：原厂可能还在做，只按读回判断。
+    Unknown,
+}
+
 /// 驱动下一步要做的事。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Next {
@@ -265,13 +275,13 @@ impl Txn {
         self.intent = Some(Intent::Apply);
     }
 
-    /// 写调用回来了（成功或报错），开始等确认。
-    pub fn applied(&mut self, ok: bool, now: u64) {
+    /// 写调用回来了（成功、报错或超时），开始等确认。
+    pub fn applied(&mut self, outcome: Applied, now: u64) {
         if self.phase != Phase::Applying {
             return;
         }
         self.intent = None;
-        self.apply_failed = !ok;
+        self.apply_failed = outcome == Applied::Failed;
         self.wait_start_ms = now;
         self.seen_ms = now;
         self.step(Phase::Verifying);

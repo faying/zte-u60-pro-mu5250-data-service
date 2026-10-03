@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """旧触屏依赖的 /control 契约（E4 T1，D26），由 control_golden.sh 在 golden 比完后调用。
 
-  control_contract.py PORT FAIL_FILE
+  control_contract.py PORT FAIL_FILE WRITE_LOCK
 
 请求按触屏 data.c control_send 的原样发（HTTP/1.1 + Connection: close，写完不关，等回复）：
 1. 挂起到回复：动作做完之前一个字节都不回，做完回 200 和结果。
@@ -13,9 +13,12 @@ E4 有意改变的行为（write-op-layer.md「旧客户端」、D14，T2），�
 5. 事务进行中（锁被占）：旧请求「关数据」马上生效、回复逐字节同锁空时；进行中的事务记 preempted。
 6. 事务进行中：同一项的旧请求当覆盖写，回复逐字节同今天；别的来源的新写回 409 busy，说清谁在做什么。
 7. 「立即退回」：退回写下去并确认，终态 rolled_back/user_revert。
+8. 跨进程写锁（D29）：别人（应急直写脚本）拿着 flock 时，datad 的写等它放；只读的不等。
 SPDX-License-Identifier: MIT
 """
+import fcntl
 import json
+import os
 import select
 import socket
 import sys
@@ -25,6 +28,7 @@ import urllib.request
 
 PORT = int(sys.argv[1])
 FAIL_FILE = sys.argv[2]
+WRITE_LOCK = sys.argv[3]
 SET_MODE = '{"action":"network.set_mode","params":{"mode":"WL_AND_5G"}}'
 BAND = '{"action":"band.set_lte","params":{"bands":"1,3"}}'
 BUSY_BODY = b'{"action":"band.set_lte","error":{"code":"busy","message":"control queue full"},"ok":false}'
@@ -205,6 +209,31 @@ def user_revert() -> None:
         fail("已结束的事务还能退回：%r %r" % (status, raw))
 
 
+def write_lock_is_shared() -> None:
+    """E4（8）：像 u60-fallback.sh 那样拿着 flock 2 秒。"""
+    fd = os.open(WRITE_LOCK, os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        start = time.monotonic()
+        read = threading.Thread(target=lambda: post({"action": "op.status", "params": {}}))
+        write_result = []
+        write = threading.Thread(target=lambda: write_result.append(post({"action": "band.set_lte", "params": {"bands": "1,3"}})))
+        write.start()
+        read.start()
+        read.join(5)
+        if read.is_alive() or time.monotonic() - start > 1.0:
+            fail("只读请求也被写锁挡住了")
+        time.sleep(2 - (time.monotonic() - start))
+        if write_result:
+            fail("别人拿着写锁时 datad 照样写了：%r" % write_result)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    write.join(10)
+    if not write_result or write_result[0][0] != b"HTTP/1.1 200 OK":
+        fail("放锁以后写没做完：%r" % write_result)
+
+
 def state_ts() -> float:
     with urllib.request.urlopen("http://127.0.0.1:%d/state" % PORT, timeout=5) as r:
         return json.load(r)["ts"]
@@ -232,6 +261,7 @@ def main() -> int:
         legacy_data_off_preempts()
         legacy_same_item_and_busy()
         user_revert()
+        write_lock_is_shared()
         set_interval_applies()
     finally:
         clear()

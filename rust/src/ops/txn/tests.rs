@@ -31,7 +31,7 @@ fn txn(rollback: bool) -> Txn {
     );
     t.begin_apply();
     assert_eq!(t.intent, Some(Intent::Apply));
-    t.applied(true, 1_000);
+    t.applied(Applied::Done, 1_000);
     t
 }
 
@@ -93,7 +93,7 @@ fn apply_error_with_old_readback_is_not_applied_at_once() {
         0,
     );
     t.begin_apply();
-    t.applied(false, 0);
+    t.applied(Applied::Failed, 0);
     assert_eq!(t.on_reading(&read("WL_AND_5G", true), 2_000), Next::Done);
     assert_eq!(end(&t), (Phase::NotApplied, Some(Reason::Ignored)));
 }
@@ -449,4 +449,17 @@ fn blank_sim_reading_only_counts_time() {
     assert_eq!(t.on_reading(&blank, 3_000), Next::Wait);
     assert!(!t.read_ok);
     assert_eq!(t.phase, Phase::Verifying);
+}
+
+#[test]
+fn timed_out_write_is_judged_only_by_readback() {
+    let mut t = txn(true);
+    t.phase = Phase::Applying;
+    t.intent = Some(Intent::Apply);
+    t.applied(Applied::Unknown, 1_000);
+    assert!(!t.apply_failed);
+    // 原厂还在做：读回仍是旧值也不马上判没写进去
+    assert_eq!(t.on_reading(&read("WL_AND_5G", true), 3_000), Next::Wait);
+    assert_eq!(t.on_reading(&read("Only_LTE", true), 9_000), Next::Done);
+    assert_eq!(end(&t), (Phase::Confirmed, Some(Reason::Verified)));
 }

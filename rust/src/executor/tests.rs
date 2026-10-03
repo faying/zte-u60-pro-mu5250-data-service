@@ -16,6 +16,8 @@ enum Step {
     Fail(Duration),
     /// 等这么久（单请求超时），回超时。
     Timeout(Duration),
+    /// 永远不回（后端自己的超时也坏了）。
+    Hang,
 }
 
 #[derive(Default)]
@@ -105,6 +107,7 @@ impl UbusBackend for Mock {
                     detail: format!("ubus {object}: timed out"),
                 })
             }
+            Some(Step::Hang) => std::future::pending().await,
             None => {
                 let mut m = lock(&self.0);
                 if method == "set" {
@@ -134,6 +137,15 @@ impl Timed {
             .iter()
             .filter_map(|(t, e)| match e {
                 Event::Heartbeat(h) => Some((*t, h.seq)),
+                _ => None,
+            })
+            .collect()
+    }
+    fn heartbeat_ages(&self) -> Vec<(Instant, u64)> {
+        lock(&self.0)
+            .iter()
+            .filter_map(|(t, e)| match e {
+                Event::Heartbeat(h) => Some((*t, h.exec_age_ms)),
                 _ => None,
             })
             .collect()
@@ -946,6 +958,9 @@ async fn rounds_and_heartbeats_continue_under_control_flood() {
     }
     assert!(mock.times("a.list").len() >= 10);
     assert!(mock.times("ctl.set").len() >= 100, "控制任务也一直在做");
+    // V2-32：一直在前进，看门狗不会动
+    assert!(exec.exec_age_ms() < 1_000, "{}", exec.exec_age_ms());
+    assert!(!exec.stalled(Duration::from_secs(30)));
     for f in floods {
         f.await.unwrap();
     }
@@ -972,4 +987,147 @@ async fn control_calls_use_control_timeout_rounds_use_round_timeout() {
     .map(|(k, r)| (k.to_string(), *r))
     .collect();
     assert_eq!(log, want);
+}
+
+// ---- E4 T3：独立心跳与执行者进度（V2-22、V2-32）、超时关闸（V2-33） ----
+
+#[tokio::test(start_paused = true)]
+async fn long_reload_short_polls_keep_heartbeat_and_no_stall() {
+    // 原厂 reload 要 60 秒：先发 reload，再用 2 秒一次的短调用轮询，执行者一直在前进。
+    let (exec, mock, sink) = setup(vec![spec("a", 0)], Config::default(), 1000);
+    mock.default_step(
+        "wlan.reload",
+        Step::Reply(json!({}), Duration::from_millis(300)),
+    );
+    mock.default_step(
+        "wlan.status",
+        Step::Reply(json!({}), Duration::from_millis(100)),
+    );
+    exec.start_rounds(Arc::new(NoLegacy));
+    exec.start_heartbeat(Duration::from_secs(5));
+    let e = exec.clone();
+    let job = tokio::spawn(async move {
+        e.control(async {
+            call("wlan", "reload", &json!({})).await.unwrap();
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                call("wlan", "status", &json!({})).await.unwrap();
+            }
+        })
+        .await
+    });
+    let mut max_age = 0;
+    for _ in 0..62 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        max_age = max_age.max(exec.exec_age_ms());
+        assert!(!exec.stalled(Duration::from_secs(30)));
+    }
+    job.await.unwrap().unwrap();
+    assert!(max_age <= 2_500, "{max_age}");
+    // 控制任务占着执行者的 60 秒里，独立定时器照样补心跳（间隔不超过 10 秒），exec_age 都小
+    let hb = sink.heartbeat_ages();
+    let mut prev: Option<Instant> = None;
+    for (t, age) in &hb {
+        if let Some(p) = prev {
+            assert!(*t - p <= Duration::from_secs(10), "{:?}", *t - p);
+        }
+        assert!(*age <= 2_500, "{age}");
+        prev = Some(*t);
+    }
+    assert!(hb.len() >= 12, "{}", hb.len());
+}
+
+#[tokio::test(start_paused = true)]
+async fn stuck_call_is_reported_and_stalls_after_limit() {
+    let (exec, mock, sink) = setup(vec![spec("a", 0)], Config::default(), 1000);
+    mock.default_step("dev.set", Step::Hang);
+    exec.start_heartbeat(Duration::from_secs(5));
+    let e = exec.clone();
+    tokio::spawn(async move {
+        let _ = e
+            .control(async {
+                let _ = call("dev", "set", &json!({})).await;
+            })
+            .await;
+    });
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    // 还在调用自己的超时里
+    assert!(!exec.stalled(Duration::from_secs(30)));
+    tokio::time::sleep(Duration::from_secs(13)).await;
+    // 22 秒没前进：订阅方按 >20 秒判卡死（D12），看门狗还没到
+    assert!(exec.exec_age_ms() > 20_000, "{}", exec.exec_age_ms());
+    assert!(!exec.stalled(Duration::from_secs(30)));
+    let last = *sink.heartbeat_ages().last().unwrap();
+    assert!(last.1 > 15_000, "{last:?}");
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    assert!(exec.stalled(Duration::from_secs(30)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_executor_is_never_stalled() {
+    let (exec, _mock, sink) = setup(vec![spec("a", 0)], Config::default(), 1000);
+    exec.start_heartbeat(Duration::from_secs(5));
+    tokio::time::sleep(Duration::from_secs(100)).await;
+    assert_eq!(exec.exec_age_ms(), 0);
+    assert!(!exec.stalled(Duration::from_secs(30)));
+    // 没有采集轮也有心跳
+    let hb = sink.heartbeat_ages();
+    assert!(hb.len() >= 19, "{}", hb.len());
+    assert!(hb.iter().all(|(_, a)| *a == 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_holds_next_call_until_object_answers() {
+    // V2-33（D28）：写超时了，下一个调用之前先用只读请求探测这个对象，回答了才放行。
+    let (exec, mock, _) = setup(vec![spec("dev", 3600)], Config::default(), 1000);
+    mock.push("dev.set", Step::Timeout(Duration::from_secs(8)));
+    mock.push("dev.list", Step::Timeout(Duration::from_secs(8)));
+    mock.push(
+        "dev.list",
+        Step::Reply(json!({}), Duration::from_millis(50)),
+    );
+    let r = exec.call("dev", "set", &json!({"v":1})).await;
+    assert!(matches!(r, Err(UbusError::Timeout { .. })));
+    exec.call("dev", "set", &json!({"v":2})).await.unwrap();
+    assert_eq!(mock.names(), ["dev.set", "dev.list", "dev.list", "dev.set"]);
+    // 放闸以后不再探测
+    exec.call("other", "get", &json!({})).await.unwrap();
+    assert_eq!(mock.names().last().unwrap(), "other.get");
+    assert_eq!(mock.names().len(), 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn gate_opens_after_four_failed_probes() {
+    let (exec, mock, _) = setup(vec![], Config::default(), 1000);
+    mock.push("dev.set", Step::Timeout(Duration::from_secs(8)));
+    mock.default_step("system.board", Step::Timeout(Duration::from_secs(8)));
+    let t0 = Instant::now();
+    let _ = exec.call("dev", "set", &json!({})).await;
+    exec.call("dev", "get", &json!({})).await.unwrap();
+    // 块表里没有这个对象：问 ubusd 本身；4 次都超时也放行
+    assert_eq!(
+        mock.names(),
+        [
+            "dev.set",
+            "system.board",
+            "system.board",
+            "system.board",
+            "system.board",
+            "dev.get"
+        ]
+    );
+    assert_eq!(Instant::now() - t0, Duration::from_secs(40));
+}
+
+#[tokio::test(start_paused = true)]
+async fn round_timeouts_do_not_close_the_gate() {
+    let (exec, mock, _) = setup(vec![spec("a", 0)], Config::default(), 1000);
+    mock.push("a.list", Step::Timeout(Duration::from_secs(2)));
+    exec.start_rounds(Arc::new(NoLegacy));
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    exec.call("ctl", "set", &json!({})).await.unwrap();
+    let names = mock.names();
+    let i = names.iter().position(|n| n == "ctl.set").unwrap();
+    // 采集轮里的读超时不关闸：控制调用前面没有探测
+    assert_eq!(names[..i], ["a.list"]);
 }
