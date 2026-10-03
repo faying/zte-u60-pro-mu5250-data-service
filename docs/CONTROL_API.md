@@ -93,6 +93,13 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `modem.online` | — | `AT+CFUN=1`（`nwinfo_set_mode ONLINE` 拉不回 LPM） |
 | `apn.set_pdp_type` | `ipv6`（布尔） | 拨号 APN 的 PDP 类型改成 IPv4v6 / IPv4（其他字段照原样），再拉起或断开 IPv6 那条腿 |
 
+Wi-Fi（E4 T7b，zte-agent 的 Wi-Fi 页、热点开关、情景、家庭模式扫描用）：
+
+| action | params | 说明 |
+|---|---|---|
+| `wifi.apply` | `set`（uci 路径 → 值，1–32 项）、`reload?`（默认 true）、`best_effort?` | 只认 `wireless.{main,guest}_{2g,5g}.{ssid,key,encryption,hidden,isolate,disabled,guest_active_time}`、`wireless.wifi{0,1}.{country,channel,txpowerpercent,htmode,disabled}`、`zte_mbb.wifi.{wifi_onoff,wifi6_switch}`。值和 uci 一样也照写，每个包 commit 一次，再 reload 一次（agent 靠「总是写 + reload + 自己轮询 hostapd」重试修复，不看这里的回复判断成没成）。`best_effort` 时设不上的项跳过并列在 `skipped`。回 `{committed, skipped, reloaded, reload_error}` |
+| `wifi.reload` | — | 只 `zwrt_wlan reload` |
+
 AT 只发这两条固定命令。AT 口和 zte-agent 共用，两边都拿 `ZWRT_DATAD_AT_LOCK`（默认 `/var/run/u60-at.lock`，flock）；口是 `ZWRT_DATAD_AT_PORT`，没设就按 agent 的顺序找第一个回 OK 的。等到 OK/ERROR 就停，最多 6 秒。
 
 **流水账**（T5）：`ZWRT_DATAD_OPS_DIR` 下的 `journal.jsonl`，每行一个 JSON，带 `ts`（unix 秒）和 `t`（设备时钟的年月日时分秒，设备时钟本来就是当地时间）。会改设备的 `/control` 动作都记一行（`sms.mark_read` 不记）：事务结束时记 op_id、来源、SIM（ICCID 后 4 位/卡槽）、旧值、新值、退回目标、读回、终态和原因；不走事务的写记动作、来源（没有 source 记 `legacy`）、参数、`ok`/`failed` 和 HTTP 状态；旧请求队列的排队、被替换、丢掉也各记一行；重启、关机在执行前先记 `requested` 并等它写进闪存。密码类字段（Wi-Fi 密码、APN 用户名/密码、eSIM 激活码/确认码、PIN 等）只写 `(changed)`；ICCID、EID、IMSI、号码类字段只留后 4 位；短信动作不记参数。同一来源 + 同一项 + 同一原因的 `skipped` 只记开头一行（`skip:start`）和结束一行（`skip:end`，`count` = 一共跳过几次；原因变了，或这个来源对这一项有了别的记录时结束；计数在内存里，datad 重启时进行中的那段丢掉）。文件超过 `ZWRT_DATAD_JOURNAL_MAX_BYTES`（默认 262144）就改名为 `journal.1.jsonl`，两份合计不超过约 2 倍上限；单行最长 2 KB。`owners.json` 记每一项最后是谁写的（screen/web/legacy 的 `user` 为 true），流水账滚掉也不丢。

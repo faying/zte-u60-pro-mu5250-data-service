@@ -83,6 +83,8 @@ pub const E4_ACTIONS: &[&str] = &[
     "modem.airplane",
     "modem.online",
     "apn.set_pdp_type",
+    "wifi.apply",
+    "wifi.reload",
 ];
 
 fn object(params: &Value) -> &Map<String, Value> {
@@ -258,6 +260,8 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         // nwinfo_set_mode ONLINE 不能把基带从 LPM 拉回来，只有 AT+CFUN=1 行
         "modem.online" => at_outcome(crate::at::send(crate::at::Cmd::CfunOnline).await),
         "apn.set_pdp_type" => apn_pdp_type(params).await,
+        "wifi.apply" => wifi_apply(params).await,
+        "wifi.reload" => call("zwrt_wlan", "reload", json!({})).await,
         "band.reset" => {
             call(
                 "zte_nwinfo_api",
@@ -867,6 +871,126 @@ async fn client_rename(params: &Value) -> Outcome {
         json!({"mac":mac,"hostname":hostname}),
     )
     .await
+}
+
+/// uci keys `wifi.apply` may set (zte-agent's Wi-Fi pages, AP switch, scenario,
+/// home-mode scan): section → options.
+const WIFI_APPLY_KEYS: &[(&str, &[&str], &[&str])] = &[
+    (
+        "wireless",
+        &["main_2g", "main_5g", "guest_2g", "guest_5g"],
+        &[
+            "ssid",
+            "key",
+            "encryption",
+            "hidden",
+            "isolate",
+            "disabled",
+            "guest_active_time",
+        ],
+    ),
+    (
+        "wireless",
+        &["wifi0", "wifi1"],
+        &["country", "channel", "txpowerpercent", "htmode", "disabled"],
+    ),
+    ("zte_mbb", &["wifi"], &["wifi_onoff", "wifi6_switch"]),
+];
+
+fn wifi_apply_key_ok(path: &str) -> bool {
+    let mut it = path.splitn(3, '.');
+    let (Some(cfg), Some(sec), Some(opt)) = (it.next(), it.next(), it.next()) else {
+        return false;
+    };
+    WIFI_APPLY_KEYS
+        .iter()
+        .any(|(c, secs, opts)| *c == cfg && secs.contains(&sec) && opts.contains(&opt))
+}
+
+/// Several uci options at once, one commit per package, then (unless
+/// `reload:false`) one `zwrt_wlan reload` — written and reloaded even when uci
+/// already holds the values: the agent's AP switch retries that way, and its
+/// own verify (polling hostapd) is the judge, not this reply (E4 T7b).
+/// `best_effort:true`: an option that cannot be set (a guest section or an
+/// mbb key this firmware lacks) is skipped and listed, not an error.
+async fn wifi_apply(params: &Value) -> Outcome {
+    let Some(set) = object(params).get("set").and_then(Value::as_object) else {
+        return Outcome::Invalid("missing parameter: set".into());
+    };
+    if set.is_empty() || set.len() > 32 {
+        return Outcome::Invalid("set must have 1-32 options".into());
+    }
+    let reload = match object(params).get("reload") {
+        None => true,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Outcome::Invalid("reload must be boolean".into()),
+    };
+    let best_effort = object(params)
+        .get("best_effort")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut updates = Vec::new();
+    for (path, v) in set {
+        if !wifi_apply_key_ok(path) {
+            return Outcome::Invalid(format!("not a Wi-Fi option this action sets: {path}"));
+        }
+        let value = match v {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+            _ => {
+                return Outcome::Invalid(format!(
+                    "{path}: value must be a string, number or boolean"
+                ));
+            }
+        };
+        if value.len() > 128 || value.contains(['\0', '\r', '\n']) {
+            return Outcome::Invalid(format!("{path}: invalid value"));
+        }
+        updates.push((path.clone(), value));
+    }
+    let mut packages: Vec<&str> = Vec::new();
+    let mut skipped = Vec::new();
+    for (path, value) in &updates {
+        if let Err(e) = state::uci_write("set", path, Some(value)).await {
+            if best_effort {
+                skipped.push(path.clone());
+                continue;
+            }
+            for p in &packages {
+                let _ = state::uci_write("revert", p, None).await;
+            }
+            let pkg = path.split('.').next().unwrap_or("wireless");
+            let _ = state::uci_write("revert", pkg, None).await;
+            return Outcome::Failed(format!("{path}: {e}"));
+        }
+        let pkg = if path.starts_with("zte_mbb.") {
+            "zte_mbb"
+        } else {
+            "wireless"
+        };
+        if !packages.contains(&pkg) {
+            packages.push(pkg);
+        }
+    }
+    for p in &packages {
+        if let Err(e) = state::uci_write("commit", p, None).await {
+            return Outcome::Failed(format!("commit {p}: {e}"));
+        }
+    }
+    let mut reload_error = Value::Null;
+    if reload
+        && !packages.is_empty()
+        && let Err(e) = state::ubus("zwrt_wlan", "reload", json!({})).await
+    {
+        reload_error = json!(e);
+    }
+    Outcome::Ok(json!({
+        "committed": packages,
+        "skipped": skipped,
+        "reloaded": reload && !packages.is_empty() && reload_error.is_null(),
+        "reload_error": reload_error,
+    }))
 }
 
 async fn revert_wireless(error: String) -> Outcome {
@@ -2076,6 +2200,35 @@ async fn qos_clear() -> Outcome {
         }
     }
     Outcome::Ok(json!({"cleared":true,"files":cleared}))
+}
+
+#[cfg(test)]
+mod wifi_apply_tests {
+    use super::*;
+
+    #[test]
+    fn only_listed_options() {
+        for ok in [
+            "wireless.main_2g.disabled",
+            "wireless.guest_5g.key",
+            "wireless.wifi1.htmode",
+            "wireless.wifi0.country",
+            "zte_mbb.wifi.wifi6_switch",
+        ] {
+            assert!(wifi_apply_key_ok(ok), "{ok}");
+        }
+        for bad in [
+            "wireless.main_2g",
+            "wireless.main_2g.macfilter",
+            "wireless.wifi2.channel",
+            "network.lan.ipaddr",
+            "zte_mbb.wifi.fota",
+            "wireless.main_2g.ssid.x",
+            "wireless.wifi0.disabled;reboot",
+        ] {
+            assert!(!wifi_apply_key_ok(bad), "{bad}");
+        }
+    }
 }
 
 #[cfg(test)]

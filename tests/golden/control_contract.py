@@ -337,6 +337,24 @@ def netselect_session() -> None:
         fail("会话关了锁频还是 409：%r" % raw)
 
 
+def wifi_apply() -> None:
+    """T7b：agent 的 Wi-Fi 整组写；只认列出来的 uci 项，密码不进流水账。"""
+    secret = "Apply-Secret-4411"
+    status, raw = post({"action": "wifi.apply", "source": "web",
+                        "params": {"set": {"wireless.main_2g.ssid": "ApplyNet", "wireless.main_2g.key": secret},
+                                   "reload": False}})
+    reply = json.loads(raw)
+    if status != b"HTTP/1.1 200 OK" or reply["result"]["committed"] != ["wireless"] or reply["result"]["reloaded"]:
+        fail("wifi.apply 回复不对：%r %r" % (status, raw))
+    status, raw = post({"action": "wifi.apply", "source": "web", "params": {"set": {"network.lan.ipaddr": "10.0.0.1"}}})
+    if status != b"HTTP/1.1 400 Bad Request":
+        fail("wifi.apply 改 Wi-Fi 以外的项应该 400：%r %r" % (status, raw))
+    post({"action": "journal.list", "params": {"limit": 1}})
+    with open(os.path.join(OPS_DIR, "journal.jsonl"), encoding="utf-8") as f:
+        if secret in f.read():
+            fail("wifi.apply 的密码写进了流水账")
+
+
 def main() -> int:
     try:
         hang_until_done()
@@ -349,6 +367,7 @@ def main() -> int:
         set_interval_applies()
         journal()
         netselect_session()
+        wifi_apply()
     finally:
         clear()
     return 0
