@@ -1429,6 +1429,10 @@ pub struct NetView {
     pub ca_sub_en: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub mode_word_en: String,
+    /// E4 T13（V2-38）：首页卡要显示的结论 = `story` 叠上写操作。只在有写操作要叠时出现，
+    /// 客户端没有它就用 `story`。`story` 本身永远只是网络结论（netwatch 历史、深查都读它）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub home: Option<Story>,
 }
 
 fn carriers(d: &Data, v: &mut NetView) {
@@ -1643,7 +1647,7 @@ pub fn net_view_with(state: &Value, win: Option<CellWindow>) -> NetView {
     net_view_op(state, win, None)
 }
 
-/// 加上写操作（E4 T13，V2-38）。`nosvc` 仍按网络本身算。
+/// 加上写操作（E4 T13，V2-38）：叠好的放在 `home`，`story`、`nosvc` 仍按网络本身算。
 pub fn net_view_op(state: &Value, win: Option<CellWindow>, op: Option<&ScreenOp>) -> NetView {
     let d = parse(state);
     let mut v = NetView::default();
@@ -1698,7 +1702,7 @@ pub fn net_view_op(state: &Value, win: Option<CellWindow>, op: Option<&ScreenOp>
     };
     v.story = story(&nin);
     v.nosvc = matches!(v.story.state, State::Nosvc | State::Sos);
-    v.story = with_op(std::mem::take(&mut v.story), op);
+    v.home = op.map(|op| with_op(v.story.clone(), Some(op)));
 
     let home = imsi_plmn(&d.sim_imsi);
     v.have_home = home.is_some();

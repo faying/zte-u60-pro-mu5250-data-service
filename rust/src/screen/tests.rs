@@ -90,7 +90,7 @@ fn matches_the_screens_c_on_the_corpus() {
 /// L2 English siblings + story.state), so the Chinese still compares field by field.
 fn strip_added_fields(mut got: Value) -> Value {
     let o = got.as_object_mut().unwrap();
-    o.retain(|k, _| !k.ends_with("_en") && k != "mode_word" && k != "mode_auto");
+    o.retain(|k, _| !k.ends_with("_en") && k != "mode_word" && k != "mode_auto" && k != "home");
     let st = o.get_mut("story").unwrap().as_object_mut().unwrap();
     st.retain(|k, _| !k.ends_with("_en") && k != "state");
     got
@@ -1885,4 +1885,92 @@ fn story_sticky_result_rides_on_the_hint() {
         o.hint_en
     );
     check_pairs("sticky", &story_pairs(&o), &[]);
+}
+
+/// E4 T13：有写操作时（`net.home` + 顶层 `op`）旧触屏的缓冲也放得下：最长的值、
+/// 进行中 + 退回也没通的结果、整机重启过、撤销过。
+#[test]
+fn response_with_op_fits_the_old_screens_buffers() {
+    use crate::ops::{
+        spec::NETWORK_MODE,
+        txn::{Confirm, NewTxn, Phase, Reason, SimId, Source, Txn},
+        ui,
+    };
+    let mk = |phase: Phase, reason: Option<Reason>| {
+        let mut t = Txn::new(
+            NewTxn {
+                op_id: "x".repeat(64),
+                action: "network.set_mode".into(),
+                item: NETWORK_MODE.into(),
+                source: Source::Guard,
+                undo: true,
+                target: "Only_GSM_WCDMA".into(),
+                old: "TDSCDMA_AND_LTE".into(),
+                rollback_to: "WL_AND_NSA".into(),
+                sim: SimId {
+                    iccid: "8".repeat(20),
+                    slot: 2,
+                },
+                conn: None,
+                confirm: Confirm::Registered,
+                rollback_enabled: true,
+                deadline_ms: 120_000,
+                boot_id: "b".repeat(36),
+            },
+            0,
+        );
+        t.phase = phase;
+        t.reason = reason;
+        t.rollback_reason = Some(Reason::RebootLoop);
+        t.readback = Some("Only_TDSCDMA".into());
+        t.boots = 2;
+        t
+    };
+    let active = mk(Phase::Verifying, None);
+    let last = mk(Phase::RollbackFailed, Some(Reason::RollbackTimeout));
+    let strip = |mut v: Value| {
+        v.as_object_mut().unwrap().remove("age_ms");
+        v
+    };
+    let mut l = strip(ui::view(&last, 0, ui::Ctx::default()));
+    l["acked"] = Value::Bool(false);
+    l["needs_ack"] = Value::Bool(true);
+    let op = serde_json::json!({
+        "rollback_enabled": true,
+        "active": strip(ui::view(&active, 0, ui::Ctx::default())),
+        "last": l,
+    });
+    let state = worst_case_state();
+    let mut worst = (0, 0);
+    for so in [
+        ui::screen_op(Some(&active), None, 0).unwrap(),
+        ui::screen_op(None, Some((&last, false)), 0).unwrap(),
+        ui::screen_op(
+            None,
+            Some((&mk(Phase::Cancelled, Some(Reason::Preempted)), false)),
+            0,
+        )
+        .unwrap(),
+    ] {
+        let v = net_view_op(&state, None, Some(&so));
+        let home = v.home.clone().unwrap();
+        check_pairs("home", &story_pairs(&home), &[]);
+        let net = serde_json::to_string(&v).unwrap();
+        let resp = serde_json::to_string(&serde_json::json!({
+            "v": SCREEN_VERSION,
+            "ts": 1_759_300_000_000u64,
+            "net": v,
+            "op": op,
+        }))
+        .unwrap();
+        assert!(net.len() < NET_BUF, "net {}", net.len());
+        assert!(serde_json::to_string(&home).unwrap().len() < STORY_BUF);
+        assert!(
+            resp.len() + HTTP_HEADROOM <= RESP_BUF,
+            "response {}",
+            resp.len()
+        );
+        worst = (worst.0.max(net.len()), worst.1.max(resp.len()));
+    }
+    eprintln!("with op: net {} bytes, response {} bytes", worst.0, worst.1);
 }

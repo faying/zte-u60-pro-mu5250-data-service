@@ -442,12 +442,26 @@ impl<D: Device> Engine<D> {
         self.publish(&st);
     }
 
-    /// `/v2/screen` 顶层的 `op`（按请求那一刻算）。
+    /// `op` 块（按这一刻算）。
+    #[cfg(test)]
     pub fn block(&self) -> Value {
         self.lock().block(self.inner.cfg.rollback, self.now())
     }
 
+    /// `/v2/screen` 用的两样，在同一把锁里算（叠在首页的和 `op` 不会一个是进行中、一个已结束）。
+    pub fn screen(&self) -> (Option<ScreenOp>, Value) {
+        let st = self.lock();
+        let now = self.now();
+        let op = ui::screen_op(
+            st.active.as_deref(),
+            st.last.as_ref().map(|l| (&l.txn, l.acked)),
+            now,
+        );
+        (op, st.block(self.inner.cfg.rollback, now))
+    }
+
     /// 首页结论要叠的写操作（V2-38）。
+    #[cfg(test)]
     pub fn screen_op(&self) -> Option<ScreenOp> {
         let st = self.lock();
         ui::screen_op(

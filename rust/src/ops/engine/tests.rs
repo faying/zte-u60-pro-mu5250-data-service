@@ -1263,13 +1263,22 @@ async fn ack_is_shared_and_journaled() {
     assert!(e.screen_op().is_none());
     // 网页再点：照样成功，不重复记账
     assert!(e.ack(&id(&op), Source::Web).is_ok());
-    e.record().flush().await;
-    let acks: Vec<Value> = e
-        .record()
-        .list(50)
-        .into_iter()
-        .filter(|l| l["action"] == "op.ack")
-        .collect();
+    // flush 的 2 秒上限按测试的暂停时钟算，会提前到点：按真实时间等写者线程
+    let acks = || -> Vec<Value> {
+        e.record()
+            .list(50)
+            .into_iter()
+            .filter(|l| l["action"] == "op.ack")
+            .collect()
+    };
+    for _ in 0..200 {
+        if !acks().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let acks = acks();
     assert_eq!(acks.len(), 1, "{acks:?}");
     assert_eq!(acks[0]["source"], "screen");
     assert_eq!(acks[0]["op_id"], op["op_id"]);

@@ -506,16 +506,13 @@ async fn v2_screen(State(app): State<App>) -> Json<Value> {
     let snap = app.snapshot().await;
     let ts = snap.ts;
     let state = serde_json::to_value(&snap).unwrap_or(Value::Null);
+    // E4 T13（V2-34、V2-38）：叠在首页的和 op 在同一把锁里算。
+    let (screen_op, op) = app.inner.ops.screen();
     Json(serde_json::json!({
         "v": crate::screen::SCREEN_VERSION,
         "ts": ts,
-        "net": crate::screen::net_view_op(
-            &state,
-            crate::cell_window::current(),
-            app.inner.ops.screen_op().as_ref(),
-        ),
-        // E4 T13（V2-34）：和 /v2 的 op 块同一份，按这一刻算。
-        "op": app.inner.ops.block(),
+        "net": crate::screen::net_view_op(&state, crate::cell_window::current(), screen_op.as_ref()),
+        "op": op,
     }))
 }
 

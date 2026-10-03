@@ -374,9 +374,11 @@ def op_ack_and_screen() -> None:
         wait_final(s["op_id"])
     op_id = take_lock()
     scr = get("/v2/screen")
-    story = scr["net"]["story"]
+    story = scr["net"]["home"]
     if scr["op"]["active"]["op_id"] != op_id or story["state"] != "changing" or story["tone"] != "neutral":
         fail("进行中时 /v2/screen 不对：%r" % scr)
+    if scr["net"]["story"]["state"] == "changing":
+        fail("net.story 要一直是网络结论（netwatch、深查读它）：%r" % scr["net"]["story"])
     if story["headline"] != "正在确认" or "后没通就退回到" not in story["hint"] and "还剩" not in story["hint"]:
         fail("进行中的首页文字不对：%r" % story)
     blocks = get("/v2/state")["blocks"]
@@ -389,8 +391,8 @@ def op_ack_and_screen() -> None:
     last = scr["op"]["last"]
     if last["op_id"] != op_id or last["needs_ack"] is not True or last["say_zh"] != "保留只用 4G · 没确认通":
         fail("保留之后的结果行不对：%r" % last)
-    if not scr["net"]["story"]["hint"].endswith("保留只用 4G · 没确认通"):
-        fail("常驻结果没接在首页提示后面：%r" % scr["net"]["story"])
+    if not scr["net"]["home"]["hint"].endswith("保留只用 4G · 没确认通"):
+        fail("常驻结果没接在首页提示后面：%r" % scr["net"])
     status, raw = post({"action": "op.ack", "params": {"op_id": op_id}})
     if status != b"HTTP/1.1 400 Bad Request":
         fail("没有 source 的 op.ack 应该 400：%r %r" % (status, raw))
@@ -402,7 +404,7 @@ def op_ack_and_screen() -> None:
         if status != b"HTTP/1.1 200 OK" or json.loads(raw)["result"]["acked"] is not True:
             fail("op.ack 回复不对：%r %r" % (status, raw))
     scr = get("/v2/screen")
-    if scr["op"]["last"]["needs_ack"] is not False or scr["net"]["story"]["hint"].endswith("没确认通"):
+    if scr["op"]["last"]["needs_ack"] is not False or "home" in scr["net"]:
         fail("点了「知道了」还在：%r" % scr)
     entries = json.loads(post({"action": "journal.list", "params": {"limit": 20}})[1])["result"]["entries"]
     acks = [e for e in entries if e.get("action") == "op.ack"]

@@ -284,6 +284,7 @@ datad 启动时把 pid 写进 `ZWRT_DATAD_PID_FILE`（默认 `/var/run/zwrt-data
 - `can_revert`、`can_keep`：现在点「退回 X」「保留 Y」有没有用（在等确认、没有在途的写）。
 - `undo`：进行中为 null；结束了是 `{"ok", "label_zh/_en"（撤销/重做）, "why_zh/_en"（不能撤时的原因）, "value"}`（V2-36）。
 英文都是 ASCII、没有句号；首页大字 ≤ 10 个字符，所以进行中的英文不带省略号（Switching / Checking / Reverting）。
+`brief` 的结果只在这次连接里亲眼看到它结束时显示 3 秒（这个 op_id 在 `active` 里出现过，或者 `last.op_id` 在连接期间变了）；刚连上、刚重启拿到的第一份里的 `brief` 不显示（块里不带结束了多久）。
 测试：`every_text_row_has_zh_and_en_within_budget`、`steps_follow_readings`
 
 **V2-36** 能不能撤销（DD10，按动作 + 终态）：confirmed、unverified 能撤；rolled_back、not_applied 不能（「设置没变 · 不用撤销」）；rollback_failed 不能（用「再试一次退回」）；
@@ -295,12 +296,14 @@ cancelled 里 sim_changed 不能（「换过卡」）、superseded 不能（「�
 `last` 和 `acked` 落盘在 `ZWRT_DATAD_OPS_DIR` 的 `last.json`，datad 重启后结果还在、点过的不再出现。同一项下一次结束的事务自然接替 `last`。不受事务锁、不进执行者。
 测试：`ack_is_shared_and_journaled`、`last_result_survives_restart`
 
-**V2-38** 首页结论（`/v2/screen` 的 `story`）加两档，排在「无 SIM」「移动网络已关」之后、「只能紧急呼叫」「无服务」「没连上网」之前
+**V2-38** 首页卡的结论放在 `/v2/screen` 的 `net.home`（只在有写操作要叠时出现，没有就用 `net.story`）。`net.story` 永远只是网络结论：agent 的 netwatch 历史和深查读它，写操作不能把它们带偏。
+`home` 比 `story` 多两档，排在「无 SIM」「移动网络已关」之后、「只能紧急呼叫」「无服务」「没连上网」之前
 （换制式时常会先经过无服务，DD3 和用户旅程第 3 步要的是不出红色）：
 - `changing`：有进行中的事务。中性色；大字是 `say`（正在换制式 / 正在确认 / 正在退回），提示是倒计时那行（`{t}` 已换好）。
 - `revert_fail`：`last` 是退回也没通、还没点「知道了」。红色；大字「退回也没通」/`Failed`，提示写现在的值（读不到写「当前设置未知」）、上次确认的值和下一步。
-其他常驻类结果还没点「知道了」时，大字照旧是网络结论，提示末尾加一句结果（DD16）。没有事务时和以前逐字段一样（对照样本不变）。
-测试：`story_changing_beats_no_service_and_offline`、`story_revert_fail_takes_the_card`、`story_sticky_result_rides_on_the_hint`
+其他常驻类结果还没点「知道了」时，大字照旧是网络结论，提示末尾加一句结果（DD16）。没有要叠的就没有 `home`，`/v2/screen` 和以前逐字段一样（对照样本不变）。
+旧触屏的缓冲（回复 16 KB、`net` 8 KB）在最坏情况下（最长的值、进行中 + 退回也没通、重启过）也放得下。
+测试：`story_changing_beats_no_service_and_offline`、`story_revert_fail_takes_the_card`、`story_sticky_result_rides_on_the_hint`、`response_with_op_fits_the_old_screens_buffers`
 
 **V2-39** busy 回复的 `doing` 加 `say_zh/_en`：「正在换制式（触屏发起，32 秒），稍等」/「Busy: network mode (Screen)」；搜网会话是「正在搜网」/「network search」。
 测试：`busy_reply_says_who_and_what`
