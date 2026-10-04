@@ -1,7 +1,8 @@
 # zwrt-datad 性能审计（MU5250，2026-10-04）
 
 对象：本 fork `main@9b89948`，对照上游 `33333s/zwrt-datad` v0.10.56（`54a2395`，合并为 `97f4561`）到 `upstream/main@85786d7`。
-本次改动在分支 `perf/ubus-cooldown-fallback`，**不改默认行为、不碰设备**；设备上试跑见第 7 节。
+本次改动在分支 `perf/ubus-cooldown-fallback`，**不改默认行为、不碰设备**：不设新环境变量时，程序行为和 `main` 完全一样
+（后端仍是 `cli`，冷却关着）。设备上试跑见第 7 节。
 
 ## 1. 结论先说
 
@@ -9,7 +10,8 @@
    本 fork 已有：纯 Rust ubusd 客户端（`rust/src/ubus/client.rs`）、单一执行者（`rust/src/executor.rs`）、块调度与每轮预算（`rust/src/block.rs`）。
 2. **最大的瓶颈是部署配置，不是代码**：后端默认 `cli`（`rust/src/ubus/backend.rs` `BackendKind::parse`），
    设备的启动脚本没有设 `ZWRT_DATAD_UBUS`，所以设备上**每个 ubus 调用仍然 fork 一个 `ubus call`**。socket 后端写好了、测过了，但没打开。
-3. 上游比我们多的、值得学的只有两点：socket 不可用时**自动退回 CLI**，以及超时对象的**跨轮冷却**。本分支两点都按自己的代码实现了，见第 4 节。
+3. 上游比我们多的、值得学的只有两点：socket 不可用时**自动退回 CLI**，以及超时对象的**跨轮冷却**。本分支两点都按自己的代码实现了，见第 4 节；
+   两点都要靠环境变量打开（`ZWRT_DATAD_UBUS=auto`、`ZWRT_DATAD_UBUS_COOLDOWN_MS=10000`）。
 4. 自适应降频、心跳去重、上游的「OK 无数据回 `{}`」、`/state` 加 `ubus_stats`：都**不做**，理由见第 5 节。
 
 ## 2. 架构对照
@@ -60,6 +62,12 @@
 - `/proc`、sysfs 和 UCI 文件读取是同步 `std::fs`，都在执行者任务里，单次很小。
 - `qos.rs` `read_tail` 每 30 秒同步读最多 2 MiB×2 的日志尾（`MAX_LOG_BYTES`），是唯一一处较大的同步读，记为低优先级。
 
+**控制请求不会被采集饿死**：
+- 控制任务在每块之前、旧采集每个 `ubus_ttl` 之前（`preempt`）、轮间执行；`drain` 只做进入时已排队的任务，持续进来的控制请求也挡不住采集轮和心跳。
+- 已有测试证明这几点：`control_runs_before_next_block`、`legacy_calls_are_preempted_by_control_and_not_budget_cut`、
+  `control_queue_ten_requests_eight_ordered_two_busy`、`rounds_and_heartbeats_continue_under_control_flood`（`rust/src/executor/tests.rs`）。
+- 最坏等待是一个在途调用：cli 8 秒；socket 采集轮里 2 秒。
+
 **消费方依赖**（决定哪些「优化」不能做）：
 - 触屏（touch-ui `src/data.c`）只订 `/events`：
   - 任何字节都算活着，45 秒静默就重连；靠 axum 默认 15 秒 keep-alive（`server.rs` `KeepAlive::new()`）。
@@ -70,12 +78,24 @@
   - `seq` 必须连续。
   - 电池/充电块 stale 超过 30 秒就自己读 ubus，并写降级标记。
 
+**消费方读、但文档（`docs/*.md`、`rust/COMPATIBILITY.md`）没写明的字段**（本分支一个都没动）：
+- `/state`：
+  - `net.nr_band`
+  - `interfaces.cellular.{enable, connect_status, roam_enable}`（schema 里只写了 `"cellular": {}`）
+  - `net.wan_dns`；`uci_device_info.wan_dns` 是 shell 引号包着的字符串
+  - 旧 C 版名字 `net.cell_id` / `net.channel`，消费方用来兜底 `lte_cell_id` / `lte_channel`
+- `/v2/screen`：`net.mode_auto`、载波的 `sinr_tone`。
+- 缺字段语义：
+  - 触屏多数字段「缺 = 0」；例外：`cpu_usage` 缺 = -1，`wlan.enabled` 缺 = 1，`cellular.enable`/`roam_enable` 缺 = -1（不知道），`exec_age_ms` 缺 = -1（旧 datad）。
+  - agent：块缺 `stale` 算 `true`，`data: null` 算「不知道」。
+  - 这些都应补进文档，单独做。
+
 ## 4. 瓶颈排序与本分支的改动
 
 | # | 瓶颈 | 影响 | 处理 |
 |---|---|---|---|
 | 1 | 设备跑 `cli` 后端，约 5 次/秒 fork `ubus call` | 设备实测 `ubus call` 3～5 ms/次，socket 0～1 ms/次（9-29 只读探测）；估算省约 1.5～2.5% 单核，**是估算，未在设备上量** | 本分支加 `auto`（socket + 肯定没送到才退回 CLI），设备按第 7 节旁路试跑后再把启动脚本换成 `auto` |
-| 2 | 旧采集里挂住的对象每轮都吃满超时（cli 8 秒、socket 2 秒） | 每轮都被拖慢，别的数据也跟着变旧 | 本分支加跨轮冷却（默认 10 秒，`ZWRT_DATAD_UBUS_COOLDOWN_MS`） |
+| 2 | 旧采集里挂住的对象每轮都吃满超时（cli 8 秒、socket 2 秒） | 每轮都被拖慢，别的数据也跟着变旧 | 本分支加跨轮冷却（`ZWRT_DATAD_UBUS_COOLDOWN_MS`，默认关，建议 10000） |
 | 3 | `extra_wifi::tick` 每 5 秒 2 次 `uci get` | 约 0.4 次/秒 fork | 待办：改用进程内 UCI 解析，先核对 `uci -q get` 在缺选项、`/tmp/.uci` 有改动时的行为 |
 | 4 | qos 每 30 秒同步读 ≤4 MiB | 偶发几毫秒阻塞执行者 | 待办，低优先级 |
 | 5 | `/events` 每个客户端各自序列化一次 | 只有触屏一个客户端，等于一次 | 不做 |
@@ -84,7 +104,8 @@
 - 只管旧采集里的调用：超时后，该对象在冷却期内的采集调用直接返回 `Skipped`，不发请求。
 - 块不冷却：块有 V2-21 的 5 秒失败重读，电池/充电不能空到 agent 的 30 秒 stale 线。
 - 控制任务、内部任务、写闸探测都不管冷却。
-- 默认 10 秒，不照搬上游的 30 秒：我们 socket 采集超时只有 2 秒，`zte_nwinfo_api` 等基带对象在 socket 上还没核实过，
+- **默认关**：不设变量时和原来一样只按本轮跳过，免得以后哪次顺手换 datad 时，把没试过的行为带上设备。
+- 建议值 10 秒，不照搬上游的 30 秒：我们 socket 采集超时只有 2 秒，`zte_nwinfo_api` 等基带对象在 socket 上还没核实过，
   一次「慢但有效」的回复就可能踩到超时，30 秒会让信号数据空太久。`0` 关掉，恢复原来「只本轮跳过」。
 - 已有的 `ubus_ttl` 对 TTL>0 的调用本来就把失败缓存 5 秒，所以冷却主要作用在每轮都读的三个对象上。
 
@@ -94,6 +115,9 @@
   之后 30 秒（`FALLBACK_RETRY`）都走 CLI，到时再试 socket。
 - 服务报错、找不到对象、OK 无数据都是 ubusd 的回答，不退回。
 - INVOKE 写出去之后的超时不退回、不重发：写操作不能做两次（测试 `auto_never_resends_an_invoke_that_may_have_run`）。
+- 时间上限：退回的那一次 CLI 只拿 8 秒减去 socket 已用掉的时间（至少 0.5 秒）。
+  所以 ubusd 收连接却不回 HELLO 时，一次调用也不会变成「8 秒 socket + 8 秒 CLI」；
+  执行者的 `CALL_LIMIT`（10 秒）、看门狗，以及触屏和 agent 的 20 秒卡住线，前提都不变（测试 `auto_fallback_stays_within_the_cli_timeout`）。
 - `socket` 保持「从不退回」，默认仍是 `cli`：设备上的账本按启动环境记 `ubus=…`，默认值不能在程序里悄悄变。
 
 **本分支没改的**：`/state`、`/events`、`/v2` 的字段和推送节奏；`/control` 语义；块表；golden 全部不变（CI 第 12、13 步）。
@@ -136,23 +160,29 @@ cargo test --release bench_socket_vs_cli -- --ignored --nocapture   # BENCH_N �
 - `client_reports_whether_the_invoke_may_have_been_sent`
 - `auto_falls_back_to_cli_while_ubusd_is_down_then_retries_socket`
 - `auto_never_resends_an_invoke_that_may_have_run`
+- `auto_fallback_stays_within_the_cli_timeout`
 - `cooldown_env_parsing`
+
+**本地没量的**：控制请求排队等待时间、`/state` 新鲜度、SSE 推送延迟、RSS 和峰值内存、长时间运行。
+这些只有在设备上量才有意义，放在第 7 节。
 
 ## 7. 设备试跑方案（未执行）
 
 每一步都要用户同意；先拿设备锁，按 datad 旁路试跑流程。
 
 1. **只读核对基带对象**：`zwrt-datad --ubus-compare zte_nwinfo_api:nwinfo_get_netinfo zwrt_data:get_wwaniface zwrt_zte_mdm.api:get_sim_info …`。9-29 只核过 `system`、`zwrt_bsp.battery`。
-2. **基线 10 分钟**：在现行 datad（cli）下用同一套采样脚本记：
+2. **基线**：在现行 datad（cli）下用同一套采样脚本记：
    - datad 的 `/proc/<pid>/stat` utime+stime 增量
    - 整机 fork 次数（`/proc/stat` processes 增量）
    - RSS / VmHWM
    - 心跳间隔、`exec_age_ms` 最大值
    - `/v2/screen` 拉取延迟 p50/p95/p99
    - 一次 `state.set_interval` 控制往返延迟
-3. **候选 10 分钟**：旁路起本分支的程序，带 `ZWRT_DATAD_UBUS=auto`。同样负载、同样亮屏状态，采同样的指标，另看 stderr 里有没有退回、冷却的日志。
+3. **候选**：旁路起本分支的程序，带 `ZWRT_DATAD_UBUS=auto ZWRT_DATAD_UBUS_COOLDOWN_MS=10000`。同样负载、同样亮屏状态，采同样的指标，另看 stderr 里有没有退回、冷却的日志。
 4. **故障**：试跑期间不重启 ubusd、不断 WAN（会动原厂服务）；这两种情况只用 mock 测试覆盖，真机只在自然发生时看日志。
-5. **判定**：
+5. **时长由用户定**：新传输方式要承载 `zte_nwinfo_api`、`zwrt_zte_mdm.api` 这些基带读取，按「碰基带的长观察」规则，
+   旁路 10 分钟只够查崩溃和明显异常；正式切换前观察多久，由用户决定。
+6. **判定**：
    - datad CPU 和整机 fork 明显下降，心跳间隔不变差，0 次退回，golden 字段一致，才把启动脚本改成 `auto`（单独提交，并更新账本检查项）。
    - 否则保持 `cli`。
 
@@ -160,7 +190,8 @@ cargo test --release bench_socket_vs_cli -- --ignored --nocapture   # BENCH_N �
 
 | 项 | 复杂度 | 风险 |
 |---|---|---|
-| 设备按第 7 节试跑，通过后启动脚本加 `ZWRT_DATAD_UBUS=auto` | S | 基带对象在 socket 上没核实过：先做第 1 步 |
+| 设备按第 7 节试跑，通过后启动脚本加 `ZWRT_DATAD_UBUS=auto`（冷却另定） | S | 基带对象在 socket 上没核实过：先做第 1 步 |
+| 把第 3 节列出的未文档化字段和缺字段语义补进 `docs/STATE_SCHEMA.md` | S | — |
 | `extra_wifi` 的 `uci get` 改进程内解析 | S | `/tmp/.uci` 改动和缺选项的语义要先对齐 |
 | qos 日志尾读改增量读（记住偏移） | S | 日志轮转 |
 | 短信事件改直连 ubusd 订阅（去掉常驻 `ubus listen`） | M | 事件路径在设备上没核实过（STATE_V2 第 241 行附近） |

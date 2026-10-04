@@ -8,6 +8,8 @@
 //! - `Auto`：走 socket；请求**肯定没送到**时（连不上 ubusd、没收到 HELLO、LOOKUP 失败、INVOKE 没写出去，
 //!   见 `UbusClient::last_call_not_sent`）这一次改用 `ubus call`，之后 `FALLBACK_RETRY`（30 秒）内都走 CLI，
 //!   到时再试 socket。INVOKE 写出去之后的超时、断开不退回、不重发。`socket` 则从不退回。
+//!   退回的那一次 CLI 只给 CLI 超时（8 秒）减去 socket 已用掉的时间（至少 `FALLBACK_MIN`），
+//!   所以一次调用总共仍不超过 8 秒左右，执行者的 `CALL_LIMIT`（10 秒）和看门狗的前提不变。
 //!
 //! 执行者（`executor.rs`）持有一个 `Backend`；`state::ubus` 经执行者调到这里（T4）。
 
@@ -32,6 +34,8 @@ pub const CLI_TIMEOUT: Duration = Duration::from_secs(8);
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(8);
 /// `auto`：socket 不可用后多久内都走 CLI，再试 socket（同上游 v0.10.56）。
 pub const FALLBACK_RETRY: Duration = Duration::from_secs(30);
+/// 退回的那一次 CLI 至少给这么久。
+pub const FALLBACK_MIN: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
@@ -259,6 +263,7 @@ impl UbusBackend for AutoBackend {
         if self.cli_until.take().is_some() {
             eprintln!("zwrt-datad: trying the ubus socket again");
         }
+        let start = Instant::now();
         match self.socket.call(object, method, args).await {
             Err(e)
                 if matches!(
@@ -272,7 +277,12 @@ impl UbusBackend for AutoBackend {
                     "zwrt-datad: ubus socket unusable ({e}); using `ubus call` for {} s",
                     self.retry.as_secs()
                 );
-                self.cli.call(object, method, args).await
+                // 这一次的总时间不超过 CLI 自己的超时（见模块说明）。
+                let full = self.cli.timeout;
+                self.cli.timeout = full.saturating_sub(start.elapsed()).max(FALLBACK_MIN);
+                let r = self.cli.call(object, method, args).await;
+                self.cli.timeout = full;
+                r
             }
             r => r,
         }

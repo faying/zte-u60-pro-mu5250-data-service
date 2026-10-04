@@ -887,3 +887,39 @@ async fn bench_socket_vs_cli() {
     }
     report("cli", lat, n);
 }
+
+#[tokio::test]
+async fn auto_fallback_stays_within_the_cli_timeout() {
+    // ubusd 收下连接却不发 HELLO：socket 用掉自己的超时后退回 CLI，CLI 只拿剩下的时间，
+    // 一次调用总共不超过 CLI 的超时（加最少保留时间），不会变成 socket 超时 + 整个 CLI 超时。
+    let path = std::env::temp_dir().join(format!("zwrt-ubus-nohello-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let held = tokio::spawn(async move {
+        let mut conns = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            conns.push(s);
+        }
+    });
+    let (dir, _, _) = counting_cli("nohello");
+    let slow = script(&dir, "slow.sh", "sleep 5");
+    let cli_timeout = Duration::from_millis(1200);
+    let mut b = AutoBackend::new(
+        SocketBackend::new(UbusClient::with_timeout(&path, Duration::from_millis(700))),
+        CliBackend::new(slow, cli_timeout),
+        Duration::from_secs(30),
+    );
+    b.set_round(true);
+    let t0 = Instant::now();
+    let e = auto_call(&mut b, "svc", "get").await.unwrap_err();
+    let took = t0.elapsed();
+    assert!(e.is_timeout(), "{e:?}");
+    assert_eq!(b.fallbacks, 1);
+    assert!(
+        took < cli_timeout + Duration::from_millis(300),
+        "took {took:?}, socket 700 ms + CLI should be capped at {cli_timeout:?}"
+    );
+    held.abort();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -48,9 +48,10 @@ pub const CONTROL_QUEUE: usize = 8;
 pub const CALL_LIMIT: Duration = Duration::from_secs(10);
 /// V2-33：调用超时后最多探测几次。
 pub const GATE_PROBES: u32 = 4;
-/// 旧采集里超时过的对象跨轮冷却多久（`ZWRT_DATAD_UBUS_COOLDOWN_MS`，0 = 关，只按本轮跳过）。
-/// 上游 v0.10.56 用 30 秒（它的采集超时是 5 秒）；我们 socket 采集超时 2 秒，慢但有效的基带回复
-/// 也可能踩到，所以取短一些，免得信号数据空太久。
+/// 旧采集里超时过的对象跨轮冷却的建议值（`ZWRT_DATAD_UBUS_COOLDOWN_MS=10000`）。**默认关**（0，只按本轮跳过），
+/// 设备试跑验证后才在启动环境里打开。上游 v0.10.56 用 30 秒（它的采集超时是 5 秒）；我们 socket 采集超时 2 秒，
+/// 慢但有效的基带回复也可能踩到，所以取短一些，免得信号数据空太久。
+#[allow(dead_code)] // 建议值：程序里不用（默认关），测试和文档引用
 pub const COOLDOWN: Duration = Duration::from_secs(10);
 pub const ENV_COOLDOWN_MS: &str = "ZWRT_DATAD_UBUS_COOLDOWN_MS";
 
@@ -60,16 +61,16 @@ pub struct Config {
     /// `ZWRT_DATAD_CACHE` 没设成 0。
     pub cache: bool,
     pub control_queue: usize,
-    /// 旧采集里超时的对象之后多久不再调（跨轮）。块不受影响（块有自己的失败重读间隔）。
+    /// 旧采集里超时的对象之后多久不再调（跨轮；0 = 关，默认）。块不受影响（块有自己的失败重读间隔）。
     pub cooldown: Duration,
 }
 
 impl Config {
-    /// `ZWRT_DATAD_UBUS_COOLDOWN_MS` 的值：未设置或不是数字 → 默认；0 → 关。
+    /// `ZWRT_DATAD_UBUS_COOLDOWN_MS` 的值：未设置、不是数字或 0 → 关；否则这么多毫秒。
     pub fn cooldown_from(value: Option<&str>) -> Duration {
         value
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(COOLDOWN, Duration::from_millis)
+            .map_or(Duration::ZERO, Duration::from_millis)
     }
 }
 
@@ -79,7 +80,7 @@ impl Default for Config {
             budget: ROUND_BUDGET,
             cache: true,
             control_queue: CONTROL_QUEUE,
-            cooldown: COOLDOWN,
+            cooldown: Duration::ZERO,
         }
     }
 }

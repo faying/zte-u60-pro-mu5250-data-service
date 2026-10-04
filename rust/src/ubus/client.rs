@@ -48,7 +48,7 @@ pub enum UbusError {
     InvalidArgument(String),
     /// 在截止时间内没等到 STATUS。连接已关闭、该对象 ID 缓存已作废；本轮应跳过这个对象（V2-18）。
     Timeout { object: String, detail: String },
-    /// 该对象本轮已经超时过，这次没有发请求（`call_in_round`）。
+    /// 该对象本轮已经超时过、或还在跨轮冷却里（执行者），这次没有发请求。
     Skipped { object: String },
     /// 对象没注册（LOOKUP 回 NOT_FOUND，或 NOT_FOUND 后重新 LOOKUP 仍不行）。
     NotFound { object: String },
@@ -91,7 +91,7 @@ impl fmt::Display for UbusError {
             Self::InvalidArgument(m) | Self::Io(m) => f.write_str(m),
             Self::Timeout { detail, .. } | Self::NoData { detail, .. } => f.write_str(detail),
             Self::Skipped { object } => {
-                write!(f, "ubus {object}: skipped after timeout this round")
+                write!(f, "ubus {object}: skipped after a recent timeout")
             }
             Self::NotFound { object } => {
                 write!(f, "ubus {object}: {}", status::name(status::NOT_FOUND))
