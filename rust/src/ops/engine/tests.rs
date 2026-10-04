@@ -1380,7 +1380,7 @@ async fn user_write_while_confirming_never_rolls_back() {
     assert!(b["active"].is_null());
     assert_eq!(b["last"]["op_id"], op_id);
     assert_eq!(b["last"]["reason"], "other_change");
-    assert_eq!(b["last"]["say_zh"], "你又改了别的设置，不再自动切回");
+    assert_eq!(b["last"]["say_zh"], "改了别的设置，不再自动退回");
     assert_eq!(b["last"]["needs_ack"], true);
     // 锁空了：新的写能做
     let next = op_of(&e.submit(req("Only_5G", Source::Scenario)).await);

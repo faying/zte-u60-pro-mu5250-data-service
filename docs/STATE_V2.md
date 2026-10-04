@@ -329,7 +329,7 @@ cancelled 里 sim_changed 不能（「换过卡」）、superseded 不能（「�
 
 **V2-42** 确认中的其他写（D40）：事务进行中（含退回中）来了影响上网的写（会话期间收 409 的那些，描述表里的动作除外；加上回自动、重拨、
 `cellular.connect/disconnect`、`vendor.call` 的 STC 小区锁和 SIM PIN/PUK/NCK），按来源：用户的（screen、web、没有 source 的旧请求）照做，
-同时取消自动退回，终态 `cancelled/other_change`（`stay` 为 `sticky`，`say_zh`「你又改了别的设置，不再自动切回」/ `say_en`「You changed something else; it won't switch back by itself」，
+同时取消自动退回，终态 `cancelled/other_change`（`stay` 为 `sticky`，`say_zh`「改了别的设置，不再自动退回」/ `say_en`「Other change; no auto revert」，
 英文比别的结果长，客户端按两行或截断显示；撤销规则同其他 cancelled）；自动来源（guard、scenario、scheduler、auto）回 409
 `{"ok":false,"action":…,"error":{"code":"op_busy","message":…,"op":{"op_id","item","phase"}}}`，不做、不记账。关数据/关漫游照旧插队（preempted）。
 在执行者里真要做之前判断：执行者队列满回 503 的请求不会取消事务。

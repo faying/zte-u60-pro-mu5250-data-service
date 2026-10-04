@@ -146,8 +146,8 @@ pub fn final_line(
         // D40：确认或退回中用户又改了别的影响上网的设置（文字照设计稿）
         (Cancelled, Some(OtherChange)) => (
             "warn",
-            "你又改了别的设置，不再自动切回".into(),
-            "You changed something else; it won't switch back by itself".into(),
+            "改了别的设置，不再自动退回".into(),
+            "Other change; no auto revert".into(),
         ),
         (Cancelled, _) => (
             "warn",
