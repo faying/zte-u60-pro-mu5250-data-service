@@ -327,4 +327,22 @@ cancelled 里 sim_changed 不能（「换过卡」）、superseded 不能（「�
 `request` 是照发就行的写（`{action, undo: true, params}`，客户端加上顶层 `source`），能撤时才有用。行本身的 `undo`（这一行是不是撤销）不变。
 测试：`every_entry_kind_reads_as_a_sentence`、`only_the_latest_change_of_an_item_can_be_undone`
 
+**V2-42** 确认中的其他写（D40）：事务进行中（含退回中）来了影响上网的写（会话期间收 409 的那些，描述表里的动作除外；加上回自动、重拨、
+`cellular.connect/disconnect`、`vendor.call` 的 STC 小区锁和 SIM PIN/PUK/NCK），按来源：用户的（screen、web、没有 source 的旧请求）照做，
+同时取消自动退回，终态 `cancelled/other_change`（`stay` 为 `sticky`，`say_zh`「你又改了别的设置，不再自动切回」/ `say_en`「You changed something else; it won't switch back by itself」，
+英文比别的结果长，客户端按两行或截断显示；撤销规则同其他 cancelled）；自动来源（guard、scenario、scheduler、auto）回 409
+`{"ok":false,"action":…,"error":{"code":"op_busy","message":…,"op":{"op_id","item","phase"}}}`，不做、不记账。关数据/关漫游照旧插队（preempted）。
+在执行者里真要做之前判断：执行者队列满回 503 的请求不会取消事务。
+测试：`other_write_by_source_while_confirming`、`user_write_while_confirming_never_rolls_back`、`network_affecting_writes`
+
+**V2-43** `op.interrupt`（D40）：agent 里不经 datad 的用户写（eSIM 切换、AT 终端）之前发 `{"source":"screen"|"web","params":{"what":…}}`。
+有进行中的事务就取消（other_change），回 `{"interrupted":true,"op_id":…}`，流水账另记一行 `{"action":"op.interrupt","what":…}`（改动记录里 `hide`，取消已经在事务那一行）；
+没有就回 `{"interrupted":false}`。别的来源、没有 `what` 回 400 `invalid_parameter`。不受事务锁、不进执行者。
+测试：`interrupt_cancels_and_records_what`
+
+**V2-44** 第一次打开自动退回的提示（DD18）：`op` 块（`/v2` 和 `/v2/screen` 的同一份）在自动退回开着（`ZWRT_DATAD_ROLLBACK=1`）且没人点过「知道了」时加 `"notice":"rollback_on"`；
+否则没有这个键（块和以前逐字段一样）。`op.notice_ack`（顶层 `source` 只认 screen/web）记在 `ZWRT_DATAD_OPS_DIR` 的 `notice.json`（`{"acked":["rollback_on"]}`），
+两边点一次都算、datad 重启后也不再出现；点过再点照样回 `{"notice":"rollback_on","acked":true}`，只记一次账（`hide`）。
+测试：`rollback_notice_until_acked`
+
 不在 datad 的几行（客户端自己判断的）：「数据服务没响应」（心跳 `exec_age_ms`，V2-32）、「和设备断开了 · 操作结果未知」（网页）、改动记录的空和读不到，归触屏 T8、网页 T9 和术语表 T14。

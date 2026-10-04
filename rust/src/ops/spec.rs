@@ -65,10 +65,88 @@ pub fn is_safety(action: &str, params: &Value) -> bool {
             .all(|k| crate::control::boolean(params, k) == Ok(false))
 }
 
+/// D40：`vendor.call` 里影响上网的 (对象, 方法)：STC 小区锁、SIM PIN/PUK/网络锁。
+const NETWORK_VENDOR_CALLS: &[(&str, &str)] = &[
+    ("zte_nwinfo_api", "nwinfo_set_stc_white_list_par"),
+    ("zte_nwinfo_api", "nwinfo_stc_cell_lock_enable"),
+    ("zte_nwinfo_api", "nwinfo_stc_cell_lock_disable"),
+    ("zte_nwinfo_api", "nwinfo_stc_cell_lock_reset"),
+    ("zwrt_zte_mdm.api", "sim_verify_pin_puk"),
+    ("zwrt_zte_mdm.api", "sim_change_pin"),
+    ("zwrt_zte_mdm.api", "sim_change_pin_mode"),
+    ("zwrt_zte_mdm.api", "set_simlock_nck"),
+];
+
+/// D40：事务在确认或退回中时要按来源处理的「影响上网的写」：会话期间收 409 的那些（描述表里的动作除外，
+/// 同一项由引擎按覆盖处理）、回自动和重拨、连接/断开数据、`vendor.call` 的 STC 小区锁和 SIM PIN 类。
+/// 搜网会话的步骤照会话规则；安全类写（[`is_safety`]）由调用方先排除，照旧插队。
+pub fn affects_network(action: &str, params: &Value) -> bool {
+    use super::engine::{SESSION_BLOCKS, SESSION_OPTIONAL};
+    if find(action).is_some() {
+        return false;
+    }
+    if SESSION_BLOCKS.contains(&action)
+        || SESSION_OPTIONAL.contains(&action)
+        || matches!(action, "cellular.connect" | "cellular.disconnect")
+    {
+        return true;
+    }
+    action == "vendor.call"
+        && NETWORK_VENDOR_CALLS.iter().any(|(o, m)| {
+            params.get("object").and_then(Value::as_str) == Some(o)
+                && params.get("method").and_then(Value::as_str) == Some(m)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn network_affecting_writes() {
+        for a in [
+            "cellular.set",
+            "band.set_lte",
+            "band.reset",
+            "cell.lock_nr",
+            "apn.modify",
+            "sim.set_slot",
+            "modem.airplane",
+            "modem.online",
+            "apn.set_pdp_type",
+            "netselect.auto",
+            "cellular.redial",
+            "cellular.connect",
+            "cellular.disconnect",
+        ] {
+            assert!(affects_network(a, &json!({})), "{a}");
+        }
+        // 描述表里的（引擎按同一项处理）、搜网步骤、别的写都不算
+        for a in [
+            "network.set_mode",
+            "netselect.scan",
+            "netselect.register",
+            "sms.delete",
+            "wifi.apply",
+            "usb.set",
+        ] {
+            assert!(!affects_network(a, &json!({})), "{a}");
+        }
+        let v = |o: &str, m: &str| affects_network("vendor.call", &json!({"object":o,"method":m}));
+        assert!(v("zte_nwinfo_api", "nwinfo_stc_cell_lock_enable"));
+        assert!(v("zte_nwinfo_api", "nwinfo_set_stc_white_list_par"));
+        assert!(v("zwrt_zte_mdm.api", "sim_verify_pin_puk"));
+        assert!(v("zwrt_zte_mdm.api", "set_simlock_nck"));
+        assert!(!v("zte_nwinfo_api", "nwinfo_start_detect_signal_quality"));
+        assert!(!v("zwrt_router.api", "router_set_dmz"));
+        assert!(!v("zwrt_router.api", "sim_change_pin"));
+        assert!(!affects_network("vendor.call", &json!({})));
+        // 表里的每一行都在 VENDOR_CALLS 里（不会因为改名悄悄失效）
+        for pair in NETWORK_VENDOR_CALLS {
+            assert!(crate::control::VENDOR_CALLS.contains(pair), "{pair:?}");
+        }
+    }
 
     #[test]
     fn safety_is_only_switching_off() {

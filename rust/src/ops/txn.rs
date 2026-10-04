@@ -12,10 +12,10 @@
 //! | rolled_back | timeout / user_revert / reboot_loop |
 //! | not_applied | ignored（读回从没变成过目标值） |
 //! | rollback_failed | rollback_timeout |
-//! | cancelled | superseded / preempted / manual_change / takeover / sim_changed |
+//! | cancelled | superseded / preempted / manual_change / takeover / sim_changed / other_change |
 //!
 //! 确认（T4，D25、D33、D34）：配置读回 = 目标 + 已注册；「应当有数据」时还要数据通：
-//! 已连接、有 IPv4、在蜂窝接口上一次 DNS 探测成功。APN 另外要求「写之后的新连接」。
+//! 已连接、有 IPv4（没有 IPv4 时有 IPv6，D41）、在蜂窝接口上一次 DNS 探测成功。APN 另外要求「写之后的新连接」。
 //! 退回也按同一条规则确认。
 
 use serde::{Deserialize, Serialize};
@@ -112,6 +112,8 @@ pub enum Reason {
     Takeover,
     SimChanged,
     ApnNoData,
+    /// D40：确认或退回中，用户又改了别的影响上网的设置（或 agent 发了 `op.interrupt`），不再自动退回。
+    OtherChange,
     /// 不需要确认的动作（状态文案表有这一行；描述表里还没有这类动作）。
     NoVerify,
 }
@@ -127,11 +129,14 @@ pub enum Confirm {
     Apn,
 }
 
-/// 一条数据连接的身份：IPv4 地址 + 从什么时候起（BOOTTIME 毫秒，按 netifd 的 uptime 秒数推算，
-/// 前后两次读数会差不到 1 秒）。
+/// 一条数据连接的身份：地址 + 从什么时候起（BOOTTIME 毫秒，按 netifd 的 uptime 秒数推算，
+/// 前后两次读数会差不到 1 秒）。地址是 IPv4；没有 IPv4 时用 IPv6（D41，只有 IPv6 的连接）。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conn {
     pub ipv4: String,
+    /// 只在没有 IPv4 时填（有 IPv4 时身份照旧只看 IPv4）。旧版落的盘里没有这个字段。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ipv6: String,
     pub up_since_ms: Option<u64>,
 }
 
@@ -139,8 +144,22 @@ pub struct Conn {
 const CONN_JITTER_MS: u64 = 2_000;
 
 impl Conn {
+    /// 连接身份用的地址：有 IPv4 用 IPv4，否则 IPv6；都没有为空。
+    pub fn addr(&self) -> &str {
+        if self.ipv4.is_empty() {
+            &self.ipv6
+        } else {
+            &self.ipv4
+        }
+    }
+
+    /// 只有 IPv6（确认时探测走 IPv6 DNS）。
+    pub fn v6_only(&self) -> bool {
+        self.ipv4.is_empty() && !self.ipv6.is_empty()
+    }
+
     fn same(&self, other: &Conn) -> bool {
-        self.ipv4 == other.ipv4
+        self.addr() == other.addr()
             && match (self.up_since_ms, other.up_since_ms) {
                 (Some(a), Some(b)) => a.abs_diff(b) <= CONN_JITTER_MS,
                 _ => true,
@@ -156,17 +175,20 @@ pub struct DataPath {
     /// `get_wwaniface` 的 connect_status 是已连接。
     pub connected: bool,
     pub conn: Conn,
-    /// 蜂窝数据接口（`get_wwaniface` 的 ipv4_dev_name，空时用 netifd 的 l3_device）。
+    /// 蜂窝数据接口（`get_wwaniface` 的 ipv4_dev_name，空时用 netifd 的 l3_device；只有 IPv6 时用
+    /// ipv6_dev_name，空时用 `zte_wan6` 的 l3_device）。
     pub iface: String,
-    /// 运营商 DNS（IPv4 的在前）。
+    /// 运营商 DNS（IPv4 的在前；只有 IPv6 时是 IPv6 的）。
     pub dns: Vec<String>,
 }
 
-/// 一次 DNS 探测要用的：绑定哪个接口、问哪几个 DNS。
+/// 一次 DNS 探测要用的：绑定哪个接口、问哪几个 DNS、走 IPv4 还是 IPv6（D41：连接只有 IPv6 时
+/// 向 IPv6 DNS 发 AAAA 查询）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProbeTarget {
     pub iface: String,
     pub dns: Vec<String>,
+    pub v6: bool,
 }
 
 /// D25：一轮最多探测失败 3 次，两次之间至少隔 5 秒。一轮都失败后，隔 30 秒再来一轮；换了连接
@@ -459,7 +481,7 @@ impl Txn {
             return true;
         }
         if let Some(r) = &self.ref_conn
-            && r.ipv4 != c.ipv4
+            && r.addr() != c.addr()
         {
             return true;
         }
@@ -490,7 +512,7 @@ impl Txn {
             }
             Some(true) => {}
         }
-        if !d.connected || d.conn.ipv4.is_empty() {
+        if !d.connected || d.conn.addr().is_empty() {
             return Err(None);
         }
         if self.confirm == Confirm::Apn && !self.new_conn(&d.conn) {
@@ -499,11 +521,12 @@ impl Txn {
         Err(Some(ProbeTarget {
             iface: d.iface.clone(),
             dns: d.dns.clone(),
+            v6: d.conn.v6_only(),
         }))
     }
 
     /// 这个读数要不要先做一次 DNS 探测（驱动在锁外做，结果填进 `Reading::probe` 再喂进来）。
-    /// 只在别的条件都齐了才探测：读回 = 正在等的值、已注册、SIM 没变、应当有数据、已连接有 IPv4
+    /// 只在别的条件都齐了才探测：读回 = 正在等的值、已注册、SIM 没变、应当有数据、已连接有 IPv4 或 IPv6
     /// （APN 还要新连接）。一轮失败满 3 次，同一条连接上要隔 30 秒才来下一轮；两次之间至少隔 5 秒。
     pub fn wants_probe(&self, r: &Reading, now: u64) -> Option<ProbeTarget> {
         if !self.waiting() || self.intent.is_some() || !r.registered {
@@ -583,7 +606,7 @@ impl Txn {
         }
         self.seen_ms = now;
         if let Some(d) = &r.data
-            && !d.conn.ipv4.is_empty()
+            && !d.conn.addr().is_empty()
         {
             self.last_conn = Some(d.conn.clone());
         }
@@ -686,7 +709,8 @@ impl Txn {
         }
     }
 
-    /// 被打断：同一项的覆盖写（superseded）、安全类写（preempted）、触屏接管（takeover）。
+    /// 被打断：同一项的覆盖写（superseded）、安全类写（preempted）、触屏接管（takeover）、
+    /// 用户的其他影响上网的写（other_change，D40）。
     pub fn cancel(&mut self, why: Reason) {
         if !self.phase.is_final() {
             self.finish(Phase::Cancelled, why);

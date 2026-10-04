@@ -131,6 +131,14 @@ const RECENT: usize = 16;
 /// 等确认期间至少隔这么久落一次盘（重启后算上一次开机等了多久）。
 const SEEN_SAVE_MS: u64 = 10_000;
 
+/// DD18：第一次打开自动退回时的提示。
+pub const NOTICE_ROLLBACK_ON: &str = "rollback_on";
+
+/// D40：事务进行中来了影响上网的写，自动来源被挡回（409 `op_busy`）时说清是哪个事务。
+fn busy_op(t: &Txn) -> Value {
+    json!({"op_id": t.op_id, "item": t.item, "phase": t.phase})
+}
+
 /// 搜网会话（D17）：agent 的搜网/手动注册/回自动流程期间占住写锁。
 #[derive(Clone, Debug)]
 struct Session {
@@ -180,6 +188,8 @@ struct St {
     saved_seen_ms: u64,
     /// 最近结束的事务（界面上的结果行，V2-34、V2-37）。
     last: Option<Last>,
+    /// DD18：「自动退回已打开」的提示有人点过「知道了」（`notice.json`）。
+    notice_acked: bool,
 }
 
 struct Inner<D> {
@@ -271,6 +281,7 @@ impl St {
     }
 
     /// `op` 块（V2-34）。不带 `age_ms`：它每拍都变，没有进行中的事务时块要保持不变、不发。
+    /// 自动退回开着、还没人点过「知道了」时加 `notice: "rollback_on"`（V2-44）；没有时不带这个键。
     fn block(&self, rollback_enabled: bool, now: u64) -> Value {
         let view = |t: &Txn| {
             let mut v = self.view(t, now);
@@ -285,11 +296,15 @@ impl St {
             v["needs_ack"] = json!(!l.acked && ui::sticky(&l.txn));
             v
         });
-        json!({
+        let mut b = json!({
             "rollback_enabled": rollback_enabled,
             "active": self.active.as_deref().map(view),
             "last": last,
-        })
+        });
+        if rollback_enabled && !self.notice_acked {
+            b["notice"] = json!(NOTICE_ROLLBACK_ON);
+        }
+        b
     }
 
     fn remember(&mut self, t: Txn) {
@@ -362,6 +377,7 @@ fn doing(t: &Txn, now: u64) -> Value {
 impl<D: Device> Engine<D> {
     pub fn new(dev: D, cfg: Config, store: Store, record: Record) -> Self {
         let last = store.load_last();
+        let notice_acked = store.notice_acked(NOTICE_ROLLBACK_ON);
         Self {
             inner: Arc::new(Inner {
                 dev,
@@ -370,6 +386,7 @@ impl<D: Device> Engine<D> {
                 record,
                 st: Mutex::new(St {
                     last,
+                    notice_acked,
                     ..St::default()
                 }),
                 wake: Notify::new(),
@@ -492,6 +509,68 @@ impl<D: Device> Engine<D> {
         Ok(json!({"op_id": op_id, "acked": true}))
     }
 
+    /// 「自动退回已打开」的提示点「知道了」（DD18，V2-44）：落盘到 `notice.json`，触屏和网页点一次都算。
+    /// 点过再点照样成功、不重复记账。
+    pub fn notice_ack(&self, source: Source) -> Value {
+        let mut st = self.lock();
+        if !st.notice_acked {
+            st.notice_acked = true;
+            self.inner.store.save_notice_ack(NOTICE_ROLLBACK_ON);
+            self.inner.record.append(json!({
+                "source": source,
+                "action": "op.notice_ack",
+                "notice": NOTICE_ROLLBACK_ON,
+                "result": "ok",
+            }));
+        }
+        self.publish(&st);
+        json!({"notice": NOTICE_ROLLBACK_ON, "acked": true})
+    }
+
+    /// D40：事务在确认或退回中时来了影响上网的写（安全类写不走这里，照旧插队）。
+    /// 用户的（screen、web、legacy）照做，同时取消这次自动退回（other_change）；自动来源的挡回去，
+    /// 返回进行中的事务（`op_id`、`item`、`phase`），调用方回 409 `op_busy`。没有进行中的事务就照做。
+    pub fn other_write(&self, source: Source) -> Result<(), Value> {
+        {
+            let mut st = self.lock();
+            let Some(t) = st.active.as_mut() else {
+                return Ok(());
+            };
+            if !source.is_user() {
+                return Err(busy_op(t));
+            }
+            t.cancel(Reason::OtherChange);
+            self.finish(&mut st);
+        }
+        self.kick_legacy();
+        Ok(())
+    }
+
+    /// `op.interrupt`（D40）：agent 里不经 datad 的用户写（eSIM 切换、AT 终端）之前发。有进行中的事务就
+    /// 取消（other_change），流水账另记一行带 `what`；没有就什么都不做。
+    pub fn interrupt(&self, source: Source, what: &str) -> Value {
+        let op_id = {
+            let mut st = self.lock();
+            let Some(t) = st.active.as_mut() else {
+                return json!({"interrupted": false});
+            };
+            t.cancel(Reason::OtherChange);
+            let (op_id, item) = (t.op_id.clone(), t.item.clone());
+            self.finish(&mut st);
+            self.inner.record.append(json!({
+                "source": source,
+                "action": "op.interrupt",
+                "op_id": op_id,
+                "item": item,
+                "what": what,
+                "result": "ok",
+            }));
+            op_id
+        };
+        self.kick_legacy();
+        json!({"interrupted": true, "op_id": op_id})
+    }
+
     /// datad 启动时：有落盘的事务就接着跑（D13、D18、D31）。没有就什么都不读（不多发 ubus）。
     /// 整个过程拿着跨进程写锁（D29）：应急直写正在写时，等它写完再看 takeover 标记。
     pub async fn start(&self) {
@@ -562,7 +641,11 @@ impl<D: Device> Engine<D> {
                 sim,
                 data,
                 ..
-            }) => (v, sim, data.map(|d| d.conn).filter(|c| !c.ipv4.is_empty())),
+            }) => (
+                v,
+                sim,
+                data.map(|d| d.conn).filter(|c| !c.addr().is_empty()),
+            ),
             Ok(_) => {
                 return Submit::NoCapture("cannot read current value: not reported".into());
             }

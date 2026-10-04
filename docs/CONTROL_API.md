@@ -57,10 +57,11 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 {"action":"network.set_mode","source":"screen","op_id":"screen-42","params":{"mode":"Only_LTE"}}
 ```
 
-- 写之前读当前值和 SIM（完整 ICCID + 卡槽），写之后按新鲜读数确认：配置读回 = 目标值且已注册；「应当有数据」（`get_wwaniface` 数据开关开，且不在漫游或漫游开关开）时还要数据通：`connect_status` 已连接、`zte_wan` 有 IPv4，并且一次绑定蜂窝接口（`get_wwaniface` 的 `ipv4_dev_name`）的 DNS 查询有回答（问运营商 DNS；一轮最多失败 3 次、间隔至少 5 秒，一轮都失败后同一条连接隔 30 秒再来一轮，换了连接马上重新计；通了就停）。不应当有数据时不发任何探测。退回也按同一条规则确认。成功回 200 `{"ok":true,"action":…,"result":<原厂回复>,"op":<状态>}`；写调用报错回 502，`op` 照样带上（事务按读回判断）；写之前读不到当前值回 502，没动设备。
+- 写之前读当前值和 SIM（完整 ICCID + 卡槽），写之后按新鲜读数确认：配置读回 = 目标值且已注册；「应当有数据」（`get_wwaniface` 数据开关开，且不在漫游或漫游开关开）时还要数据通：`connect_status` 已连接、`zte_wan` 有 IPv4，并且一次绑定蜂窝接口（`get_wwaniface` 的 `ipv4_dev_name`）的 DNS 查询有回答（问运营商 DNS；连接没有 IPv4 时（D41）改看 `zte_wan6`：有 IPv6 地址就用它当连接身份，绑定 `ipv6_dev_name`（空时用 `zte_wan6` 的 `l3_device`）向前两个 IPv6 DNS（`zte_wan6` 的 `dns-server`，没有时用 `get_wwaniface` 的 `ipv6_dns_prefer`/`ipv6_dns_standby`）发 AAAA 查询，同样绝不发不绑定接口的查询；一轮最多失败 3 次、间隔至少 5 秒，一轮都失败后同一条连接隔 30 秒再来一轮，换了连接马上重新计；通了就停）。不应当有数据时不发任何探测。退回也按同一条规则确认。成功回 200 `{"ok":true,"action":…,"result":<原厂回复>,"op":<状态>}`；写调用报错回 502，`op` 照样带上（事务按读回判断）；写之前读不到当前值回 502，没动设备。
 - 同一时刻只有一个进行中的事务。别的写回 **409** `{"error":{"code":"busy"},"doing":{op_id,action,source,phase,age_ms}}`。能插队的：同一项的用户写（screen/web/legacy）和 guard（旧事务记 `superseded`，新事务的退回目标继承旧事务的）、关数据/关漫游（`cellular.set` 只含 `enabled`/`roaming` 且都为关，旧事务记 `preempted`）。
+- **确认中的其他写**（D40，STATE_V2.md V2-42）：事务在进行中时，影响上网的写（会话期间收 409 的那些，描述表里的动作除外；加上 `netselect.auto`、`cellular.redial`、`cellular.connect`、`cellular.disconnect`，以及 `vendor.call` 的 STC 小区锁和 SIM PIN/PUK/NCK）按来源处理：用户的（`screen`、`web`、没有 source 的旧请求）照做，同时取消这次自动退回，事务记 `cancelled/other_change`（旧请求的回复逐字节不变）；自动来源（`guard`、`scenario`、`scheduler`、`auto`）不做、不记账，回 **409** `{"ok":false,"action":…,"error":{"code":"op_busy","message":"a change is being confirmed; try again after it ends","op":{"op_id","item","phase"}}}`，等事务结束再发。关数据/关漫游照旧插队（`preempted`）。
 - 到点没确认：自动退回默认关（`ZWRT_DATAD_ROLLBACK=1` 才开），关着时以 `unverified/no_rollback` 结束；读回从没变成目标值以 `not_applied/ignored` 结束（不退回）。
-- 状态（`op`）：`phase` 为 `accepted`、`applying`、`verifying`、`rolling_back` 或终态 `confirmed`、`unverified`、`rolled_back`、`not_applied`、`rollback_failed`、`cancelled`；`reason` 见设计稿「状态表」，另有 `sim_changed`（D32）、`reboot_loop`（D13）。`ever_matched` = 读回对上过目标值（对上过、数据一直不通，到点按没通处理，不算 `not_applied`），`data_ok` = 数据这一关过了。
+- 状态（`op`）：`phase` 为 `accepted`、`applying`、`verifying`、`rolling_back` 或终态 `confirmed`、`unverified`、`rolled_back`、`not_applied`、`rollback_failed`、`cancelled`；`reason` 见设计稿「状态表」，另有 `sim_changed`（D32）、`reboot_loop`（D13）、`other_change`（D40：确认中用户又改了别的影响上网的设置，或 agent 发了 `op.interrupt`）。`ever_matched` = 读回对上过目标值（对上过、数据一直不通，到点按没通处理，不算 `not_applied`），`data_ok` = 数据这一关过了。
 - 界面用的字段（`say_zh/_en`、`steps`、`undo`、`next_zh/_en` …）、`/v2` 的 `op` 块和首页「进行中」档见 STATE_V2.md 第 12 节（E4 T13）。busy 的 `doing` 也带 `say_zh/_en`。
 - `op.*`、`journal.*` 和会话、E4 新动作不进 `/capabilities`：它属于冻结的旧接口（回复要逐字节不变）。新客户端看 `/v2/screen` 有没有 `op` 判断 datad 支不支持。
 
@@ -70,6 +71,8 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `op.revert` | `op_id` | 立即退回（自动退回关着也能用）；不在等确认时回 409 `invalid_state` |
 | `op.keep` | `op_id` | 保留现状，取消退回，记 `confirmed/user_keep` |
 | `op.ack` | `op_id` | 「知道了」：只记账，要顶层 `source`（screen/web）；只能点最近结束的那个（`op` 块的 `last`），点过再点照样成功。别的 op_id 回 409 `invalid_state`（STATE_V2.md V2-37） |
+| `op.interrupt` | `what`（如 `esim`、`at`） | agent 里不经 datad 的用户写之前发（D40）：要顶层 `source`（screen/web，否则 400）；有进行中的事务就取消（`cancelled/other_change`，流水账另记一行带 `what`），回 `{"interrupted":true,"op_id":…}`；没有回 `{"interrupted":false}`（STATE_V2.md V2-43） |
+| `op.notice_ack` | 无 | 「自动退回已打开」的提示点「知道了」（DD18）：要顶层 `source`（screen/web，否则 400）；回 `{"notice":"rollback_on","acked":true}`，记在 `ZWRT_DATAD_OPS_DIR` 的 `notice.json`，之后 `op` 块不再带 `notice`（STATE_V2.md V2-44） |
 
 | `journal.append` | `item` 或 `action`、`result`，可选 `reason`、`old`、`new`、`detail` 等 | 只记账（eSIM、CHILL 这类不经 `/control` 的改动由 agent 补记）；要顶层 `source`；`result` 为 `skipped` 时按下面的规则合并。不受事务锁、不进执行者队列 |
 | `journal.list` | `limit?`（默认 50，最多 500） | `{"entries":[…新的在前],"owners":{项:{source,user,undo,value,op_id,ts,t}}}`；每行另带界面显示用的 `what_zh/_en`、`change_zh/_en`、`result_zh/_en`、`mark`、`source_zh/_en`、`hide`、`undo_view`（STATE_V2.md V2-41） |

@@ -229,6 +229,14 @@ fn every_text_row_has_zh_and_en_within_budget() {
             "warn",
             "sticky",
         ),
+        (
+            Cancelled,
+            OtherChange,
+            "你又改了别的设置，不再自动切回",
+            "You changed something else; it won't switch back by itself",
+            "warn",
+            "sticky",
+        ),
     ];
     for &(phase, reason, zh, en, mark, stay) in rows {
         let v = view(&ended(phase, reason), 5_000, Ctx::default());
@@ -242,8 +250,10 @@ fn every_text_row_has_zh_and_en_within_budget() {
             matches!(stay, "sticky" | "alert")
         );
         check_en(&what, en);
-        // 事务行：值用剩余宽度、末尾 …；这里只防明显过长
-        assert!(en.len() <= 32 && zh.chars().count() <= 20, "{what}");
+        // 事务行：值用剩余宽度、末尾 …；这里只防明显过长。
+        // other_change 的英文是设计稿 D40 定的原文，比别的长，界面按两行或截断处理（T19/T20）。
+        let en_budget = if reason == OtherChange { 64 } else { 32 };
+        assert!(en.len() <= en_budget && zh.chars().count() <= 20, "{what}");
         assert!(
             v["next_zh"].is_null() && v["remaining_ms"].is_null(),
             "{what}"

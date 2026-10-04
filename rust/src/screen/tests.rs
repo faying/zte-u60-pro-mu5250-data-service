@@ -1995,6 +1995,7 @@ fn response_with_op_fits_the_old_screens_buffers() {
         "rollback_enabled": true,
         "active": strip(ui::view(&active, 0, ui::Ctx::default())),
         "last": l,
+        "notice": "rollback_on",
     });
     let state = worst_case_state();
     let mut worst = (0, 0);
@@ -2004,6 +2005,13 @@ fn response_with_op_fits_the_old_screens_buffers() {
         ui::screen_op(
             None,
             Some((&mk(Phase::Cancelled, Some(Reason::Preempted)), false)),
+            0,
+        )
+        .unwrap(),
+        // D40：最长的常驻结果
+        ui::screen_op(
+            None,
+            Some((&mk(Phase::Cancelled, Some(Reason::OtherChange)), false)),
             0,
         )
         .unwrap(),

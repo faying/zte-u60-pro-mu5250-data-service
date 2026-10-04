@@ -257,7 +257,8 @@ pub fn decorate(entries: &mut [Value]) {
         let mut res: Words;
         let mark: &'static str;
         let mut undo = Value::Null;
-        let mut hide = action == "op.ack";
+        // 只记账的界面动作不单独成行：「知道了」、提示的「知道了」、op.interrupt（取消已经在事务那一行里）
+        let mut hide = matches!(action.as_str(), "op.ack" | "op.notice_ack" | "op.interrupt");
 
         if is_txn {
             let (c, r, m, u) = txn_entry(line, changed_later.contains(&item));

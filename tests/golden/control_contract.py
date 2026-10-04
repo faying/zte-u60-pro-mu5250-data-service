@@ -16,6 +16,8 @@ E4 有意改变的行为（write-op-layer.md「旧客户端」、D14，T2），�
 8. 跨进程写锁（D29）：别人（应急直写脚本）拿着 flock 时，datad 的写等它放；只读的不等。
 9. 流水账（T5）：旧请求直接执行的写记一行、密码不落盘；journal.append 的 skipped 合并；journal.list 新的在前。
 10. 界面数据（T13）：/v2/screen 带 op、首页「进行中」档；/v2/state 有 op 块；op.ack 两边共享、只记一次账。
+11. 确认中的其他写（D40）：自动来源影响上网的写回 409 op_busy；旧请求照做、回复逐字节同锁空时，事务记 other_change；
+    op.interrupt 有事务就取消、没有回 false，只认 screen/web；op.notice_ack 只认 screen/web，自动退回关着时没有 notice。
 SPDX-License-Identifier: MIT
 """
 import fcntl
@@ -412,6 +414,73 @@ def op_ack_and_screen() -> None:
         fail("op.ack 的流水账不对：%r" % acks)
 
 
+def no_active() -> None:
+    s = json.loads(post({"action": "op.status"})[1])["result"]
+    if s and s.get("phase") in ("accepted", "applying", "verifying", "rolling_back"):
+        wait_final(s["op_id"])
+
+
+def other_writes_while_confirming() -> None:
+    """E4 T16（D40，STATE_V2.md V2-42、V2-43）。"""
+    no_active()
+    free = split(read_all(send(BAND), 10))
+    op_id = take_lock()
+    for src in ("scenario", "guard", "scheduler", "auto"):
+        status, raw = post({"action": "band.set_lte", "source": src, "params": {"bands": "1,3"}})
+        reply = json.loads(raw)
+        want = {"ok": False, "action": "band.set_lte", "error": {"code": "op_busy", "message": reply.get("error", {}).get("message"),
+                                                                  "op": {"op_id": op_id, "item": "network.mode", "phase": "verifying"}}}
+        if status != b"HTTP/1.1 409 Conflict" or reply != want or not want["error"]["message"]:
+            fail("确认中 %s 的锁频应该 409 op_busy：%r %r" % (src, status, raw))
+    # 关数据照旧插队之外，自动来源别的写（短信）照常
+    status, raw = post({"action": "sms.mark_read", "source": "auto", "params": {"ids": "1", "tag": 0}})
+    if status != b"HTTP/1.1 200 OK":
+        fail("确认中不影响上网的写不该挡：%r %r" % (status, raw))
+    if op_status(op_id)["phase"] != "verifying":
+        fail("自动来源被挡回时事务不该变：%r" % op_status(op_id))
+    held = split(read_all(send(BAND), 10))
+    if held != free:
+        fail("确认中旧请求锁频的回复变了：%r != %r" % (held, free))
+    s = op_status(op_id)
+    if (s["phase"], s["reason"]) != ("cancelled", "other_change"):
+        fail("旧请求锁频没有取消自动退回：%r" % s)
+    # 网页的写同样照做并取消
+    op_id = take_lock()
+    status, raw = post({"action": "band.set_lte", "source": "web", "params": {"bands": "1,3"}})
+    if status != b"HTTP/1.1 200 OK" or (op_status(op_id)["phase"], op_status(op_id)["reason"]) != ("cancelled", "other_change"):
+        fail("网页锁频应该照做并取消：%r %r %r" % (status, raw, op_status(op_id)))
+    # op.interrupt
+    status, raw = post({"action": "op.interrupt", "source": "web", "params": {"what": "esim"}})
+    if status != b"HTTP/1.1 200 OK" or json.loads(raw) != {"ok": True, "action": "op.interrupt", "result": {"interrupted": False}}:
+        fail("没有事务时 op.interrupt 应该回 false：%r %r" % (status, raw))
+    op_id = take_lock()
+    for body in ({"action": "op.interrupt", "source": "scenario", "params": {"what": "at"}},
+                 {"action": "op.interrupt", "params": {"what": "at"}},
+                 {"action": "op.interrupt", "source": "web", "params": {}}):
+        status, raw = post(body)
+        if status != b"HTTP/1.1 400 Bad Request":
+            fail("op.interrupt 应该 400：%r %r %r" % (body, status, raw))
+    status, raw = post({"action": "op.interrupt", "source": "screen", "params": {"what": "at"}})
+    if status != b"HTTP/1.1 200 OK" or json.loads(raw)["result"] != {"interrupted": True, "op_id": op_id}:
+        fail("op.interrupt 回复不对：%r %r" % (status, raw))
+    s = op_status(op_id)
+    if (s["phase"], s["reason"]) != ("cancelled", "other_change"):
+        fail("op.interrupt 没有取消事务：%r" % s)
+    entries = json.loads(post({"action": "journal.list", "params": {"limit": 20}})[1])["result"]["entries"]
+    lines = [e for e in entries if e.get("action") == "op.interrupt"]
+    if len(lines) != 1 or lines[0].get("what") != "at" or lines[0].get("op_id") != op_id or lines[0].get("hide") is not True:
+        fail("op.interrupt 的流水账不对：%r" % lines)
+    # op.notice_ack（V2-44）：这里自动退回关着，没有 notice
+    if "notice" in get("/v2/screen")["op"]:
+        fail("自动退回关着时不该有 notice：%r" % get("/v2/screen")["op"])
+    status, raw = post({"action": "op.notice_ack", "source": "auto"})
+    if status != b"HTTP/1.1 400 Bad Request":
+        fail("auto 的 op.notice_ack 应该 400：%r %r" % (status, raw))
+    status, raw = post({"action": "op.notice_ack", "source": "web"})
+    if status != b"HTTP/1.1 200 OK" or json.loads(raw)["result"] != {"notice": "rollback_on", "acked": True}:
+        fail("op.notice_ack 回复不对：%r %r" % (status, raw))
+
+
 def main() -> int:
     try:
         hang_until_done()
@@ -426,6 +495,7 @@ def main() -> int:
         netselect_session()
         wifi_apply()
         op_ack_and_screen()
+        other_writes_while_confirming()
     finally:
         clear()
     return 0

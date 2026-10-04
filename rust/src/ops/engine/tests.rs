@@ -72,6 +72,7 @@ impl Dev {
             conn: Conn {
                 ipv4: "10.0.0.1".into(),
                 up_since_ms: Some(1),
+                ..Conn::default()
             },
             probe_ok: true,
             probes: vec![],
@@ -111,7 +112,12 @@ impl Device for Dev {
     }
     async fn probe(&self, target: &ProbeTarget) -> Result<(), String> {
         let mut s = self.s();
-        s.probes.push(target.iface.clone());
+        // IPv6 探测记成「接口/v6」（D41）
+        s.probes.push(if target.v6 {
+            format!("{}/v6", target.iface)
+        } else {
+            target.iface.clone()
+        });
         if s.probe_ok {
             Ok(())
         } else {
@@ -1160,7 +1166,7 @@ async fn op_block_follows_the_engine() {
     // 接上时马上交一次：没有事务
     assert_eq!(
         latest(&seen),
-        json!({"rollback_enabled": true, "active": null, "last": null})
+        json!({"rollback_enabled": true, "active": null, "last": null, "notice": "rollback_on"})
     );
     let op = op_of(&e.submit(req("Only_LTE", Source::Web)).await);
     let b = latest(&seen);
@@ -1311,4 +1317,174 @@ async fn last_result_survives_restart() {
     // 旧的那条在最近列表里：后来又改过，不能撤销
     let old = e3.status(Some(&id(&op)));
     assert!(old.is_null() || old["undo"]["why_zh"] == "之后又改过");
+}
+
+/// 确认中（自动退回开、数据探测不通）的一个网页事务。
+async fn verifying(dev: &Dev, e: &Engine<Dev>) -> String {
+    dev.s().probe_ok = false;
+    let op = op_of(&e.submit(req("Only_LTE", Source::Web)).await);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(e.status(Some(&id(&op)))["phase"], "verifying");
+    id(&op)
+}
+
+/// D40：每个来源 × 有没有进行中的事务。安全类写不走 other_write（server 先排除，照旧 preempt），单独一行。
+#[tokio::test(start_paused = true)]
+async fn other_write_by_source_while_confirming() {
+    use Source::*;
+    for src in [Screen, Web, Legacy, Guard, Scenario, Scheduler, Auto] {
+        // 没有进行中的事务：谁都照做
+        let dev = Dev::new();
+        let e = engine(&dev, true, None);
+        assert_eq!(e.other_write(src), Ok(()), "{src:?} idle");
+        // 有：用户的照做并取消（other_change），自动来源回进行中的事务
+        let op_id = verifying(&dev, &e).await;
+        match e.other_write(src) {
+            Ok(()) => {
+                assert!(src.is_user(), "{src:?}");
+                assert_eq!(
+                    end(&e.status(Some(&op_id))),
+                    pair("cancelled", "other_change"),
+                    "{src:?}"
+                );
+            }
+            Err(op) => {
+                assert!(!src.is_user(), "{src:?}");
+                assert_eq!(
+                    op,
+                    json!({"op_id": op_id, "item": NETWORK_MODE, "phase": "verifying"})
+                );
+                assert_eq!(e.status(Some(&op_id))["phase"], "verifying", "{src:?}");
+            }
+        }
+    }
+    // 安全类写照旧插队（preempted），不是 other_change
+    let dev = Dev::new();
+    let e = engine(&dev, true, None);
+    let op_id = verifying(&dev, &e).await;
+    assert_eq!(e.legacy_gate(None, true), LegacyGate::Pass);
+    assert_eq!(end(&e.status(Some(&op_id))), pair("cancelled", "preempted"));
+}
+
+/// D40 的要点：确认中用户改了别的设置，到点也不会再发退回。
+#[tokio::test(start_paused = true)]
+async fn user_write_while_confirming_never_rolls_back() {
+    let dev = Dev::new();
+    let e = engine(&dev, true, None);
+    let seen = observed(&e);
+    let op_id = verifying(&dev, &e).await;
+    e.other_write(Source::Screen).unwrap();
+    tokio::time::sleep(Duration::from_millis(DEADLINE + 60_000)).await;
+    assert_eq!(dev.s().writes, ["Only_LTE"]);
+    let b = latest(&seen);
+    assert!(b["active"].is_null());
+    assert_eq!(b["last"]["op_id"], op_id);
+    assert_eq!(b["last"]["reason"], "other_change");
+    assert_eq!(b["last"]["say_zh"], "你又改了别的设置，不再自动切回");
+    assert_eq!(b["last"]["needs_ack"], true);
+    // 锁空了：新的写能做
+    let next = op_of(&e.submit(req("Only_5G", Source::Scenario)).await);
+    assert_eq!(next["phase"], "verifying");
+}
+
+#[tokio::test(start_paused = true)]
+async fn interrupt_cancels_and_records_what() {
+    let dev = Dev::new();
+    let dir = temp_dir();
+    let e = Engine::new(
+        dev.clone(),
+        cfg(true),
+        Store::open(Some(dir.clone())),
+        Record::open(Some(dir.clone())),
+    );
+    assert_eq!(
+        e.interrupt(Source::Web, "esim"),
+        json!({"interrupted": false})
+    );
+    let op_id = verifying(&dev, &e).await;
+    assert_eq!(
+        e.interrupt(Source::Web, "at"),
+        json!({"interrupted": true, "op_id": op_id})
+    );
+    assert_eq!(
+        end(&e.status(Some(&op_id))),
+        pair("cancelled", "other_change")
+    );
+    tokio::time::sleep(Duration::from_millis(DEADLINE + 60_000)).await;
+    assert_eq!(dev.s().writes, ["Only_LTE"]);
+    let lines = || -> Vec<Value> {
+        e.record()
+            .list(50)
+            .into_iter()
+            .filter(|l| l["action"] == "op.interrupt")
+            .collect()
+    };
+    for _ in 0..200 {
+        if !lines().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let l = lines();
+    assert_eq!(l.len(), 1, "{l:?}");
+    assert_eq!(l[0]["what"], "at");
+    assert_eq!(l[0]["source"], "web");
+    assert_eq!(l[0]["op_id"], op_id);
+    // 事务那一行记的是 other_change
+    let txn: Vec<Value> = e
+        .record()
+        .list(50)
+        .into_iter()
+        .filter(|l| l["op_id"] == op_id && l.get("new").is_some())
+        .collect();
+    assert_eq!(txn[0]["reason"], "other_change");
+}
+
+/// DD18（V2-44）：自动退回开着、没人点过「知道了」才有 notice；点了两边都没有，重启后也没有。
+#[tokio::test(start_paused = true)]
+async fn rollback_notice_until_acked() {
+    let dev = Dev::new();
+    let dir = temp_dir();
+    // 关着：没有这个键（块和以前一样）
+    let off = engine(&dev, false, Some(dir.clone()));
+    assert!(off.block().get("notice").is_none());
+    let on = engine(&dev, true, Some(dir.clone()));
+    let seen = observed(&on);
+    assert_eq!(latest(&seen)["notice"], "rollback_on");
+    assert_eq!(on.screen().1["notice"], "rollback_on");
+    assert_eq!(
+        on.notice_ack(Source::Screen),
+        json!({"notice": "rollback_on", "acked": true})
+    );
+    assert!(latest(&seen).get("notice").is_none());
+    assert!(on.screen().1.get("notice").is_none());
+    // 再点照样成功
+    assert_eq!(on.notice_ack(Source::Web)["acked"], true);
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("notice.json")).unwrap()).unwrap();
+    assert_eq!(saved, json!({"acked": ["rollback_on"]}));
+    // datad 重启：不再出现
+    let again = engine(&dev, true, Some(dir.clone()));
+    assert!(again.block().get("notice").is_none());
+    // 不落盘时只在内存里记
+    let mem = engine(&dev, true, None);
+    assert_eq!(mem.block()["notice"], "rollback_on");
+    mem.notice_ack(Source::Web);
+    assert!(mem.block().get("notice").is_none());
+}
+
+/// D41：只有 IPv6 的连接，确认时向 IPv6 DNS 探测，绑定同一个蜂窝接口。
+#[tokio::test(start_paused = true)]
+async fn ipv6_only_connection_confirms_with_an_ipv6_probe() {
+    let dev = Dev::new();
+    dev.s().conn = Conn {
+        ipv6: "2001:db8::1".into(),
+        up_since_ms: Some(1),
+        ..Conn::default()
+    };
+    let e = engine(&dev, true, None);
+    let op = op_of(&e.submit(req("Only_LTE", Source::Screen)).await);
+    let fin = settle(&e, &id(&op)).await;
+    assert_eq!(end(&fin), pair("confirmed", "verified"));
+    assert_eq!(dev.s().probes, ["rmnet_data0/v6"]);
 }

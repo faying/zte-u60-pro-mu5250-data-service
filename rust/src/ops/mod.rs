@@ -114,12 +114,36 @@ fn flag(v: &Value, key: &str) -> Option<bool> {
     }
 }
 
+fn strings(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn first_address(v: &Value, key: &str) -> String {
+    v.get(key)
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .map(|a| text(a, "address"))
+        .unwrap_or_default()
+}
+
 /// 数据通路：`get_wwaniface`（开关、连接状态、接口）+ netifd 的 `zte_wan`（IPv4、连上多久、DNS）+
 /// nwinfo 的漫游。`now_ms` 用来把 uptime 秒数换成连接的起点。
+/// `zte_wan` 没有 IPv4 时（D41）看 `wan6`（netifd 的 `zte_wan6`）：有 IPv6 地址就用它当连接身份，
+/// 连上多久、DNS 都按 `zte_wan6` 的（DNS 没有时用 `get_wwaniface` 的 ipv6_dns_prefer/standby），
+/// 接口用 ipv6_dev_name（空时用 `zte_wan6` 的 l3_device）。
 fn data_path(
     net: &Value,
     wwan: &Value,
     wan: &Value,
+    wan6: Option<&Value>,
     uci_dns: Option<String>,
     now_ms: u64,
 ) -> DataPath {
@@ -129,30 +153,49 @@ fn data_path(
         (Some(true), Some(roam_on), Some(true)) => Some(roam_on),
         _ => None,
     };
-    let ipv4 = wan
-        .get("ipv4-address")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        .map(|a| text(a, "address"))
-        .unwrap_or_default();
-    let up_since_ms = wan
-        .get("uptime")
-        .and_then(Value::as_u64)
-        .map(|secs| now_ms.saturating_sub(secs * 1000));
+    let up_since = |v: &Value| {
+        v.get("uptime")
+            .and_then(Value::as_u64)
+            .map(|secs| now_ms.saturating_sub(secs * 1000))
+    };
+    let connected = connected(&text(wwan, "connect_status"));
+    let ipv4 = first_address(wan, "ipv4-address");
+    if ipv4.is_empty()
+        && let Some(wan6) = wan6
+    {
+        let ipv6 = first_address(wan6, "ipv6-address");
+        if !ipv6.is_empty() {
+            let mut iface = text(wwan, "ipv6_dev_name");
+            if iface.is_empty() {
+                iface = text(wan6, "l3_device");
+            }
+            let mut dns = strings(wan6, "dns-server");
+            if dns.is_empty() {
+                dns = ["ipv6_dns_prefer", "ipv6_dns_standby"]
+                    .iter()
+                    .map(|k| text(wwan, k))
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            return DataPath {
+                expected,
+                connected,
+                conn: Conn {
+                    ipv6,
+                    up_since_ms: up_since(wan6),
+                    ..Conn::default()
+                },
+                iface,
+                dns,
+            };
+        }
+    }
+    let up_since_ms = up_since(wan);
     let mut iface = text(wwan, "ipv4_dev_name");
     if iface.is_empty() {
         iface = text(wan, "l3_device");
     }
-    let mut dns: Vec<String> = wan
-        .get("dns-server")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut dns = strings(wan, "dns-server");
     if dns.is_empty() {
         // uci 里是 `'a' 'b'` 或空格分开的一串。
         dns = uci_dns
@@ -164,8 +207,12 @@ fn data_path(
     }
     DataPath {
         expected,
-        connected: connected(&text(wwan, "connect_status")),
-        conn: Conn { ipv4, up_since_ms },
+        connected,
+        conn: Conn {
+            ipv4,
+            up_since_ms,
+            ..Conn::default()
+        },
         iface,
         dns,
     }
@@ -179,7 +226,8 @@ fn sim_id(sim: &Value) -> SimId {
 }
 
 impl UbusDevice {
-    /// 读不到 `get_wwaniface` 或 `zte_wan` 就是 None（这一拍不判断数据）。
+    /// 读不到 `get_wwaniface` 就是 None（这一拍不判断数据）；`zte_wan` 也读不到时，`zte_wan6` 有 IPv6
+    /// 地址就按只有 IPv6 的连接算，否则 None。`zte_wan6` 只在 `zte_wan` 没有 IPv4 时才读（D41）。
     async fn data(&self, net: &Value) -> Option<DataPath> {
         let wwan = crate::state::ubus(
             "zwrt_data",
@@ -190,7 +238,29 @@ impl UbusDevice {
         .ok()?;
         let wan = crate::state::ubus("network.interface.zte_wan", "status", json!({}))
             .await
-            .ok()?;
+            .ok();
+        let has_ipv4 = wan
+            .as_ref()
+            .is_some_and(|w| !first_address(w, "ipv4-address").is_empty());
+        let wan6 = if has_ipv4 {
+            None
+        } else {
+            crate::state::ubus("network.interface.zte_wan6", "status", json!({}))
+                .await
+                .ok()
+                .filter(|w| !first_address(w, "ipv6-address").is_empty())
+        };
+        if wan6.is_some() {
+            return Some(data_path(
+                net,
+                &wwan,
+                wan.as_ref().unwrap_or(&json!({})),
+                wan6.as_ref(),
+                None,
+                engine::Device::now_ms(self),
+            ));
+        }
+        let wan = wan?;
         let no_dns = wan
             .get("dns-server")
             .and_then(Value::as_array)
@@ -204,6 +274,7 @@ impl UbusDevice {
             net,
             &wwan,
             &wan,
+            None,
             uci_dns,
             engine::Device::now_ms(self),
         ))
@@ -357,7 +428,7 @@ mod tests {
         let home = json!({"simcard_roam":"Home"});
         let away = json!({"simcard_roam":"Roaming"});
         let unknown = json!({});
-        let e = |net: &Value, w: Value| data_path(net, &w, &wan(), None, 100_000).expected;
+        let e = |net: &Value, w: Value| data_path(net, &w, &wan(), None, None, 100_000).expected;
         assert_eq!(e(&home, wwan(1, 0)), Some(true));
         assert_eq!(e(&home, wwan(0, 1)), Some(false));
         assert_eq!(e(&away, wwan(1, 0)), Some(false));
@@ -383,15 +454,18 @@ mod tests {
             &json!({"simcard_roam":"Home"}),
             &wwan(1, 0),
             &wan(),
+            Some(&wan6()),
             None,
             100_000,
         );
         assert!(d.connected);
+        // 有 IPv4：zte_wan6 不看
         assert_eq!(
             d.conn,
             Conn {
                 ipv4: "10.1.2.3".into(),
-                up_since_ms: Some(70_000)
+                up_since_ms: Some(70_000),
+                ..Conn::default()
             }
         );
         // 接口按 get_wwaniface 报的，不是 netifd 的 l3_device。
@@ -401,6 +475,7 @@ mod tests {
             &json!({}),
             &json!({"connect_status":"disconnected"}),
             &json!({"l3_device":"rmnet_data0"}),
+            None,
             Some("'222.66.251.8' '116.236.159.8'".into()),
             1_000,
         );
@@ -408,6 +483,45 @@ mod tests {
         assert_eq!(bare.iface, "rmnet_data0");
         assert_eq!(bare.conn, Conn::default());
         assert_eq!(bare.dns, ["222.66.251.8", "116.236.159.8"]);
+    }
+
+    fn wan6() -> Value {
+        json!({"uptime":20,"l3_device":"rmnet_data9","ipv4-address":[],"ipv6-address":[{"address":"2001:db8:4f2a:1c07::1","mask":64}],"dns-server":["2001:db8:100::53"]})
+    }
+
+    #[test]
+    fn ipv6_only_connection_uses_the_ipv6_address_and_dns() {
+        let home = json!({"simcard_roam":"Home"});
+        let w = json!({"enable":1,"roam_enable":0,"connect_status":"ipv6_connected","ipv4_dev_name":"","ipv6_dev_name":"rmnet_data1","ipv6_dns_prefer":"2001:db8:200::53","ipv6_dns_standby":"2001:db8:200::54"});
+        let no_v4 = json!({"uptime":30,"l3_device":"rmnet_data0","ipv4-address":[],"dns-server":["192.0.2.53"]});
+        let d = data_path(&home, &w, &no_v4, Some(&wan6()), None, 100_000);
+        assert!(d.connected);
+        assert_eq!(d.expected, Some(true));
+        assert_eq!(
+            d.conn,
+            Conn {
+                ipv6: "2001:db8:4f2a:1c07::1".into(),
+                up_since_ms: Some(80_000),
+                ..Conn::default()
+            }
+        );
+        assert!(d.conn.v6_only());
+        assert_eq!(d.iface, "rmnet_data1");
+        assert_eq!(d.dns, ["2001:db8:100::53"]);
+        // zte_wan6 没报 DNS：用 get_wwaniface 的；没报接口：用 zte_wan6 的 l3_device
+        let mut bare6 = wan6();
+        bare6["dns-server"] = json!([]);
+        let mut w2 = w.clone();
+        w2["ipv6_dev_name"] = json!("");
+        let d = data_path(&home, &w2, &json!({}), Some(&bare6), None, 100_000);
+        assert_eq!(d.dns, ["2001:db8:200::53", "2001:db8:200::54"]);
+        assert_eq!(d.iface, "rmnet_data9");
+        // zte_wan6 也没有地址：照旧（没有身份，不探测）
+        let mut empty6 = wan6();
+        empty6["ipv6-address"] = json!([]);
+        let d = data_path(&home, &w, &no_v4, Some(&empty6), None, 100_000);
+        assert_eq!(d.conn.addr(), "");
+        assert_eq!(d.dns, ["192.0.2.53"]);
     }
 
     #[test]

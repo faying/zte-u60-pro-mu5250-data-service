@@ -41,6 +41,16 @@ fn conn(ip: &str, up_since: u64) -> Conn {
     Conn {
         ipv4: ip.into(),
         up_since_ms: Some(up_since),
+        ..Conn::default()
+    }
+}
+
+/// 只有 IPv6 的连接（D41）。
+fn conn6(ip: &str, up_since: u64) -> Conn {
+    Conn {
+        ipv6: ip.into(),
+        up_since_ms: Some(up_since),
+        ..Conn::default()
     }
 }
 
@@ -632,7 +642,68 @@ fn probe_only_when_everything_else_is_there() {
         Some(ProbeTarget {
             iface: "rmnet_data0".into(),
             dns: vec!["192.0.2.53".into()],
+            v6: false,
         })
+    );
+}
+
+#[test]
+fn ipv6_only_connection_probes_over_ipv6() {
+    let mut t = txn(false);
+    let mut r = live("Only_LTE", conn6("2001:db8::1", 500));
+    r.data.as_mut().unwrap().dns = vec!["2001:db8::53".into()];
+    assert_eq!(
+        t.wants_probe(&r, 3_000),
+        Some(ProbeTarget {
+            iface: "rmnet_data0".into(),
+            dns: vec!["2001:db8::53".into()],
+            v6: true,
+        })
+    );
+    // 有 IPv4 时照旧走 IPv4，IPv6 地址不算进身份
+    let both = Conn {
+        ipv6: "2001:db8::1".into(),
+        ..conn("10.0.0.1", 500)
+    };
+    assert_eq!(both.addr(), "10.0.0.1");
+    assert!(!both.v6_only());
+    assert!(!t.wants_probe(&live("Only_LTE", both), 3_000).unwrap().v6);
+    let (next, probed) = feed(&mut t, r, true, 3_000);
+    assert!(probed);
+    assert_eq!(next, Next::Done);
+    assert_eq!(end(&t), (Phase::Confirmed, Some(Reason::Verified)));
+}
+
+#[test]
+fn ipv6_address_change_is_a_new_connection() {
+    let mut t = txn(false);
+    for (now, ip) in [(3_000, "2001:db8::1"), (8_000, "2001:db8::1")] {
+        feed(&mut t, live("Only_LTE", conn6(ip, 500)), false, now);
+    }
+    assert_eq!(t.probe_fails, 2);
+    // 换了地址（重新拨号）：重新计数
+    feed(
+        &mut t,
+        live("Only_LTE", conn6("2001:db8::2", 500)),
+        false,
+        13_000,
+    );
+    assert_eq!(t.probe_fails, 1);
+    // 没有地址：不探测
+    assert!(
+        t.wants_probe(&live("Only_LTE", Conn::default()), 20_000)
+            .is_none()
+    );
+}
+
+#[test]
+fn old_pending_file_without_ipv6_still_reads() {
+    let c: Conn = serde_json::from_str(r#"{"ipv4":"10.0.0.1","up_since_ms":5}"#).unwrap();
+    assert_eq!(c, conn("10.0.0.1", 5));
+    // 有 IPv4 的连接落盘的样子不变
+    assert_eq!(
+        serde_json::to_string(&c).unwrap(),
+        r#"{"ipv4":"10.0.0.1","up_since_ms":5}"#
     );
 }
 

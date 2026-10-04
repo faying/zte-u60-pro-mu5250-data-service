@@ -621,6 +621,9 @@ async fn control_job(app: App, action: String, body: Value) -> Response {
     let writes = (crate::control::ACTIONS.contains(&action.as_str())
         || crate::control::E4_ACTIONS.contains(&action.as_str()))
         && !read_only(&action);
+    if writes && let Some(response) = other_write_gate(&app, &action, &body) {
+        return response;
+    }
     // D29：会改设备的动作在执行者里拿着跨进程写锁做（和应急直写脚本互斥）。
     let _lock = if writes {
         Some(crate::ops::write_lock::acquire().await)
@@ -656,6 +659,39 @@ async fn control_job(app: App, action: String, body: Value) -> Response {
         marker.mark_immediate(blocks_for_action(&action));
     }
     response
+}
+
+/// D40：事务在确认或退回中时，影响上网的写（安全类写除外，照旧插队）按来源处理：用户的（screen、web、
+/// 没有 source 的旧请求）照做并取消这次自动退回（other_change）；自动来源的回 409 `op_busy`，不做、不记账。
+/// 在执行者里、真要做之前判断（执行者队列满回 503 的请求不会取消事务）。
+fn other_write_gate(app: &App, action: &str, body: &Value) -> Option<Response> {
+    let empty = json!({});
+    let params = body.get("params").unwrap_or(&empty);
+    if crate::ops::spec::is_safety(action, params)
+        || !crate::ops::spec::affects_network(action, params)
+    {
+        return None;
+    }
+    let source = body
+        .get("source")
+        .and_then(Value::as_str)
+        .and_then(crate::ops::Source::parse)
+        .unwrap_or(crate::ops::Source::Legacy);
+    let op = app.inner.ops.other_write(source).err()?;
+    Some(op_busy(action, op))
+}
+
+/// D40 的 409：`{"ok":false,"action":…,"error":{"code":"op_busy","message":…,"op":{op_id,item,phase}}}`。
+fn op_busy(action: &str, op: Value) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({"ok":false,"action":action,"error":{
+            "code":"op_busy",
+            "message":"a change is being confirmed; try again after it ends",
+            "op":op,
+        }})),
+    )
+        .into_response()
 }
 
 /// 不走事务的写记一行流水账（T5）：旧请求直接执行的、带来源但不在描述表里的。
@@ -795,6 +831,35 @@ async fn ops_route(app: &App, action: &str, body: &Value) -> Option<Response> {
                 Ok(v) => control_ok(action, v),
                 Err(e) => op_error(action, StatusCode::CONFLICT, "invalid_state", &e, None),
             });
+        }
+        // D40：agent 里不经 datad 的用户写（eSIM 切换、AT 终端）之前发，取消进行中的自动退回。
+        // DD18：「自动退回已打开」的提示点「知道了」。都只认触屏和网页。
+        "op.interrupt" | "op.notice_ack" => {
+            let what = params
+                .get("what")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            if action == "op.interrupt" && what.is_none() {
+                return Some(invalid_parameter(action, "missing parameter: what"));
+            }
+            let source = body
+                .get("source")
+                .and_then(Value::as_str)
+                .and_then(crate::ops::Source::parse)
+                .filter(|s| matches!(s, crate::ops::Source::Screen | crate::ops::Source::Web));
+            let Some(source) = source else {
+                return Some(invalid_parameter(
+                    action,
+                    &format!("{action} needs source screen or web"),
+                ));
+            };
+            return Some(control_ok(
+                action,
+                match what {
+                    Some(what) if action == "op.interrupt" => ops.interrupt(source, what),
+                    _ => ops.notice_ack(source),
+                },
+            ));
         }
         "op.revert" | "op.keep" => {
             let Some(op_id) = op_id else {
