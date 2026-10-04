@@ -1098,13 +1098,14 @@ fn bless_corpus() {
 /// The headline table, hard-coded from manager docs/DESIGN.md §4「首页结论表」and
 /// docs/ui-glossary.md §4 (this repo can't read them; touch-ui's cross-repo test
 /// compares the docs with screen.rs). (state, 中文大字, English state word, tone)
-const HEADLINES: [(&str, &str, &str, Tone); 14] = [
+const HEADLINES: [(&str, &str, &str, Tone); 15] = [
     ("nosim", "无 SIM", "No SIM", Tone::Bad),
     ("airplane", "移动网络已关", "Airplane", Tone::Neutral),
     ("sos", "只能紧急呼叫", "SOS only", Tone::Bad),
     ("nosvc", "无服务", "No service", Tone::Bad),
     ("nodata", "没连上网", "Offline", Tone::Bad),
     ("stall", "连上了但不通", "No traffic", Tone::Bad),
+    ("hot", "慢：过热限速", "Slow", Tone::Warn),
     ("limit", "慢：限速", "Slow", Tone::Warn),
     ("weak", "慢：信号弱", "Slow", Tone::Warn),
     ("noise", "慢：干扰大", "Slow", Tone::Warn),
@@ -1303,6 +1304,11 @@ fn every_branch_has_its_state_and_english() {
             |x| x.win = Some(win(20, 0)),
             "stall",
             "Signal and data are up, but nothing came back for 30 s",
+        ),
+        (
+            |x| x.hot = true,
+            "hot",
+            "Too hot; speed limited until it cools",
         ),
         (
             |x| x.ambr_dl = 4.6,
