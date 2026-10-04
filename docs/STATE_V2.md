@@ -51,6 +51,8 @@
 测试（T5）：`v2_slow_subscriber_lagged_is_closed`、`v2_lagged_reconnect_gets_new_snapshot`、`v2_other_subscriber_contiguous_during_lag`
 
 `/v2/events` 和旧 `/events` 共用同一个 SSE 连接上限（现在 16 个），满了同样回 `503`（`sse_client_limit`）。
+不读的客户端（写连续卡住 30 秒）会被断开、名额收回；对端已经不在的连接由 TCP keepalive / `TCP_USER_TIMEOUT`（约 60 秒）断开。
+datad 收到 SIGTERM 时主动结束所有 SSE 流（客户端看到流正常结束，按断线重连处理），3 秒内退出。
 
 **V2-9** 旧 `/events` 仍然用现有的 `watch` 通道，推完整快照，行为不变。
 测试（T1）：`legacy_events_golden_unchanged`

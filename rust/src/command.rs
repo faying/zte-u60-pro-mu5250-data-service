@@ -1,6 +1,14 @@
 use anyhow::{Context, Result, bail};
-use std::{ffi::OsStr, process::Stdio, time::Duration};
-use tokio::{process::Command, time::timeout};
+use std::{
+    ffi::OsStr,
+    process::{ExitStatus, Stdio},
+    time::Duration,
+};
+use tokio::{
+    io::AsyncReadExt,
+    process::{Child, Command},
+    time::timeout,
+};
 
 const MAX_OUTPUT: usize = 1024 * 1024;
 
@@ -44,25 +52,43 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let child = die_with_parent(&mut Command::new(program))
+    let mut child = die_with_parent(&mut Command::new(program))
         .args(args)
         .stdin(Stdio::null())
-        .stderr(Stdio::piped())
+        // 没人看 stderr：接管道又不读，话多的程序会卡在写满的管道上。
+        .stderr(Stdio::null())
         .stdout(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawn {program}"))?;
-    let output = timeout(deadline, child.wait_with_output()).await;
-    // 子进程有自己的超时（V2-32）：在执行者里时，结束（含超时）算一次前进。
+    let output = timeout(deadline, collect(&mut child)).await;
+    // 子进程有自己的超时（V2-32）：在执行者里时，结束（含超时、超长）算一次前进。
     crate::executor::progress();
-    let output = output.with_context(|| format!("{program} timed out"))??;
-    if !output.status.success() {
-        bail!("{program} exited with {}", output.status);
-    }
-    if output.stdout.len() > MAX_OUTPUT {
+    // 超时或超长时 `child` 在这里被丢掉，kill_on_drop 杀掉它。
+    let (status, stdout) = output.with_context(|| format!("{program} timed out"))??;
+    let Some(status) = status else {
         bail!("{program} output exceeds limit");
+    };
+    if !status.success() {
+        bail!("{program} exited with {status}");
     }
-    Ok(output.stdout)
+    Ok(stdout)
+}
+
+/// 边读边判 stdout（P2-6）：最多读 `MAX_OUTPUT + 1` 字节，超了不再读、不等退出，回 `None`；
+/// 没超就读到 EOF 再等退出码。
+async fn collect(child: &mut Child) -> Result<(Option<ExitStatus>, Vec<u8>)> {
+    let mut stdout = child.stdout.take().context("stdout not piped")?;
+    let mut buf = Vec::new();
+    (&mut stdout)
+        .take(MAX_OUTPUT as u64 + 1)
+        .read_to_end(&mut buf)
+        .await?;
+    if buf.len() > MAX_OUTPUT {
+        return Ok((None, buf));
+    }
+    drop(stdout);
+    Ok((Some(child.wait().await?), buf))
 }
 
 #[cfg(test)]
@@ -79,5 +105,34 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn output_is_capped_while_reading() {
+        // `yes` 永远写不完：老写法读到超时才失败；现在读满上限就停、马上报超长（不是超时）。
+        let started = std::time::Instant::now();
+        let err = run("yes", std::iter::empty::<&str>(), Duration::from_secs(20))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // 刚好到上限的照常返回。
+        let out = run(
+            "head",
+            ["-c", &MAX_OUTPUT.to_string(), "/dev/zero"],
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.len(), MAX_OUTPUT);
+        // 多一个字节就算超长。
+        let err = run(
+            "head",
+            ["-c", &(MAX_OUTPUT + 1).to_string(), "/dev/zero"],
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"), "{err:#}");
     }
 }

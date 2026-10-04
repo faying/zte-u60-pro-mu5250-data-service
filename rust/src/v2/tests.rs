@@ -454,6 +454,6 @@ fn v2_event_shapes_match_doc() {
         "{text}"
     );
     // HTTP 响应头。
-    let resp = events_response(&hub, &feed, ());
+    let resp = events_response(stream(&hub, &feed, ()));
     assert_eq!(resp.headers()["content-type"], "text/event-stream");
 }

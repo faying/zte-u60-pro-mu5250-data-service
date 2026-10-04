@@ -17,7 +17,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Map, Value, json};
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{convert::Infallible, future::IntoFuture, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{Mutex, RwLock, Semaphore, watch},
@@ -49,7 +49,13 @@ struct Inner {
     stage: watch::Sender<Stage>,
     /// 采样间隔（`App::start` 用）。
     interval: Duration,
+    /// 收到 SIGTERM/SIGINT 后置 true（P2-4）：SSE 流看到就结束，服务在 `SHUTDOWN_GRACE` 内退出。
+    stop: watch::Sender<bool>,
 }
+
+/// 收到退出信号后最多等连接收尾这么久（P2-4）。procd 的 `term_timeout` 约 5 秒，到了就 SIGKILL；
+/// 这里留出余量。读不动的客户端（发送缓冲满）收不到流的结尾，graceful shutdown 会一直等它，所以要有上限。
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 /// 启动进度（P1-3）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -155,6 +161,7 @@ impl App {
                 ops,
                 stage,
                 interval,
+                stop: watch::channel(false).0,
             }),
         })
     }
@@ -268,6 +275,14 @@ impl RoundDriver for App {
 }
 
 impl App {
+    /// 收到退出信号时完成（`stop` 置 true；`App` 已经没了也算）。SSE 流用它结束自己。
+    fn stopped(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.inner.stop.subscribe();
+        async move {
+            let _ = rx.wait_for(|stop| *stop).await;
+        }
+    }
+
     /// 在 `listener` 上提供服务（P1-3：监听在 `App::start` 之前就起来，启动中的请求见 `starting_gate`）。
     pub async fn serve(
         self,
@@ -298,12 +313,27 @@ impl App {
         let router = router
             .layer(RequestBodyLimitLayer::new(1024 * 1024))
             .with_state(self.clone());
-        let result = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
+        let server = axum::serve(
+            crate::conn::DatadListener::new(listener),
+            router.into_make_service_with_connect_info::<crate::conn::Peer>(),
         )
-        .with_graceful_shutdown(shutdown())
-        .await;
+        .with_graceful_shutdown(shutdown(self.clone()))
+        .into_future();
+        // 从收到信号算起最多 `SHUTDOWN_GRACE`：还有连接没收尾（对端不读）也不再等。
+        let deadline = {
+            let stopped = self.stopped();
+            async move {
+                stopped.await;
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+            }
+        };
+        let result = tokio::select! {
+            result = server => result,
+            () = deadline => {
+                eprintln!("shutdown: connections still open after {SHUTDOWN_GRACE:?}, exiting anyway");
+                Ok(())
+            }
+        };
         self.inner.neighbor.lock().await.shutdown().await;
         result?;
         Ok(())
@@ -399,7 +429,7 @@ async fn auth_login(State(app): State<App>, headers: HeaderMap) -> Response {
 
 async fn auth_exchange(
     State(app): State<App>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(crate::conn::Peer(peer)): ConnectInfo<crate::conn::Peer>,
     headers: HeaderMap,
 ) -> Response {
     let token = headers
@@ -587,6 +617,8 @@ async fn events(State(app): State<App>) -> Response {
         let _keep_permit_alive = &permit;
         Ok::<_, Infallible>(Event::default().event("state").json_data(v).unwrap())
     });
+    // 退出时流结束，连接才能收尾（P2-4）。
+    let stream = futures_util::StreamExt::take_until(stream, app.stopped());
     Sse::new(stream)
         .keep_alive(axum::response::sse::KeepAlive::new())
         .into_response()
@@ -596,7 +628,8 @@ async fn v2_events(State(app): State<App>) -> Response {
     let Ok(permit) = app.inner.sse_slots.clone().try_acquire_owned() else {
         return sse_limit();
     };
-    v2::events_response(app.inner.exec.hub(), &app.inner.feed, permit)
+    let stream = v2::stream(app.inner.exec.hub(), &app.inner.feed, permit);
+    v2::events_response(futures_util::StreamExt::take_until(stream, app.stopped()))
 }
 
 /// `/v2/state`（V2-6）：调试用，内容同 snapshot。
@@ -1485,7 +1518,7 @@ async fn readonly_ubus(action: &str, service: &str, method: &str, args: Value) -
         Err(error) => control_failed(action, error),
     }
 }
-async fn shutdown() {
+async fn shutdown(app: App) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -1497,8 +1530,13 @@ async fn shutdown() {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
-    // 收到 SIGTERM/SIGINT：先收掉 ubus listen 子进程，再等连接收尾。
-    crate::ubus::listen::shutdown(std::time::Duration::from_secs(2)).await;
+    // 收到 SIGTERM/SIGINT：先让 SSE 流结束（P2-4），再同时收掉 ubus listen 和邻区扫描的子进程（各最多 2 秒），
+    // 然后 axum 等连接收尾（`serve` 里另有总上限）。
+    app.inner.stop.send_replace(true);
+    tokio::join!(
+        crate::ubus::listen::shutdown(std::time::Duration::from_secs(2)),
+        async { app.inner.neighbor.lock().await.shutdown().await },
+    );
 }
 
 #[cfg(test)]

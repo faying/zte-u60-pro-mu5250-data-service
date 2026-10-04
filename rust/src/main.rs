@@ -3,6 +3,7 @@ mod auth;
 mod block;
 mod cell_window;
 mod command;
+mod conn;
 mod control;
 mod cooling;
 mod executor;
@@ -131,14 +132,23 @@ async fn main() -> Result<()> {
     server::write_pid_file();
     let starting = app.clone();
     tokio::spawn(async move { starting.start().await });
-    if let Some(lan) = lan {
+    let result = if let Some(lan) = lan {
         tokio::try_join!(
             app.clone().serve(listener, false, false),
             app.serve(lan, true, true)
-        )?;
-        Ok(())
+        )
+        .map(|_| ())
     } else {
         app.serve(listener, local_requires_auth, false).await
+    };
+    // 服务停了就直接退出进程（P2-4）：从 main 返回会析构运行时，而运行时要等阻塞线程池里还在跑的
+    // 任务（如卡在串口上的 AT 读写），可能一直等到 procd 的 SIGKILL。
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            std::process::exit(1)
+        }
     }
 }
 

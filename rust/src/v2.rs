@@ -189,11 +189,14 @@ pub fn stream<G: Send + Sync + 'static>(
 }
 
 /// `/v2/events` 的响应。
-pub fn events_response<G: Send + Sync + 'static>(hub: &Hub, feed: &Feed, guard: G) -> Response {
+/// 流是 `stream` 再包一层（server.rs 让它在退出时结束）。
+pub fn events_response(
+    s: impl Stream<Item = Result<Bytes, Infallible>> + Send + 'static,
+) -> Response {
     Response::builder()
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(stream(hub, feed, guard)))
+        .body(Body::from_stream(s))
         .expect("static headers")
 }
 
