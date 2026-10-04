@@ -8,6 +8,7 @@ and is not used for new releases.
 |---|---|---|
 | CLI and static ARM64 musl build | implemented | real MU5252 `/tmp` smoke passed |
 | `/healthz`, `/version`, `/state` | MC7523 device shape parity passed; MU5252 TopFlow and all four supported-model read-only fixture matrices pass, including MC8532B UCI fallback | MU5250, MU5252 and MC8532B device golden comparisons pending |
+| `/healthz` executor health (2026-10-04) | fork change: JSON `{"ok","status","exec_age_ms"}`; 503 `starting` until the first round finishes (the listener now binds before it) and 503 `stalled` after 20 s without executor progress; see `docs/API.md` | clients that only checked "it answers" must treat any HTTP reply as alive |
 | change-driven `/events` SSE | implemented; framing, reconnect, 16-client limit, 503 overflow and disconnect slot-release tests pass | complete |
 | `/capabilities` | exact 79-action legacy set, legacy transport metadata (discovery/passthrough removed with `/ubus`), duplicate guard and formal 404 unknown-action behavior | complete |
 | `/ubus`, `/ubus/list`, `/ubus/call` | removed in this fork (404) | — |

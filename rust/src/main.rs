@@ -112,20 +112,33 @@ async fn main() -> Result<()> {
     let local_requires_auth = args.lan_bind.is_none() && token.is_some();
     let app = App::new(args.data_dir, interval, token, args.neighbor).await?;
     if args.once {
+        app.start().await;
         println!("{}", serde_json::to_string(&app.snapshot().await)?);
         return Ok(());
     }
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port).parse()?;
     validate_listener_security(addr, local_requires_auth)?;
-    if let Some(lan_bind) = args.lan_bind {
-        let lan_addr: SocketAddr = format!("{}:{}", lan_bind, args.lan_port).parse()?;
+    // 先监听、再采第一轮（P1-3）：第一轮期间 `/healthz` 就能回 503 `starting`，看门狗也已经在看。
+    // 端口被占（另一个 datad 还在）时在这里就退出，不碰事务恢复。
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let lan = match &args.lan_bind {
+        Some(lan_bind) => {
+            let lan_addr: SocketAddr = format!("{}:{}", lan_bind, args.lan_port).parse()?;
+            Some(tokio::net::TcpListener::bind(lan_addr).await?)
+        }
+        None => None,
+    };
+    server::write_pid_file();
+    let starting = app.clone();
+    tokio::spawn(async move { starting.start().await });
+    if let Some(lan) = lan {
         tokio::try_join!(
-            app.clone().serve(addr, false, false),
-            app.serve(lan_addr, true, true)
+            app.clone().serve(listener, false, false),
+            app.serve(lan, true, true)
         )?;
         Ok(())
     } else {
-        app.serve(addr, local_requires_auth, false).await
+        app.serve(listener, local_requires_auth, false).await
     }
 }
 

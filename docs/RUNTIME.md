@@ -49,4 +49,6 @@ curl -fsS -H "Authorization: Bearer $(cat /data/zwrt-datad/auth.token)" \
   http://127.0.0.1:9460/state
 ```
 
-`/healthz` 返回 `ok` 表示服务监听正常；`/state` 用于检查最新聚合快照。
+`/healthz` 返回 200（`{"ok":true,"status":"ok","exec_age_ms":…}`）表示第一轮采集已完成、采集执行者在前进；
+刚启动（第一轮还没采完）回 503 `starting`，执行者超过 20 秒没前进回 503 `stalled`（见 [`API.md`](API.md)）。
+datad 先监听再采第一轮，所以 ubusd 不回时端口照样能连上、`/healthz` 照样回答。`/state` 用于检查最新聚合快照（启动中先等第一轮，最多 10 秒，还没好回 503 `starting`）。

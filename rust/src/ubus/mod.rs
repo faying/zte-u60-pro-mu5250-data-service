@@ -18,7 +18,7 @@ pub mod listen;
 
 #[cfg(test)]
 #[path = "../../tests/support/mock_ubusd.rs"]
-mod mock_ubusd;
+pub(crate) mod mock_ubusd;
 #[cfg(test)]
 mod tests;
 

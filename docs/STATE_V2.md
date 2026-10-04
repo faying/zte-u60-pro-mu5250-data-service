@@ -113,7 +113,10 @@ stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 **V2-13** 每块的 `max_age` = 3 × 这块的采集间隔，最少 15 秒；采集间隔是「每轮」的块按当前采样间隔算。
 距上次读成功超过 `max_age` 还没有再读成功（比如一直被每轮预算挤掉，没轮到读），就置 `stale=true` 并按 V2-12 发布。
 下次读成功时翻回 `false`，再发一条。
+判定在轮末做；**正在跑一轮时**，V2-22 的独立定时器（每 5 秒）也判一次，所以一轮拖得很长（ubusd 不回、旧采集挨个超时）时，
+块不用等到轮末才置 stale。轮与轮之间的长任务（短信发送等）不判：下一轮先读块，用不着让块翻 stale 再翻回来。
 测试（T4）：`block_starved_to_max_age_goes_stale`、`block_stale_clears_after_recovery_read`
+测试（P1-2）：`block_goes_stale_mid_round_when_the_round_drags`
 
 **V2-14** 启动后一直没读成功过的块：`stale=true`、`data=null`、`observed_at=0`、`revision=0`。
 第一次读成功后 revision 变成 1。
@@ -166,7 +169,15 @@ stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 2 秒只用于采集轮里的读取；`socket` 后端在采集轮之外（控制任务、内部任务）的请求用 8 秒，
 因为写操作（比如切换设置）可能要等较久，2 秒就判超时会把已送达的写操作报成失败。控制任务不计每轮预算（见 V2-23）。
 例：同一轮有 3 个对象都不回复。第 1 个 0～2 秒超时，第 2 个 2～4 秒超时，第 3 个没开始。这一轮约 4 秒，心跳照发，下一轮先读第 3 个。
+旧采集（还没迁成块的读取）不受 3 秒预算截断（慢但在回答的轮照旧全读），只有一个按**超时数**的上限：
+本轮已有 6 个对象超时（块和旧采集合计，`LEGACY_TIMEOUT_LIMIT`），旧采集就不再发新请求，剩下的读取本轮算跳过。
+ubusd 整个不回时，一轮从十几个对象挨个超时（socket 约 26 秒、cli 约 104 秒）缩到 6 个（约 12 秒、48 秒）；
+基带重启时只有基带那几个对象（`zwrt_zte_mdm.api`、`zte_nwinfo_api`、`zwrt_data`、`zwrt_wms`）超时，到不了上限。
+本轮跳过（包括对象本轮已超时、在跨轮冷却里）的读取：有 TTL 的沿用上一次读成功的值，旧 `/state` 的字段不丢；
+但不算读到，派生块（`sim`、`sms`）按读失败置 stale；TTL 为 0 的（`system info`、`nwinfo`、实时流量）按读失败输出，同今天。
+跳过的那次不写进慢数据缓存（不把上一次的值冲掉）。
 测试（T4）：`round_three_timeouts_within_budget_plus_one_timeout`、`control_calls_use_control_timeout_rounds_use_round_timeout`、`socket_control_timeout_longer_than_round`
+测试（P1-2）：`legacy_reads_stop_after_timeout_limit`、`legacy_round_is_bounded_when_ubusd_hangs`、`skipped_read_keeps_the_previous_value_but_is_not_fresh`
 
 **V2-20** 轮转：本轮因为预算没轮到的块，下一轮从停下的地方开始、先读它们，保证慢对象不会一直把后面的块挤掉。
 测试（T4）：`round_rotation_reads_skipped_blocks_first`
@@ -252,12 +263,20 @@ stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 ## 11. 活性和写操作的闸（E4 T3）
 
 **V2-32** 执行者的「前进」= 完成一次 ubus 调用、一个任务、一轮，或者闲着在等活（闲着时 `exec_age_ms` 是 0）。
+任务里自己有上限的非 ubus 等待做完一段也算：拿到（或等满）跨进程写锁（≤15 秒）、拿到 AT 锁（≤10 秒）、探完一个 AT 口（≤2 秒）、
+AT 命令收到回答（≤7 秒）、一个子进程结束（自己的超时）。所以 AT 写（`netselect.auto`、`modem.online`）连着等写锁、AT 锁、基带最坏 30 多秒，
+但每段都不到 20 秒，订阅方不会判卡死、看门狗不会动；真卡在某一段里时照样不前进、照样触发看门狗。
 心跳里的 `exec_age_ms` 是最近一次前进距今的毫秒数。订阅方（触屏、agent）超过 **20 秒**就当 datad 卡了：触屏显示「数据服务没响应」、不写，agent 切退路（D12）。
 datad 自己有看门狗（独立系统线程，每秒看一次）：超过 **30 秒**没前进、而且不是一个还在它自己超时里的调用（单次调用上限 10 秒），就记一行退出，由 procd 拉起。
 `ZWRT_DATAD_WATCHDOG_S` 改上限（秒，0 = 关），不会小于 11 秒。所有 ubus 和子进程调用的超时都必须小于它；
 原厂要拖几十秒的动作（`zwrt_wlan reload` 这类）先发、再用多次短调用轮询，不能在一次调用里等完。
 datad 启动时把 pid 写进 `ZWRT_DATAD_PID_FILE`（默认 `/var/run/zwrt-datad.pid`），应急直写脚本据此判断 datad 在不在（D18）。
+datad 先监听再采第一轮，心跳定时器和看门狗也在第一轮之前起（第一轮里每次调用都记前进）。`/healthz` 回执行者的健康：
+200 `{"ok":true,"status":"ok","exec_age_ms":…}`；第一轮还没采完回 503 `status:"starting"`，`exec_age_ms` 超过 20 秒回 503 `status:"stalled"`。
+第一轮采完之前，`/state`、`/events`、`/v2/*` 先等第一轮（最多 10 秒），还没好回 503 `{"ok":false,"error":{"code":"starting",…}}`；`/control` 先等就绪（第一轮和事务恢复做完），
+最多 20 秒，还没好就回 503 `busy`（同 V2-25）。
 测试（E4 T3）：`stuck_call_is_reported_and_stalls_after_limit`
+测试（P1-1）：`lock_and_at_waits_count_as_progress`、`a_wait_that_never_ends_still_stalls`
 
 **V2-33** 写的上下文（拿着跨进程写锁的那段：事务的写和退回、会改设备的 `/control`）里调用超时了，结果算「未知」：原厂那边可能还在做（D28）。
 执行者先把闸关上：下一个写的调用之前，先用这个对象的只读请求探测（固定表：`zte_nwinfo_api` 用 `nwinfo_get_netinfo`、`zwrt_data` 用 `get_wwaniface` 等；

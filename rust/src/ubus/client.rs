@@ -146,6 +146,10 @@ impl RoundSkips {
     pub fn clear(&mut self) {
         self.timed_out.clear();
     }
+    /// 本轮超时过的对象个数。
+    pub fn timed_out(&self) -> usize {
+        self.timed_out.len()
+    }
     pub fn skipped(&self) -> impl Iterator<Item = &str> {
         self.timed_out.iter().map(String::as_str)
     }

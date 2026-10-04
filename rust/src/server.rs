@@ -45,14 +45,37 @@ struct Inner {
     neighbor: Mutex<NeighborManager>,
     /// E4 写操作层：事务引擎（`ops/`）。
     ops: crate::ops::Engine<crate::ops::UbusDevice>,
+    /// 启动进度（`App::start`）：监听先起来，第一轮采集和事务恢复在后台做。
+    stage: watch::Sender<Stage>,
+    /// 采样间隔（`App::start` 用）。
+    interval: Duration,
 }
+
+/// 启动进度（P1-3）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Stage {
+    /// 第一轮还没采完：读数据的接口先等（`starting_gate`），`/healthz` 回 503。
+    Starting,
+    /// 有第一份快照了：读接口照常；`/control` 还在等事务恢复（`ops.start`）。
+    Snapshot,
+    /// 全部就绪。
+    Ready,
+}
+
+/// 启动时 `/control` 最多等这么久（等第一轮和事务恢复做完），还没好就回 503 `busy`（客户端照队列满重试）。
+const CONTROL_START_WAIT: Duration = Duration::from_secs(20);
+/// 启动时读数据的请求最多等这么久（等第一轮采完），还没好就回 503 `starting`。
+/// 先等而不是马上回 503：以前端口要到第一轮采完才监听，有的客户端把「连得上」当成「有快照」。
+const READ_START_WAIT: Duration = Duration::from_secs(10);
+/// `/healthz` 判卡住的线：执行者这么久没前进就回 503（和订阅方判卡死的 20 秒一样，V2-32）。
+const HEALTH_STALL_MS: u64 = 20_000;
 
 /// V2-22：距上一条心跳满这么久，独立定时器就补一条。
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
 
 /// D18：应急直写脚本据此判断 datad 在不在（pid + /proc/<pid>/comm 前缀）。
 /// `ZWRT_DATAD_PID_FILE`，默认 `/var/run/zwrt-datad.pid`，空串 = 不写。
-fn write_pid_file() {
+pub fn write_pid_file() {
     let path = match std::env::var("ZWRT_DATAD_PID_FILE") {
         Ok(v) if v.is_empty() => return,
         Ok(v) => PathBuf::from(v),
@@ -97,31 +120,32 @@ impl App {
             interval,
         );
         executor::install(&exec);
-        crate::cooling::tick().await;
-        crate::extra_wifi::tick().await;
-        // 第一轮在执行者里立即采（块 + 旧采集），之后执行者自己「睡一个采样间隔 → 一轮」。
-        let interval_ms = interval.as_millis() as u64;
-        let mut initial = exec
-            .round_now(async move { state::collect(interval_ms, &hub).await })
-            .await;
-        let mut neighbor = NeighborManager::new(neighbor_enabled);
-        neighbor
-            .tick(initial.fields.get("net").unwrap_or(&Value::Null))
-            .await;
-        initial.fields.insert("neighbor".into(), neighbor.status());
-        let (tx, _) = watch::channel(initial.clone());
+        // V2-22：独立定时器补心跳（带 exec_age_ms）；V2-32：看门狗。第一轮之前就起：第一轮里每次调用都记前进，
+        // 执行者闲着时不算卡（P1-3：以前第一轮在看门狗起来之前跑，ubusd 不回时没人管）。
+        exec.start_heartbeat(HEARTBEAT_EVERY);
+        if let Some(limit) = crate::watchdog::limit_from_env() {
+            crate::watchdog::spawn(exec.clone(), limit);
+        }
+        // 第一轮之前的占位快照：只在 `Stage::Starting` 时存在，读接口这时先等第一轮（`starting_gate`），不会发出去。
+        let placeholder = Snapshot {
+            ts: 0,
+            datad: Default::default(),
+            fields: Map::new(),
+        };
+        let (tx, _) = watch::channel(placeholder.clone());
         let ops = crate::ops::Engine::new(
             crate::ops::UbusDevice::new(exec.clone()),
             crate::ops::Config::from_env(),
             crate::ops::pending::Store::open(crate::ops::ops_dir()),
             crate::ops::record::Record::open(crate::ops::ops_dir()),
         );
-        let app = Self {
+        let (stage, _) = watch::channel(Stage::Starting);
+        Ok(Self {
             inner: Arc::new(Inner {
-                snapshot: RwLock::new(initial),
+                snapshot: RwLock::new(placeholder),
                 tx,
                 exec,
-                neighbor: Mutex::new(neighbor),
+                neighbor: Mutex::new(NeighborManager::new(neighbor_enabled)),
                 _data_dir: data_dir,
                 token,
                 sessions: Mutex::new(Sessions::default()),
@@ -129,15 +153,37 @@ impl App {
                 sse_slots: Arc::new(Semaphore::new(16)),
                 feed,
                 ops,
+                stage,
+                interval,
             }),
-        };
-        app.inner.exec.start_rounds(Arc::new(app.clone()));
-        // V2-22：独立定时器补心跳（带 exec_age_ms）；V2-32：看门狗。
-        app.inner.exec.start_heartbeat(HEARTBEAT_EVERY);
-        if let Some(limit) = crate::watchdog::limit_from_env() {
-            crate::watchdog::spawn(app.inner.exec.clone(), limit);
+        })
+    }
+
+    /// 第一轮采集、周期采集、事务恢复、短信监听（P1-3：在监听起来之后做，`/healthz` 这期间回 503 `starting`）。
+    /// 只调一次。
+    pub async fn start(&self) {
+        let app = self;
+        crate::cooling::tick().await;
+        crate::extra_wifi::tick().await;
+        // 第一轮在执行者里立即采（块 + 旧采集），之后执行者自己「睡一个采样间隔 → 一轮」。
+        let interval_ms = app.inner.interval.as_millis() as u64;
+        let hub = app.inner.exec.hub().clone();
+        let mut initial = app
+            .inner
+            .exec
+            .round_now(async move { state::collect(interval_ms, &hub).await })
+            .await;
+        {
+            let mut neighbor = app.inner.neighbor.lock().await;
+            neighbor
+                .tick(initial.fields.get("net").unwrap_or(&Value::Null))
+                .await;
+            initial.fields.insert("neighbor".into(), neighbor.status());
         }
-        write_pid_file();
+        *app.inner.snapshot.write().await = initial.clone();
+        app.inner.tx.send_replace(initial);
+        app.inner.stage.send_replace(Stage::Snapshot);
+        app.inner.exec.start_rounds(Arc::new(app.clone()));
         // 排队的旧请求锁空出来后照原来的 /control 处理执行（返回 false = 执行者队列满）。
         let runner_app = app.clone();
         app.inner
@@ -170,8 +216,21 @@ impl App {
                 exec.kick(&["sms"]);
             }),
         );
-        Ok(app)
+        app.inner.stage.send_replace(Stage::Ready);
     }
+
+    fn stage(&self) -> Stage {
+        *self.inner.stage.borrow()
+    }
+
+    /// 等到至少 `stage`，最多 `limit`；到了回 true。
+    async fn wait_stage(&self, stage: Stage, limit: Duration) -> bool {
+        let mut rx = self.inner.stage.subscribe();
+        tokio::time::timeout(limit, rx.wait_for(|s| *s >= stage))
+            .await
+            .is_ok_and(|r| r.is_ok())
+    }
+
     pub async fn snapshot(&self) -> Snapshot {
         self.inner.snapshot.read().await.clone()
     }
@@ -209,9 +268,10 @@ impl RoundDriver for App {
 }
 
 impl App {
+    /// 在 `listener` 上提供服务（P1-3：监听在 `App::start` 之前就起来，启动中的请求见 `starting_gate`）。
     pub async fn serve(
         self,
-        addr: SocketAddr,
+        listener: TcpListener,
         require_auth: bool,
         open_auth_routes: bool,
     ) -> Result<()> {
@@ -231,13 +291,13 @@ impl App {
                 .route("/auth/login", post(auth_login))
                 .route("/auth/exchange", post(auth_exchange));
         }
+        router = router.layer(middleware::from_fn_with_state(self.clone(), starting_gate));
         if require_auth {
             router = router.layer(middleware::from_fn_with_state(self.clone(), authenticate));
         }
         let router = router
             .layer(RequestBodyLimitLayer::new(1024 * 1024))
             .with_state(self.clone());
-        let listener = TcpListener::bind(addr).await?;
         let result = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -248,6 +308,29 @@ impl App {
         result?;
         Ok(())
     }
+}
+
+/// P1-3：第一轮采完之前（`Stage::Starting`），读数据的接口先等第一轮（最多 10 秒），还没好就回 503 `starting`
+/// （客户端按连不上处理、过一会儿重试）；`/`、`/healthz`、`/version`、`/capabilities`、登录照常。
+/// `/control` 在处理函数里等就绪（`wait_stage(Ready)`）。
+async fn starting_gate(State(app): State<App>, request: Request, next: Next) -> Response {
+    let open = matches!(
+        request.uri().path(),
+        "/" | "/healthz"
+            | "/version"
+            | "/capabilities"
+            | "/control"
+            | "/auth/login"
+            | "/auth/exchange"
+    );
+    if open || app.wait_stage(Stage::Snapshot, READ_START_WAIT).await {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"ok":false,"error":{"code":"starting","message":"datad is starting (first collection round not finished)"}})),
+    )
+        .into_response()
 }
 
 async fn authenticate(State(app): State<App>, request: Request, next: Next) -> Response {
@@ -420,8 +503,27 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 async fn index() -> &'static str {
     "zwrt-datad Rust rewrite\n"
 }
-async fn health() -> &'static str {
-    "ok\n"
+/// `/healthz`（P1-3）：200 = 第一轮采完了、执行者没卡（`exec_age_ms` ≤ 20 秒）；503 = 还在启动（`starting`）
+/// 或执行者卡住（`stalled`，订阅方也按 20 秒判卡死，V2-32）。不经执行者，卡住时照样回。
+async fn health(State(app): State<App>) -> Response {
+    let age = app.inner.exec.exec_age_ms();
+    let status = if app.stage() < Stage::Snapshot {
+        "starting"
+    } else if age > HEALTH_STALL_MS {
+        "stalled"
+    } else {
+        "ok"
+    };
+    let code = if status == "ok" {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(json!({"ok": status == "ok", "status": status, "exec_age_ms": age})),
+    )
+        .into_response()
 }
 async fn version() -> Json<DatadVersion> {
     Json(Default::default())
@@ -562,6 +664,10 @@ async fn control(
             .into_response();
     }
     let action = action.to_owned();
+    // P1-3：启动中（第一轮、事务恢复还没做完）先等，最多 20 秒；还没好就照队列满回 503 `busy`。
+    if !app.wait_stage(Stage::Ready, CONTROL_START_WAIT).await {
+        return control_busy(&action);
+    }
     if let Some(response) = ops_route(&app, &action, &body).await {
         return response;
     }

@@ -113,6 +113,13 @@ impl MockUbusd {
         &self.path
     }
 
+    /// 连这个 mock 的 socket 后端（采集轮里的超时 = `timeout`），给执行者用。
+    pub fn backend(&self, timeout: Duration) -> crate::ubus::backend::SocketBackend {
+        crate::ubus::backend::SocketBackend::new(crate::ubus::client::UbusClient::with_timeout(
+            &self.path, timeout,
+        ))
+    }
+
     /// 注册（或替换）对象的一个方法和它的默认回复。
     pub fn add_method(&self, object: &str, id: u32, method: &str, reply: Value) {
         let mut st = self.state.lock().unwrap();

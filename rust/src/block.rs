@@ -595,19 +595,30 @@ impl Hub {
         }));
     }
 
-    /// 每轮结束（V2-13、V2-16、V2-22）：超过 max_age 的块置 stale；各块策略的轮末钩子；最后发心跳。
-    pub fn round_end(&self, now: Instant, sample_interval: Duration) -> Heartbeat {
+    /// V2-13：超过 max_age 的块置 stale 并发布（轮末，以及一轮拖得很长时独立定时器每 5 秒一次）。
+    pub fn expire(&self, now: Instant, sample_interval: Duration) {
         let mut g = self.lock();
-        let g = &mut *g;
+        Self::expire_locked(&mut g, &*self.sink, now, sample_interval);
+    }
+
+    fn expire_locked(g: &mut Inner, sink: &dyn EventSink, now: Instant, sample_interval: Duration) {
         for b in &mut g.blocks {
             if !b.stale
                 && let Some(ok) = b.last_success
                 && now.saturating_duration_since(ok) > b.max_age(sample_interval)
             {
                 b.stale = true;
-                Self::publish(&mut g.seq, b, &*self.sink, Publish::No, true, now);
-                continue;
+                Self::publish(&mut g.seq, b, sink, Publish::No, true, now);
             }
+        }
+    }
+
+    /// 每轮结束（V2-13、V2-16、V2-22）：超过 max_age 的块置 stale；各块策略的轮末钩子；最后发心跳。
+    pub fn round_end(&self, now: Instant, sample_interval: Duration) -> Heartbeat {
+        let mut g = self.lock();
+        let g = &mut *g;
+        Self::expire_locked(g, &*self.sink, now, sample_interval);
+        for b in &mut g.blocks {
             if b.stale {
                 continue;
             }

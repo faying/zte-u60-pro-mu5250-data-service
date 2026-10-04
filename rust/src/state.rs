@@ -135,19 +135,50 @@ fn cache_put<T>(cache: &Cache<T>, key: String, ttl: Duration, value: T) {
 /// does not exist on this model should not fork every second, but a transient
 /// error must not stick.
 async fn ubus_ttl(ttl_s: u64, service: &str, method: &str, args: Value) -> Result<Value, String> {
+    ubus_ttl_read(ttl_s, service, method, args).await.0
+}
+
+/// `ubus_ttl`，另外回答这次的结果算不算「读到了」（`/v2` 派生块的健康用）。
+///
+/// 执行者这次没发请求（`Skipped`：对象本轮已超时、在跨轮冷却里、或本轮超时的对象已到
+/// `executor::LEGACY_TIMEOUT_LIMIT`，V2-19）时，不覆盖缓存里上一次的结果；有 TTL 的读取有上一次读成功的值
+/// 就接着用（旧 `/state` 的字段不丢），但不算读到（块按读失败、照 V2-12 置 stale）。
+/// TTL 为 0 的读取（`system info`、`nwinfo`、实时流量）没有上一次的值，照旧按读失败。
+async fn ubus_ttl_read(
+    ttl_s: u64,
+    service: &str,
+    method: &str,
+    args: Value,
+) -> (Result<Value, String>, bool) {
     // 旧采集里的安全点：这里不持有任何锁，排队的 /control 可以先做（V2-24）。
     crate::executor::preempt().await;
-    if ttl_s == 0 || !cache_enabled() {
-        return ubus(service, method, args).await;
-    }
+    let cached = ttl_s != 0 && cache_enabled();
     let key = format!("{service}\u{0}{method}\u{0}{args}");
-    if let Some(v) = cache_get(&UBUS_CACHE, &key) {
-        return v;
+    if cached && let Some(v) = cache_get(&UBUS_CACHE, &key) {
+        return (v, true);
     }
-    let v = ubus(service, method, args).await;
-    let ttl = if v.is_ok() { ttl_s } else { ttl_s.min(5) };
-    cache_put(&UBUS_CACHE, key, Duration::from_secs(ttl), v.clone());
-    v
+    let v = crate::executor::call(service, method, &args).await;
+    if let Err(e @ crate::ubus::client::UbusError::Skipped { .. }) = &v {
+        let previous = if cached {
+            cache_last_ok(&UBUS_CACHE, &key)
+        } else {
+            None
+        };
+        return (previous.ok_or_else(|| e.to_string()), false);
+    }
+    let v = v.map_err(|e| e.to_string());
+    if cached {
+        let ttl = if v.is_ok() { ttl_s } else { ttl_s.min(5) };
+        cache_put(&UBUS_CACHE, key, Duration::from_secs(ttl), v.clone());
+    }
+    let fresh = v.is_ok();
+    (v, fresh)
+}
+
+/// 缓存里这个键上一次读成功的值，过期了也给（`ubus_ttl_read` 没发请求时用）。
+fn cache_last_ok(cache: &Cache<Result<Value, String>>, key: &str) -> Option<Value> {
+    let c = cache.lock().ok()?;
+    c.as_ref()?.get(key)?.value.as_ref().ok().cloned()
 }
 
 /// 按块间隔读一个 UCI 包（R19）：`ttl_s` 就是间隔（阶段 2 迁完之前沿用 UCI_CACHE 的 TTL）。
@@ -1153,7 +1184,7 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         json!({"source_module":"web","cid":1}),
     )
     .await;
-    let sim = ubus_ttl(30, "zwrt_zte_mdm.api", "get_sim_info", json!({})).await;
+    let (sim, sim_read) = ubus_ttl_read(30, "zwrt_zte_mdm.api", "get_sim_info", json!({})).await;
     let imei = ubus_ttl(300, "zwrt_zte_mdm.api", "get_imei", json!({})).await;
     let lan_clients = ubus_ttl(
         10,
@@ -1187,15 +1218,16 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     let charger = hub.legacy("charger");
     let nfc = ubus_ttl(60, "zwrt_nfc", "zwrt_nfc_wifi_get", json!({})).await;
     let _ = crate::sms::prepare().await;
-    let sms_capacity = ubus_ttl(30, "zwrt_wms", "zwrt_wms_get_wms_capacity", json!({})).await;
-    let sms_nv = ubus_ttl(
+    let (sms_capacity, capacity_read) =
+        ubus_ttl_read(30, "zwrt_wms", "zwrt_wms_get_wms_capacity", json!({})).await;
+    let (sms_nv, nv_read) = ubus_ttl_read(
         10,
         "zwrt_wms",
         "zte_libwms_get_sms_data",
         json!({"page":0,"data_per_page":8,"mem_store":1,"tags":10,"order_by":"order by id desc"}),
     )
     .await;
-    let sms_sim = ubus_ttl(
+    let (sms_sim, sim_list_read) = ubus_ttl_read(
         10,
         "zwrt_wms",
         "zte_libwms_get_sms_data",
@@ -1216,7 +1248,8 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     // `/v2` 派生块的健康：信号块看 nwinfo，live 块看 system info 和实时流量。
     let signal_ok = net.is_ok();
     let live_ok = info.is_ok() && traffic.is_ok();
-    let sim_ok = sim.is_ok();
+    // 没发请求、沿用上一次值的不算读到（`ubus_ttl_read`）：块照 V2-12 置 stale。
+    let sim_ok = sim_read;
     // stall 的 30 秒窗口：厂商收发包数（cell_window.rs；没读到就作废窗口）
     crate::cell_window::sample(
         now_ms(),
@@ -1242,7 +1275,9 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     let sms_ok = sms_capacity.is_ok();
     // V2-30：短信块。容量和两库第一页都读成功才算读成功（任一失败 → stale）。
     let sms_block = match (&sms_capacity, &sms_nv, &sms_sim) {
-        (Ok(capacity), Ok(nv), Ok(sim)) => Ok(crate::sms::block_data(capacity, nv, sim)),
+        (Ok(capacity), Ok(nv), Ok(sim)) if capacity_read && nv_read && sim_list_read => {
+            Ok(crate::sms::block_data(capacity, nv, sim))
+        }
         _ => Err("zwrt_wms capacity or SMS list read failed".to_string()),
     };
     let sms_capacity = object(sms_capacity);
@@ -1942,8 +1977,12 @@ mod tests {
         assert!(is_sms_key(&keys[0]) && is_sms_key(&keys[1]) && !is_sms_key(&keys[2]));
     }
 
+    /// 会整体清空慢数据缓存、或依赖缓存内容的测试互相排队（缓存是全局的）。
+    static CACHE_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn slow_state_cache_expires_and_is_cleared_by_control() {
+        let _serial = CACHE_TEST.blocking_lock();
         let key = "test\u{0}cache".to_string();
         cache_put(
             &UBUS_CACHE,
@@ -2114,6 +2153,145 @@ mod tests {
         assert_eq!(v["up"], false);
         assert_eq!(v["ipv4"], json!([]))
     }
+    /// 旧采集读到的对象（块的两个也算），mock ubusd 上都注册上，正常时回 `{}`。
+    const COLLECT_CALLS: &[(&str, &str)] = &[
+        ("zwrt_bsp.battery", "list"),
+        ("zwrt_bsp.charger", "list"),
+        ("zwrt_zte_mdm.api", "get_zwrt_common_info"),
+        ("zwrt_zte_mdm.api", "get_sim_info"),
+        ("zwrt_zte_mdm.api", "get_imei"),
+        ("system", "board"),
+        ("system", "info"),
+        ("zte_nwinfo_api", "nwinfo_get_netinfo"),
+        ("zwrt_data", "get_wwandst"),
+        ("zwrt_data", "get_wwandst_monthlimit"),
+        ("zwrt_data", "get_wwandst_clearday"),
+        ("zwrt_data", "get_wwaniface"),
+        ("zwrt_router.api", "router_lan_access_list"),
+        ("zwrt_router.api", "router_wireless_access_list"),
+        ("zwrt_router.api", "router_get_status_no_auth"),
+        ("zwrt_router.api", "router_get_lan_info"),
+        ("zwrt_bsp.thermal", "get_cpu_temp"),
+        ("uci", "get"),
+        ("zwrt_bsp.usb", "list"),
+        ("zwrt_nfc", "zwrt_nfc_wifi_get"),
+        ("zwrt_wms", "zwrt_wms_get_wms_capacity"),
+        ("zwrt_wms", "zte_libwms_get_sms_data"),
+        ("network.interface.lan", "status"),
+        ("network.interface.zte_wan", "status"),
+        ("network.interface.zte_wan6", "status"),
+    ];
+
+    /// P1-2（V2-19）：ubusd 整个不回（mock 的 `Hang`：不回也不断开）时，旧采集到了 `LEGACY_TIMEOUT_LIMIT`
+    /// 个超时对象就不再发新请求，一轮的长度有上限；派生块（信号、live）这一轮就置 stale。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_round_is_bounded_when_ubusd_hangs() {
+        use crate::ubus::mock_ubusd::{Action, MockUbusd};
+        let _serial = CACHE_TEST.lock().await;
+        invalidate_cache();
+        let m = MockUbusd::start_new().await;
+        let mut objects: Vec<&str> = COLLECT_CALLS.iter().map(|(o, _)| *o).collect();
+        objects.dedup();
+        for (o, method) in COLLECT_CALLS {
+            let id = 0x100 + objects.iter().position(|x| x == o).unwrap() as u32;
+            m.add_method(o, id, method, json!({}));
+        }
+        let timeout = Duration::from_millis(300);
+        let hub = std::sync::Arc::new(crate::block::Hub::new(
+            crate::block::phase1_blocks(),
+            Box::new(crate::block::NoSink),
+        ));
+        let exec = crate::executor::Executor::spawn(
+            m.backend(timeout),
+            hub.clone(),
+            crate::executor::Config::default(),
+            Duration::from_secs(1),
+        );
+        // 第一轮正常：信号、live 块读到了。
+        let h = hub.clone();
+        exec.round_now(async move { collect(1000, &h).await }).await;
+        assert!(!hub.view("signal").unwrap().stale);
+        assert!(!hub.view("live").unwrap().stale);
+
+        // ubusd 不回了（慢数据缓存也清掉：最坏情况，每个对象都要读）。
+        invalidate_cache();
+        for (o, method) in COLLECT_CALLS {
+            for _ in 0..4 {
+                m.script(o, method, Action::Hang);
+            }
+        }
+        let invokes = |m: &MockUbusd| objects.iter().map(|o| m.invokes(o)).sum::<u64>();
+        let before = invokes(&m);
+        let h = hub.clone();
+        let t0 = std::time::Instant::now();
+        let snap = exec.round_now(async move { collect(1000, &h).await }).await;
+        let took = t0.elapsed();
+        let sent = invokes(&m) - before;
+        // 每个超时的对象只发一次（本轮跳过），到上限就停：发出去的请求数就是上限。
+        // 没有上限时是 objects.len() 个，一轮约 objects.len() × 300 ms。
+        assert_eq!(
+            sent,
+            crate::executor::LEGACY_TIMEOUT_LIMIT as u64,
+            "{} objects, took {took:?}",
+            objects.len()
+        );
+        assert!(
+            took < timeout * (crate::executor::LEGACY_TIMEOUT_LIMIT as u32 + 3),
+            "took {took:?}"
+        );
+        assert!(hub.view("signal").unwrap().stale);
+        assert!(hub.view("live").unwrap().stale);
+        assert!(hub.view("sim").unwrap().stale);
+        // 旧 /state 照今天读失败的样子输出，字段都在
+        assert!(snap.fields.contains_key("net") && snap.fields.contains_key("system"));
+    }
+
+    /// 执行者这次没发请求（`Skipped`）时，有 TTL 的读取沿用上一次读成功的值（过期了也给），
+    /// 但不算读到；缓存里的上一次结果不被覆盖。TTL 为 0 的照旧读失败。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn skipped_read_keeps_the_previous_value_but_is_not_fresh() {
+        use crate::ubus::mock_ubusd::{Action, MockUbusd};
+        let _serial = CACHE_TEST.lock().await;
+        invalidate_cache();
+        let m = MockUbusd::start_new().await;
+        m.add_method("p12.svc", 0x10, "slow", json!({"v":1}));
+        m.add_method("p12.svc", 0x10, "hang", json!({}));
+        m.add_method("p12.svc", 0x10, "now", json!({"n":1}));
+        let hub = std::sync::Arc::new(crate::block::Hub::new(
+            vec![],
+            Box::new(crate::block::NoSink),
+        ));
+        let exec = crate::executor::Executor::spawn(
+            m.backend(Duration::from_millis(200)),
+            hub,
+            crate::executor::Config::default(),
+            Duration::from_secs(1),
+        );
+        let first = exec
+            .round_now(async { ubus_ttl_read(1, "p12.svc", "slow", json!({})).await })
+            .await;
+        assert_eq!(first, (Ok(json!({"v":1})), true));
+        tokio::time::sleep(Duration::from_millis(1100)).await; // TTL 过了
+        m.script("p12.svc", "hang", Action::Hang);
+        let (slow, now) = exec
+            .round_now(async {
+                // 同一个对象先超时一次：本轮之后的调用都跳过
+                let _ = ubus_ttl(0, "p12.svc", "hang", json!({})).await;
+                (
+                    ubus_ttl_read(1, "p12.svc", "slow", json!({})).await,
+                    ubus_ttl_read(0, "p12.svc", "now", json!({})).await,
+                )
+            })
+            .await;
+        assert_eq!(slow, (Ok(json!({"v":1})), false));
+        assert!(now.0.is_err() && !now.1, "{now:?}");
+        // 跳过的那次没把读失败写进缓存（原来会存 5 秒的失败，冲掉上一次的值）
+        assert_eq!(
+            cache_last_ok(&UBUS_CACHE, &format!("p12.svc\u{0}slow\u{0}{}", json!({}))),
+            Some(json!({"v":1}))
+        );
+    }
+
     #[test]
     fn connected_clients_ignore_historical_leases() {
         let (items, wifi, lan) = connected_clients(

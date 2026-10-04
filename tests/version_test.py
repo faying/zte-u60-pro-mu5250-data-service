@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -31,8 +32,12 @@ class VersionTests(unittest.TestCase):
         fake.write_text(r"""#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
+import time
 with Path(os.environ['VERSION_TEST_CALLS']).open('a') as out:
     out.write('called\n')
+# while this file exists the "modem" does not answer (ubusd hung at boot)
+while Path(os.environ['VERSION_TEST_HOLD']).exists():
+    time.sleep(0.05)
 if 'get_zwrt_common_info' in sys.argv:
     print(json.dumps({'wa_inner_version':'BD_TESTMODEMV1.0.0B99', 'hardware_version':'MU5250_HW1.0'}))
 else:
@@ -43,6 +48,7 @@ else:
                         ZWRT_DATAD_UCI_BIN='/usr/bin/false',
                         ZWRT_DATAD_DIR=str(self.root / 'cloud'),
                         VERSION_TEST_CALLS=str(self.calls),
+                        VERSION_TEST_HOLD=str(self.root / 'hold'),
                         ZWRT_DATAD_NEIGHBOR_DIR=str(self.root / 'capture'),
                         ZWRT_DATAD_NEIGHBOR_CONFIG=str(self.root / 'neighbor.json'))
 
@@ -70,6 +76,53 @@ else:
                                 capture_output=True, timeout=3)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('refusing unauthenticated non-loopback listener', result.stderr)
+
+    def test_listens_and_reports_starting_before_first_round(self):
+        """P1-3: the port answers while the first round is stuck; /healthz is 503 until it ends."""
+        hold = self.root / 'hold'
+        hold.write_text('')
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        proc = subprocess.Popen([str(BIN), '-i', '200', '-p', str(port)],
+                                cwd=self.root, env=self.env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        def get(path, timeout=4):
+            try:
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}{path}', timeout=timeout) as r:
+                    return r.status, json.load(r)
+            except urllib.error.HTTPError as error:
+                return error.code, json.load(error)
+        try:
+            deadline = time.monotonic() + 8
+            while True:
+                try:
+                    status, body = get('/healthz')
+                    break
+                except (OSError, urllib.error.URLError):
+                    if time.monotonic() >= deadline or proc.poll() is not None:
+                        self.fail('datad did not listen while the first round was stuck')
+                    time.sleep(.05)
+            self.assertEqual((status, body['status'], body['ok']), (503, 'starting', False))
+            self.assertEqual(get('/version'), (200, EXPECTED))
+            # a read waits for the first round (up to 10 s), then gets its data
+            started = time.monotonic()
+            threading.Timer(1, hold.unlink).start()
+            status, state = get('/state', timeout=12)
+            self.assertEqual(status, 200)
+            self.assertEqual(state['datad'], EXPECTED)
+            self.assertGreaterEqual(time.monotonic() - started, 0.9)
+            status, body = get('/healthz')
+            self.assertEqual((status, body['status'], body['ok']), (200, 'ok', True))
+            self.assertIsInstance(body['exec_age_ms'], int)
+        finally:
+            hold.unlink(missing_ok=True)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
     def test_http_sse_and_lan_auth_share_binary_version(self):
         sockets = [socket.socket(), socket.socket()]

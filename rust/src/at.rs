@@ -59,13 +59,30 @@ fn lock_path() -> Option<String> {
 
 /// Send `cmd`, return the modem's answer (must contain OK).
 pub async fn send(cmd: Cmd) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || send_blocking(cmd))
+    let port = std::env::var("ZWRT_DATAD_AT_PORT")
+        .ok()
+        .filter(|p| !p.is_empty());
+    send_with(cmd, lock_path(), port).await
+}
+
+/// `send` with the lock path and port given (`port` None = probe the list).
+/// Runs on a blocking thread; on the executor, every bounded stage that ends
+/// (lock taken, a port probed, the answer read) counts as progress for the
+/// watchdog and `exec_age_ms` (STATE_V2.md V2-32): the whole command can take
+/// ~30 s of lock waits and probes, each stage at most 10 s.
+pub(crate) async fn send_with(
+    cmd: Cmd,
+    lock: Option<String>,
+    port: Option<String>,
+) -> Result<String, String> {
+    let progress = crate::executor::progress_handle();
+    tokio::task::spawn_blocking(move || send_blocking(cmd, lock, port, &|| progress.tick()))
         .await
         .map_err(|e| format!("AT task: {e}"))?
 }
 
-fn take_lock() -> Result<Option<File>, String> {
-    let Some(path) = lock_path() else {
+fn take_lock(path: Option<String>) -> Result<Option<File>, String> {
+    let Some(path) = path else {
         return Ok(None);
     };
     let f = OpenOptions::new()
@@ -86,10 +103,21 @@ fn take_lock() -> Result<Option<File>, String> {
     }
 }
 
-fn send_blocking(cmd: Cmd) -> Result<String, String> {
-    let _lock = take_lock()?;
-    let port = port()?;
-    exchange(&port, cmd.text(), ANSWER_WAIT).and_then(|a| {
+fn send_blocking(
+    cmd: Cmd,
+    lock: Option<String>,
+    port: Option<String>,
+    progress: &dyn Fn(),
+) -> Result<String, String> {
+    let _lock = take_lock(lock)?;
+    progress();
+    let port = match port {
+        Some(p) => p,
+        None => find_port(progress)?,
+    };
+    let answer = exchange(&port, cmd.text(), ANSWER_WAIT);
+    progress();
+    answer.and_then(|a| {
         if a.contains("OK") {
             Ok(a)
         } else {
@@ -98,16 +126,14 @@ fn send_blocking(cmd: Cmd) -> Result<String, String> {
     })
 }
 
-fn port() -> Result<String, String> {
-    if let Ok(p) = std::env::var("ZWRT_DATAD_AT_PORT")
-        && !p.is_empty()
-    {
-        return Ok(p);
-    }
+fn find_port(progress: &dyn Fn()) -> Result<String, String> {
     for p in PORTS {
-        if Path::new(p).exists()
-            && exchange(p, "AT", Duration::from_secs(1)).is_ok_and(|a| a.contains("OK"))
-        {
+        if !Path::new(p).exists() {
+            continue;
+        }
+        let ok = exchange(p, "AT", Duration::from_secs(1)).is_ok_and(|a| a.contains("OK"));
+        progress();
+        if ok {
             return Ok((*p).to_string());
         }
     }
@@ -169,13 +195,21 @@ fn exchange(port: &str, text: &str, wait: Duration) -> Result<String, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::ffi::CStr;
 
     /// A pseudo-terminal standing in for the modem: answers `answer` to every
     /// command line it reads; returns the slave path and what it was sent.
     fn fake_modem(answer: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        fake_modem_after(answer, Duration::ZERO)
+    }
+
+    /// `fake_modem` that takes `delay` to answer each line (a slow COPS=0).
+    pub(crate) fn fake_modem_after(
+        answer: &'static str,
+        delay: Duration,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
         // SAFETY: plain libc pty calls on a fresh descriptor.
         unsafe {
             let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
@@ -204,6 +238,7 @@ mod tests {
                     if b[0] == b'\r' {
                         let _ = tx.send(String::from_utf8_lossy(&line).into_owned());
                         line.clear();
+                        std::thread::sleep(delay);
                         libc::write(m, answer.as_ptr().cast(), answer.len());
                     } else {
                         line.push(b[0]);
@@ -256,7 +291,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             FileExt::unlock(&held).unwrap();
         });
-        let got = take_lock().unwrap();
+        let got = take_lock(lock_path()).unwrap();
         assert!(got.is_some() && t.elapsed() >= Duration::from_millis(250));
         r.join().unwrap();
     }

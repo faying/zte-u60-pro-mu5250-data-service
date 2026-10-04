@@ -48,7 +48,19 @@ fn path() -> Option<String> {
 static OPEN_FAILED: AtomicBool = AtomicBool::new(false);
 
 pub async fn acquire() -> WriteLock {
-    let Some(path) = path() else {
+    acquire_path(path()).await
+}
+
+/// `acquire`，路径由调用方给（`None` = 不用锁）。
+pub(crate) async fn acquire_path(path: Option<String>) -> WriteLock {
+    let lock = wait_for(path).await;
+    // 等锁最多 15 秒，不是 ubus 调用：拿到（或等满）算执行者前进一次（V2-32），后面的写调用再各自记。
+    crate::executor::progress();
+    lock
+}
+
+async fn wait_for(path: Option<String>) -> WriteLock {
+    let Some(path) = path else {
         return held(None);
     };
     let file = match OpenOptions::new()

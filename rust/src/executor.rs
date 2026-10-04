@@ -3,8 +3,9 @@
 //! 一个 tokio 任务持有 ubus 后端，datad 里所有 ubus 请求都经过它，同一时间最多一个在途：
 //!
 //! - **采集轮**：先读到期的块（`block::Hub`，每轮 ubus 预算 3 秒、没轮到的下一轮先读），
-//!   再跑还没迁移的旧采集（`RoundDriver::legacy`，即 `state::collect` 那一套，不受预算截断），
-//!   最后 `Hub::round_end`：max_age、轮末钩子、心跳（`seq` 在那里分配）。
+//!   再跑还没迁移的旧采集（`RoundDriver::legacy`，即 `state::collect` 那一套，不受 3 秒预算截断；
+//!   只在本轮已有 `LEGACY_TIMEOUT_LIMIT` 个对象超时后不再发新请求），
+//!   最后 `Hub::round_end`：max_age、轮末钩子、心跳（`seq` 在那里分配）。轮拖得很长时，独立心跳定时器也判 max_age。
 //! - **任务**：`/control` 整个处理过程作为一个控制任务交给执行者（`Executor::control`，排队上限 8，
 //!   满了立即 `Busy`）；其他地方（登录校验等）在执行者外调 `state::ubus` 时，自动包成一个内部任务
 //!   （不计上限）。任务在块与块之间、旧采集的 `ubus_ttl` 调用之前（`preempt`）、以及轮间睡眠时执行，
@@ -54,6 +55,11 @@ pub const GATE_PROBES: u32 = 4;
 #[allow(dead_code)] // 建议值：程序里不用（默认关），测试和文档引用
 pub const COOLDOWN: Duration = Duration::from_secs(10);
 pub const ENV_COOLDOWN_MS: &str = "ZWRT_DATAD_UBUS_COOLDOWN_MS";
+/// 旧采集的超时上限（V2-19）：本轮已有这么多个对象超时（块和旧采集合计），旧采集就不再发新请求，
+/// 剩下的读取本轮算跳过（`Skipped`，有 TTL 的沿用上一次的值，`state::ubus_ttl_read`）。
+/// 只按超时数，不按用掉的时间：慢但在回答的轮照旧全读。ubusd 整个不回时一轮从 13 个对象挨个超时
+/// （socket 约 26 秒、cli 约 104 秒）缩到 6 个；基带重启时只有基带那几个对象（mdm、nwinfo、data、wms）超时，到不了 6 个。
+pub const LEGACY_TIMEOUT_LIMIT: usize = 6;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -135,6 +141,8 @@ struct Queue {
 struct RoundState {
     skips: RoundSkips,
     used: Duration,
+    /// 本轮已经记过「旧采集到了超时上限」。
+    cut_logged: bool,
 }
 
 /// 活性（D12、V2-32）：执行者最近一次「前进」= 完成一次调用、一个任务、一轮，或者闲着在等活。
@@ -219,6 +227,8 @@ struct Shared {
     gate: Mutex<Option<String>>,
     /// 正在做写（拿着跨进程写锁的任务，`write_scope`）。
     writing: AtomicBool,
+    /// 正在跑一轮（V2-13：一轮拖得很长时，独立定时器替轮末判 max_age）。
+    in_round: AtomicBool,
     /// 旧采集里超时过的对象 → 冷却到什么时候（跨轮，`Config::cooldown`）。
     cooldown: Mutex<HashMap<String, Instant>>,
 }
@@ -303,6 +313,30 @@ pub async fn call(object: &str, method: &str, args: &Value) -> Result<Value, Ubu
         return Err(UbusError::Io("ubus executor not running".into()));
     };
     exec.call(object, method, args).await
+}
+
+/// 任务里一段自己有上限的等待做完了（拿到跨进程写锁、AT 锁，一次 AT 交换，一个子进程）：记一次前进（V2-32）。
+/// 这些等待不是 ubus 调用，不经 `raw_call`，不记的话一个写任务连着等锁、等 AT 可以 30 多秒不前进，
+/// 订阅方 20 秒就判卡死、看门狗 30 秒退出。每段都有自己的上限（写锁 15 秒、AT 锁 10 秒……），
+/// 所以真卡在某一段时照样不前进、照样触发看门狗。不在执行者里时什么都不做。
+pub fn progress() {
+    let _ = CTX.try_with(|c| c.shared.live.progress());
+}
+
+/// 阻塞线程里用的 `progress`（`spawn_blocking` 里没有 task-local）：在任务里先拿，再带进去。
+#[derive(Clone)]
+pub struct ProgressHandle(Option<Arc<Shared>>);
+
+impl ProgressHandle {
+    pub fn tick(&self) {
+        if let Some(s) = &self.0 {
+            s.live.progress();
+        }
+    }
+}
+
+pub fn progress_handle() -> ProgressHandle {
+    ProgressHandle(CTX.try_with(|c| c.shared.clone()).ok())
 }
 
 /// 安全点：在采集轮里时，先把排队的任务做完（V2-24）。调用方不能持有任何锁。
@@ -396,9 +430,11 @@ impl Shared {
         method: &str,
         args: &Value,
     ) -> Result<Value, UbusError> {
-        let cool = round && cool && !self.cfg.cooldown.is_zero();
+        let legacy = round && cool;
+        let cool = legacy && !self.cfg.cooldown.is_zero();
         if (round && lock(&self.round).skips.is_skipped(object))
             || (cool && self.cooling(object, Instant::now()))
+            || (legacy && self.legacy_cut(object))
         {
             return Err(UbusError::Skipped {
                 object: object.into(),
@@ -430,6 +466,22 @@ impl Shared {
             lock(&self.cooldown).insert(object.to_owned(), until);
         }
         r
+    }
+
+    /// 旧采集到了本轮的超时上限（`LEGACY_TIMEOUT_LIMIT`）吗；第一次到的时候记一行。
+    fn legacy_cut(&self, object: &str) -> bool {
+        let mut rs = lock(&self.round);
+        let n = rs.skips.timed_out();
+        if n < LEGACY_TIMEOUT_LIMIT {
+            return false;
+        }
+        if !rs.cut_logged {
+            rs.cut_logged = true;
+            eprintln!(
+                "executor: {n} objects timed out this round; skipping the rest of the legacy reads (from {object})"
+            );
+        }
+        true
     }
 
     /// 这个对象还在跨轮冷却里吗（过期的顺手删掉）。
@@ -489,7 +541,9 @@ impl Shared {
             let mut rs = lock(&self.round);
             rs.skips.clear();
             rs.used = Duration::ZERO;
+            rs.cut_logged = false;
         }
+        self.in_round.store(true, Ordering::Relaxed);
         let ctx = Ctx {
             shared: self.clone(),
             round: true,
@@ -508,6 +562,7 @@ impl Shared {
             .await;
         self.drain().await;
         self.live.progress();
+        self.in_round.store(false, Ordering::Relaxed);
         self.hub.round_end(Instant::now(), self.sample_interval());
         self.stats.rounds.fetch_add(1, Ordering::Relaxed);
         out
@@ -618,6 +673,7 @@ impl Executor {
             live: Liveness::new(),
             gate: Mutex::new(None),
             writing: AtomicBool::new(false),
+            in_round: AtomicBool::new(false),
             cooldown: Mutex::default(),
         });
         tokio::spawn(shared.clone().run());
@@ -645,12 +701,17 @@ impl Executor {
 
     /// V2-22：独立定时器的心跳。每 `every` 看一次，距上一条心跳满 `every` 就补一条（带 exec_age_ms）。
     /// 不经执行者：执行者被长任务占着或卡住时照样发。
+    /// V2-13：正在跑一轮时（比如 ubusd 不回、旧采集挨个超时），同时判一次 max_age，块不必等到轮末才置 stale。
+    /// 轮间的长任务（短信发送等）不判：下一轮会先读块，用不着让块翻 stale 再翻回来。
     pub fn start_heartbeat(&self, every: Duration) {
         let shared = self.shared.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(every).await;
                 let now = Instant::now();
+                if shared.in_round.load(Ordering::Relaxed) {
+                    shared.hub.expire(now, shared.sample_interval());
+                }
                 shared
                     .hub
                     .heartbeat_if_quiet(now, shared.live.age_ms(now), every);

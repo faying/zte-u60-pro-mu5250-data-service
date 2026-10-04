@@ -52,9 +52,10 @@ where
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawn {program}"))?;
-    let output = timeout(deadline, child.wait_with_output())
-        .await
-        .with_context(|| format!("{program} timed out"))??;
+    let output = timeout(deadline, child.wait_with_output()).await;
+    // 子进程有自己的超时（V2-32）：在执行者里时，结束（含超时）算一次前进。
+    crate::executor::progress();
+    let output = output.with_context(|| format!("{program} timed out"))??;
     if !output.status.success() {
         bail!("{program} exited with {}", output.status);
     }

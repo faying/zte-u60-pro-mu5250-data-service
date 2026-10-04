@@ -168,7 +168,20 @@ data: {"ts":1782396733,...}
 
 ### `GET /healthz`
 
-始终返回 `ok`。该接口只代表 HTTP 进程正在监听，不代表每个设备子模块都可用。
+返回采集执行者的健康（不经执行者，datad 卡住时照样回答）：
+
+```json
+{"ok": true, "status": "ok", "exec_age_ms": 120}
+```
+
+- `200`，`status: "ok"`：第一轮采集已完成，执行者最近 20 秒内有前进（`exec_age_ms` 见 [`STATE_V2.md`](STATE_V2.md) V2-32）。
+- `503`，`status: "starting"`：datad 刚启动，第一轮采集还没完成（监听先于第一轮起来）。
+- `503`，`status: "stalled"`：执行者超过 20 秒没有前进（和订阅方判「数据服务没响应」的线一样）；超过 30 秒 datad 的看门狗会退出、由 procd 拉起。
+
+`curl -f` / `wget` 只看状态码即可。它不代表每个设备子模块都可用。
+
+启动中（`starting`）其余接口：`/state`、`/events`、`/v2/*` 先等第一轮采完（最多 10 秒），还没好回 `503 {"ok":false,"error":{"code":"starting",…}}`，客户端按连不上处理、稍后重试；
+`/control` 先等第一轮和事务恢复做完（最多 20 秒），还没好就回 `503 busy`（同控制队列满）；`/`、`/version`、`/capabilities` 照常。
 
 ## Status Codes
 
@@ -179,7 +192,7 @@ data: {"ts":1782396733,...}
 - `405`：请求方法错误
 - `413`：请求体超过限制
 - `502`：设备侧 `ubus/uci` 调用失败
-- `503`：SSE 客户端达到上限
+- `503`：SSE 客户端达到上限；控制队列满（`busy`）；刚启动、第一轮采集还没完成（`starting`）；`/healthz` 判执行者卡住
 
 ## Command Line
 

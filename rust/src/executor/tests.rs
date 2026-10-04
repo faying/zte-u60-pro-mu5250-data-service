@@ -1076,6 +1076,165 @@ async fn idle_executor_is_never_stalled() {
     assert!(hb.iter().all(|(_, a)| *a == 0));
 }
 
+const OBJS: [&str; 10] = ["o0", "o1", "o2", "o3", "o4", "o5", "o6", "o7", "o8", "o9"];
+
+/// 旧采集按顺序读 o0…o9 各一次（每次前是安全点）。
+struct TenLegacyObjects;
+impl RoundDriver for TenLegacyObjects {
+    fn legacy(&self) -> BoxFuture<'static, ()> {
+        Box::pin(async {
+            for o in OBJS {
+                preempt().await;
+                let _ = call(o, "status", &json!({})).await;
+            }
+        })
+    }
+}
+
+/// P1-2（V2-19）：ubusd 不回时旧采集到了 `LEGACY_TIMEOUT_LIMIT` 个超时对象就不再发新请求，
+/// 剩下的算跳过；排进来的控制任务不受影响；下一轮重新读。慢但在回答的轮不截（见上面的 not_budget_cut）。
+#[tokio::test(start_paused = true)]
+async fn legacy_reads_stop_after_timeout_limit() {
+    let (exec, mock, _) = setup(vec![], Config::default(), 1000);
+    for o in OBJS {
+        mock.push(
+            &format!("{o}.status"),
+            Step::Timeout(Duration::from_secs(2)),
+        );
+    }
+    let e = exec.clone();
+    let t0 = Instant::now();
+    let round = tokio::spawn(async move { e.round_now(TenLegacyObjects.legacy()).await });
+    // o5 超时的时候排进来的控制任务（在截了之后的安全点做）照常调
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    exec.control(async { call("o9", "set", &json!({})).await.unwrap() })
+        .await
+        .unwrap();
+    round.await.unwrap();
+    let sent: Vec<_> = mock
+        .names()
+        .into_iter()
+        .filter(|n| n.ends_with(".status"))
+        .collect();
+    assert_eq!(sent.len(), LEGACY_TIMEOUT_LIMIT, "{sent:?}");
+    assert!(mock.names().contains(&"o9.set".to_string()));
+    assert!(
+        t0.elapsed()
+            <= Duration::from_secs(2) * LEGACY_TIMEOUT_LIMIT as u32 + Duration::from_secs(1),
+        "{:?}",
+        t0.elapsed()
+    );
+    // 下一轮：都回答了，全读
+    exec.round_now(TenLegacyObjects.legacy()).await;
+    let n = mock
+        .names()
+        .iter()
+        .filter(|n| n.ends_with(".status"))
+        .count();
+    assert_eq!(n, LEGACY_TIMEOUT_LIMIT + OBJS.len());
+}
+
+/// P1-2（V2-13）：一轮拖得很长（旧采集挨个 8 秒超时，cli 后端）时，块过了 max_age 由独立定时器置 stale，
+/// 不等轮末。
+#[tokio::test(start_paused = true)]
+async fn block_goes_stale_mid_round_when_the_round_drags() {
+    let (exec, mock, sink) = setup(vec![spec("a", 0)], Config::default(), 1000);
+    for o in OBJS {
+        mock.default_step(
+            &format!("{o}.status"),
+            Step::Timeout(Duration::from_secs(8)),
+        );
+    }
+    exec.start_heartbeat(Duration::from_secs(5));
+    exec.start_rounds(Arc::new(TenLegacyObjects));
+    // 第一轮约 1 秒开始：读 a，然后旧采集 6 × 8 = 48 秒。a 的 max_age 是 15 秒。
+    tokio::time::sleep(Duration::from_secs(22)).await;
+    let ev = sink.blocks("a");
+    assert!(ev.last().is_some_and(|(_, b)| b.stale), "{ev:?}");
+    assert!(
+        mock.times("o5.status").is_empty(),
+        "still in the first round"
+    );
+    // 轮末之后下一轮重读 a，翻回来
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert!(!sink.blocks("a").last().unwrap().1.stale);
+}
+
+/// 一把被别人（应急脚本、agent）拿着的 flock：`hold` 之后放开。
+fn held_lock(name: &str, hold: Duration) -> (String, std::thread::JoinHandle<()>) {
+    use fs2::FileExt;
+    let dir = std::env::temp_dir().join(format!("datad-exec-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("lock");
+    let f = std::fs::File::create(&path).unwrap();
+    f.lock_exclusive().unwrap();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        FileExt::unlock(&f).unwrap();
+    });
+    (path.to_string_lossy().into_owned(), t)
+}
+
+/// P1-1：AT 写（`netselect.auto`）在一个控制任务里先等跨进程写锁、再等 AT 锁、再等基带回答，
+/// 都不是 ubus 调用。每段做完记一次前进：exec_age 不会累加成整个任务的时长，看门狗不动。
+/// 真机上三段最长 15 + 10 + 6 秒；这里各 1.2 秒（真实时间），用 2 秒的上限检查。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_and_at_waits_count_as_progress() {
+    let (exec, _mock, _) = setup(vec![], Config::default(), 1000);
+    let stage = Duration::from_millis(1200);
+    let (write_lock, w) = held_lock("write", stage);
+    let (at_lock, a) = held_lock("at", stage * 2);
+    let (port, sent) = crate::at::tests::fake_modem_after("\r\nOK\r\n", stage);
+    let e = exec.clone();
+    let job = tokio::spawn(async move {
+        e.control(async move {
+            let _w = crate::ops::write_lock::acquire_path(Some(write_lock)).await;
+            crate::at::send_with(crate::at::Cmd::CopsAuto, Some(at_lock), Some(port)).await
+        })
+        .await
+    });
+    let start = std::time::Instant::now();
+    let mut max_age = 0;
+    while !job.is_finished() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        max_age = max_age.max(exec.exec_age_ms());
+        assert!(
+            !exec.stalled(Duration::from_secs(2)),
+            "stalled after {:?} (exec_age {} ms)",
+            start.elapsed(),
+            exec.exec_age_ms()
+        );
+        assert!(start.elapsed() < Duration::from_secs(20), "job never ended");
+    }
+    let answer = job.await.unwrap().unwrap().unwrap();
+    assert!(answer.contains("OK"), "{answer:?}");
+    assert_eq!(sent.recv().unwrap(), "AT+COPS=0");
+    // 一共约 3.6 秒，每段不到 1.5 秒
+    assert!(start.elapsed() >= stage * 3, "{:?}", start.elapsed());
+    assert!(max_age < 1_800, "exec_age reached {max_age} ms");
+    w.join().unwrap();
+    a.join().unwrap();
+}
+
+/// 真卡在一段等待里（锁一直不放、子进程不受自己的超时管）照样不前进：看门狗照样会动。
+#[tokio::test(start_paused = true)]
+async fn a_wait_that_never_ends_still_stalls() {
+    let (exec, _mock, _) = setup(vec![], Config::default(), 1000);
+    let e = exec.clone();
+    tokio::spawn(async move {
+        let _ = e
+            .control(async {
+                progress();
+                std::future::pending::<()>().await;
+            })
+            .await;
+    });
+    tokio::time::sleep(Duration::from_secs(29)).await;
+    assert!(!exec.stalled(Duration::from_secs(30)));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(exec.stalled(Duration::from_secs(30)));
+}
+
 /// 写的上下文里调一次（像拿着写锁的事务写或 `/control` 写）。
 async fn write_call(
     exec: &Executor,

@@ -24,7 +24,7 @@
 | 退回 CLI | 无（本分支加 `auto`） | `Failure::NotSent` → 30 秒内走 CLI（`Executor::call`、`mark_socket_down`） |
 | 超时处理 | 采集轮 2 秒 / 控制 8 秒（`SocketBackend::set_round`）；超时对象**只在本轮**跳过（`RoundSkips`） | 采集 5 秒 / 交互 8 秒；超时对象冷却 30 秒；查不到的对象 10 秒内不再 LOOKUP |
 | 优先级 | 控制任务排队上限 8（`CONTROL_QUEUE`，满了 `Busy`），在块与块之间、`ubus_ttl` 前（`preempt`）、轮间执行；`drain` 按快照计数，防饿死 | 两条道：交互 / 采集；交互排队上限 8；采集调用让位给等待中的交互（`yield_to_interactive`）；无每轮预算、无防饿死 |
-| 每轮预算 / 轮转 | 3 秒预算 + 轮转（V2-19、V2-20） | 无 |
+| 每轮预算 / 轮转 | 3 秒预算 + 轮转（V2-19、V2-20）；旧采集不按预算截，本轮 6 个对象超时后不再发新请求（V2-19，2026-10-04 P1-2） | 无 |
 | 写闸 | 写超时后探测对象恢复才放下一个写（V2-33，`reopen_gate`，最多 4 次） | 无 |
 | 看门狗 | `watchdog.rs`：执行者 30 秒不前进就退出让 procd 拉起（V2-32） | 无 |
 | 观测 | stderr 日志；`exec_age_ms` 在心跳和 `/v2/screen` | `ZWRT_DATAD_UBUS_STATS=1` 时 `/state.ubus_stats` |
