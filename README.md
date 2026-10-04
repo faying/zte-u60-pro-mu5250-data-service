@@ -3,7 +3,7 @@
 **English** · [中文](README.zh-CN.md) · [API](docs/API.md)
 
 `zwrt-datad` runs on the device itself. It turns `ubus`, `uci`, `sysfs` and the device logs it needs into a stable JSON state, served over HTTP and SSE to the touch UI, scripts and other local services.
-This repo is a fork of [33333s/zwrt-datad](https://github.com/33333s/zwrt-datad). On the `main` branch it adds MU5250 alignment fixes and a slow-data cache, **and removes upstream's self-updater (OTA), cloud client, WebShell and `/ubus` passthrough; the binary does not contact any Internet address**.
+It started from [33333s/zwrt-datad](https://github.com/33333s/zwrt-datad) and is now maintained independently, for the U60 Pro (MU5250): it adds MU5250 alignment fixes, a slow-data cache and a single ubus reader with a write-op layer, **and removes the original's self-updater (OTA), cloud client, WebShell and `/ubus` passthrough; the binary does not contact any Internet address**.
 
 The documents linked under `docs/` are in Chinese.
 
@@ -41,7 +41,7 @@ curl -fsS http://127.0.0.1:9460/state
 curl -N  http://127.0.0.1:9460/events
 ```
 
-The binary has no self-updater (upstream's OTA, cloud client, WebShell and `/ubus` passthrough are all removed) and no hard-coded Internet addresses. To update, build it yourself and install it with the install kit's `./install.sh devui`.
+The binary has no self-updater (the original's OTA, cloud client, WebShell and `/ubus` passthrough are all removed) and no hard-coded Internet addresses. To update, build it yourself and install it with the install kit's `./install.sh devui`.
 
 ## Build
 
@@ -65,13 +65,13 @@ When building the install kit, point to it with `DATAD_BIN=…/zwrt-datad-aarch6
 - [docs/STATE_SCHEMA.md](docs/STATE_SCHEMA.md): state field conventions
 - [docs/CONTROL_API.md](docs/CONTROL_API.md): control actions and safety boundaries
 - [docs/models/](docs/models/): model templates
-- [docs/RUNTIME.md](docs/RUNTIME.md), [docs/NEIGHBOR.md](docs/NEIGHBOR.md): upstream's runtime notes and optional features (the U60 Pro install kit uses its own startup method)
+- [docs/RUNTIME.md](docs/RUNTIME.md), [docs/NEIGHBOR.md](docs/NEIGHBOR.md): runtime notes and optional features from the original (the U60 Pro install kit uses its own startup method)
 
 ## Credits
 
 - [33333s](https://github.com/33333s): original author of `zwrt-datad`; thanks for this reference repo (and [u60pro-devui](https://github.com/33333s/u60pro-devui)).
-- Upstream contributors are listed in [CONTRIBUTORS.md](CONTRIBUTORS.md).
-- [Jesther Silvestre](https://github.com/jesther-ai) (open-u60-pro), Wei REN (this fork's MU5250 fixes and the three-repo integration).
+- Contributors to the original are listed in [CONTRIBUTORS.md](CONTRIBUTORS.md).
+- [Jesther Silvestre](https://github.com/jesther-ai) (open-u60-pro), Wei REN (MU5250 fixes and the three-repo integration).
 
 ## License and disclaimer
 
