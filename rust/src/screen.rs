@@ -848,9 +848,16 @@ fn net_badge(i: &NetIn) -> String {
     }
     if matches!(r, Rat::Sa | Rat::Nsa) {
         if i.mcc == 460 {
-            let unicom = matches!(i.mnc, 1 | 6 | 9);
-            if i.nr_active >= 3 || (unicom && i.nr_active >= 2 && i.nr_mhz >= 200) {
+            // 3CC，或电信/联通（共建共享的同一张网）2CC 合计 ≥200 MHz（联通终端白皮书）。
+            // 网传的「电联 3CC≥130M、移动广电 3CC≥180M」查不到出处，不用。
+            let shared = matches!(i.mnc, 1 | 3 | 5 | 6 | 9 | 11);
+            if i.nr_active >= 3 || (shared && i.nr_active >= 2 && i.nr_mhz >= 200) {
                 out = "5G-A";
+            }
+        } else if i.mcc == 440 && i.mnc == 10 {
+            // docomo：3.7/4.5 GHz（n78/n79）上是「5G+」，4G 频段上的 5G 是「5G」。
+            if i.nr_band == 78 || i.nr_band == 79 {
+                out = "5G+";
             }
         } else if i.mcc == 310 && i.mnc == 260 {
             if i.nr_band == 41 {
@@ -864,7 +871,10 @@ fn net_badge(i: &NetIn) -> String {
             out = "5G+";
         }
     } else if r == Rat::G4 {
-        if i.lte_active >= 2 && (i.mcc == 466 || i.mcc == 440) {
+        if i.mcc == 440 && i.mnc == 10 {
+            // docomo 的 LTE 一律写「4G+」（docomo.ne.jp 5G 注意事项）
+            out = "4G+";
+        } else if i.lte_active >= 2 && (i.mcc == 466 || i.mcc == 440 || i.mcc == 460) {
             out = "4G+";
         } else if us {
             out = "LTE";

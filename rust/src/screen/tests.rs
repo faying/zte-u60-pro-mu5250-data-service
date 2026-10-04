@@ -357,7 +357,7 @@ fn story_every_situation_in_priority_order() {
         x.lte_active = 3;
         x.mhz = 60
     });
-    assert!(o.rat == "4G" && o.link == "3 条载波聚合 · 带宽一般");
+    assert!(o.rat == "4G+" && o.link == "3 条载波聚合 · 带宽一般");
     let o = with(|x| {
         x.net_type = "LTE";
         x.n_active = 1;
@@ -543,8 +543,10 @@ fn status_bar_label_by_the_network_you_are_on() {
         net_badge(&x)
     };
     assert_eq!(b(|_| {}), "5G");
+    // 移动 2CC 200 MHz 不算 5G-A（只有电信/联通的 2CC ≥200 MHz 算）
     assert_eq!(
         b(|x| {
+            x.mnc = 0;
             x.nr_active = 2;
             x.nr_mhz = 200
         }),
@@ -641,13 +643,67 @@ fn status_bar_label_by_the_network_you_are_on() {
         }),
         "5G"
     );
+    // 电信和联通共建共享：2CC ≥200 MHz 两家都算
+    assert_eq!(
+        b(|x| {
+            x.mnc = 11;
+            x.nr_active = 2;
+            x.nr_mhz = 200
+        }),
+        "5G-A"
+    );
+    // docomo：n78/n79 是 5G+，按频段不按载波数
+    assert_eq!(
+        b(|x| {
+            x.mcc = 440;
+            x.mnc = 10
+        }),
+        "5G+"
+    );
     assert_eq!(
         b(|x| {
             x.mcc = 440;
             x.mnc = 10;
+            x.nr_band = 28;
             x.nr_active = 3
         }),
         "5G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "LTE";
+            x.mcc = 440;
+            x.mnc = 10;
+            x.nr_active = 0;
+            x.lte_active = 1
+        }),
+        "4G+"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "LTE";
+            x.mcc = 440;
+            x.mnc = 20;
+            x.nr_active = 0;
+            x.lte_active = 1
+        }),
+        "4G"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "LTE";
+            x.nr_active = 0;
+            x.lte_active = 2
+        }),
+        "4G+"
+    );
+    assert_eq!(
+        b(|x| {
+            x.net_type = "LTE";
+            x.nr_active = 0;
+            x.lte_active = 1
+        }),
+        "4G"
     );
     assert_eq!(
         b(|x| {
@@ -706,7 +762,7 @@ fn status_bar_label_by_the_network_you_are_on() {
             x.nr_active = 0;
             x.lte_active = 3
         }),
-        "4G"
+        "4G+"
     );
     assert_eq!(
         b(|x| {
