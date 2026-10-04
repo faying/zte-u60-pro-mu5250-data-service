@@ -166,7 +166,32 @@ cargo test --release bench_socket_vs_cli -- --ignored --nocapture   # BENCH_N �
 **本地没量的**：控制请求排队等待时间、`/state` 新鲜度、SSE 推送延迟、RSS 和峰值内存、长时间运行。
 这些只有在设备上量才有意义，放在第 7 节。
 
-## 7. 设备试跑方案（未执行）
+## 6b. 设备实测（2026-10-04，息屏、采样间隔 5 秒）
+
+1. **只读核对**（`--ubus-compare`，程序放 `/tmp` 跑一次后删掉）：
+   - 11 个对象、179 个值，socket 和 `ubus call` 完全一致。
+   - 对象包括 `zte_nwinfo_api nwinfo_get_netinfo`、`zwrt_zte_mdm.api get_sim_info`、`zwrt_router.api`、`zwrt_bsp.{thermal,charger,battery,usb}`、`network.interface.{lan,zte_wan}`、`zwrt_wms` 容量。
+   - 对象 ID 和 `ubus -v list` 一致；1 次连接，丢帧 0，超时 0。
+   - 前后 ubusd、datad 进程号和 boot id 都不变。
+   - 单次耗时：socket 0～5 ms，`ubus call` 3～6 ms；`zwrt_wms` 两边都约 15 ms，时间花在原厂服务本身。
+2. **基线**（现行 datad，cli 后端，600 秒）和**候选**（本分支，`ZWRT_DATAD_UBUS=auto`，冷却关；旁路试跑预热 60 秒后量 420 秒）：
+
+| 指标 | 基线 cli | 候选 auto | 备注 |
+|---|---|---|---|
+| datad CPU（单核） | 2.73% | **1.20%** | 约 -56% |
+| 整机 fork 次数/秒 | 94.1 | 77.9 | 整机计数，含其他程序的波动，只作参考 |
+| VmRSS / VmHWM | 28.8 / 32.8 MB | 15.4 / 19.2 MB | 进程年龄不同（候选刚起），不能直接比 |
+| `/v2/screen` p50 / p95 / 最大 | 3.6 / 4.5 / 4.5 ms | 3.3 / 4.1 / 4.7 ms | 各 30 次 |
+| 30 秒内心跳 | 6 | 6 | 息屏间隔 5 秒 |
+| 退回 CLI | — | 0 次 | |
+
+- 旁路试跑守护 1200 秒内无异常，结束后自动恢复正式版。
+- 局限：
+  - 两段测量不是同一时间，窗口长度不同（600 秒 / 420 秒）。
+  - 只量了息屏；亮屏 1 秒一轮时调用次数约多 5 倍，预计收益更大，但没量。
+  - 没有量控制请求往返。
+
+## 7. 设备试跑方案（2026-10-04 已按第 1～3 步做过一次，结果见 6b）
 
 每一步都要用户同意；先拿设备锁，按 datad 旁路试跑流程。
 
