@@ -221,6 +221,13 @@ print(json.dumps({"messages": rows}))' "$args" "$n"
     zwrt_bsp.thermal:get_cpu_temp)
         printf '%s\n' '{"cpuss_temp":42}'
         ;;
+    # 固件的过热限速标记（rpcd 的 uci get 带上未提交的改动）。MOCK_HIGHTEMP 改值，unset 时为 0。
+    uci:get)
+        case "$args" in
+            *'"zwrt_zte_mc_tmp"'*) printf '{"value":"%s"}\n' "${MOCK_HIGHTEMP:-0}" ;;
+            *) printf '%s\n' '{"result":"success"}' ;;
+        esac
+        ;;
     # netifd 标准形状（OpenWrt network.interface.* status）。取值贴近 MU5250：LAN 是 br-lan
     # 192.168.0.1/24；蜂窝 WAN 在 rmnet_data0 上，IPv4 是 /30、默认路由 proto static。
     # 地址用文档保留段（RFC 5737 / 2001:db8::/32）。

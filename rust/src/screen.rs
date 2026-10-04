@@ -202,6 +202,8 @@ struct Data {
     rx_speed: i64,
     cell_data: i64,
     cell_roam: i64,
+    /// `thermal.hightemp_limit` == 1：固件在过热限速（读不到当没有）。
+    hot: bool,
 }
 
 /// The 4 mainland carriers as (中文, English); the English must match zte-agent's
@@ -282,6 +284,11 @@ fn parse(state: &Value) -> Data {
     if let Some(q) = state.get("qos") {
         d.ambr_dl = raw(q, "ambr_dl").map(|s| atof(&cstr(s, 32))).unwrap_or(0.0);
     }
+    d.hot = state
+        .get("thermal")
+        .and_then(|t| t.get("hightemp_limit"))
+        .and_then(Value::as_i64)
+        == Some(1);
     if let Some(sim) = state.get("sim") {
         d.sim_state = getstr(sim, "state", 24);
         d.sim_imsi = getstr(sim, "imsi", 20);
@@ -648,6 +655,8 @@ pub enum State {
     Only2g,
     Only3g,
     Narrow,
+    /// 固件在过热限速（`thermal.hightemp_limit`）。
+    Hot,
     /// E4 T13：有进行中的写操作（V2-38）。
     Changing,
     /// E4 T13：退回也没通，还没点「知道了」（V2-38，DD9）。
@@ -752,6 +761,8 @@ struct NetIn<'a> {
     net_select: &'a str,
     data_sw: Sw,
     roam_sw: Sw,
+    /// 固件在过热限速。
+    hot: bool,
 }
 
 /// `ui_net_story` output.
@@ -1146,6 +1157,20 @@ fn story(i: &NetIn) -> Story {
             t(
                 "有信号、已拨号，但 30 秒没收到任何数据",
                 "Signal and data are up, but nothing came back for 30 s",
+            ),
+        );
+    }
+    // 固件自己说在限速，是事实不是推断，排在运营商限速和信号判断前面。
+    if i.hot {
+        return say(
+            o,
+            State::Hot,
+            Cause::None,
+            Tone::Warn,
+            ("慢：过热限速", "Slow"),
+            (
+                format!("机身太热，固件在限速，凉下来自动恢复{roam_note}"),
+                format!("Too hot; speed limited until it cools{roam_en}"),
             ),
         );
     }
@@ -1709,6 +1734,7 @@ pub fn net_view_op(state: &Value, win: Option<CellWindow>, op: Option<&ScreenOp>
             1 => Sw::On,
             _ => Sw::Unknown,
         },
+        hot: d.hot,
     };
     v.story = story(&nin);
     v.nosvc = matches!(v.story.state, State::Nosvc | State::Sos);

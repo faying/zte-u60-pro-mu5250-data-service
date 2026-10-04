@@ -173,6 +173,15 @@ async fn uci_show_ttl(ttl_s: u64, package: &str) -> BTreeMap<String, String> {
 fn uci_bin() -> String {
     std::env::var("ZWRT_DATAD_UCI_BIN").unwrap_or_else(|_| "/sbin/uci".into())
 }
+/// `thermal.hightemp_limit`：1 固件在过热限速，0 没有，null 读不到（别的机型没有这个键）。
+fn hightemp_limit(v: &Result<Value, String>) -> Value {
+    v.as_ref()
+        .ok()
+        .and_then(|v| v.get("value"))
+        .and_then(Value::as_str)
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map_or(Value::Null, |n| json!(i64::from(n != 0)))
+}
 fn object(v: Result<Value, String>) -> Value {
     v.unwrap_or_else(|_| json!({}))
 }
@@ -1163,6 +1172,16 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     let router_status =
         ubus_ttl(5, "zwrt_router.api", "router_get_status_no_auth", json!({})).await;
     let thermal = ubus_ttl(5, "zwrt_bsp.thermal", "get_cpu_temp", json!({})).await;
+    // 固件的过热限速标记（MU5250：zwrt_zte_mc_tmp.cpe.hightemp_datalimit_status）。走 ubus 的
+    // uci get：它带上 /tmp/.uci 里没提交的改动，而这个包在 /tmp/.uci 里常年有几百行改动，
+    // 自己解析会退回 fork `uci show`。
+    let hightemp = ubus_ttl(
+        30,
+        "uci",
+        "get",
+        json!({"config":"zwrt_zte_mc_tmp","section":"cpe","option":"hightemp_datalimit_status"}),
+    )
+    .await;
     let usb = ubus_ttl(30, "zwrt_bsp.usb", "list", json!({})).await;
     let battery = hub.legacy("battery");
     let charger = hub.legacy("charger");
@@ -1433,7 +1452,7 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     }
     fields.insert(
         "thermal".into(),
-        json!({"cpu_celsius":cpu_temp,"zones":zones,"modems":[]}),
+        json!({"cpu_celsius":cpu_temp,"zones":zones,"modems":[],"hightemp_limit":hightemp_limit(&hightemp)}),
     );
     fields.insert("interfaces".into(),json!({"lan":interface(&lan_if),"wan4":interface(&wan4_if),"wan6":interface(&wan6_if),"lan_config":lan_config,"cellular":cellular}));
     const UF: &[(&str, &str)] = &[
@@ -1954,6 +1973,19 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn hightemp_limit_is_one_zero_or_null() {
+        let v = |x: &str| hightemp_limit(&Ok(json!({ "value": x })));
+        assert_eq!(v("0"), json!(0));
+        assert_eq!(v("1"), json!(1));
+        assert_eq!(v("2"), json!(1));
+        assert_eq!(v(" 1\n"), json!(1));
+        assert_eq!(v(""), Value::Null);
+        assert_eq!(v("on"), Value::Null);
+        assert_eq!(hightemp_limit(&Ok(json!({}))), Value::Null);
+        assert_eq!(hightemp_limit(&Err("Not found".into())), Value::Null);
+    }
 
     #[test]
     fn legacy_state_stale_block_renders_as_failure() {

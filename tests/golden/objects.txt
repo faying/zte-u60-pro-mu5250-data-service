@@ -2,6 +2,7 @@ network.interface.lan
 network.interface.zte_wan
 network.interface.zte_wan6
 system
+uci
 zte_nwinfo_api
 zwrt_bsp.battery
 zwrt_bsp.charger

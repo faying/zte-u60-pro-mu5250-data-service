@@ -151,6 +151,7 @@ fn base() -> NetIn<'static> {
         net_select: "WL_AND_5G",
         data_sw: Sw::Unknown,
         roam_sw: Sw::Unknown,
+        hot: false,
     }
 }
 
@@ -2037,4 +2038,85 @@ fn response_with_op_fits_the_old_screens_buffers() {
         worst = (worst.0.max(net.len()), worst.1.max(resp.len()));
     }
     eprintln!("with op: net {} bytes, response {} bytes", worst.0, worst.1);
+}
+
+#[test]
+fn hot_says_the_firmware_limits_speed() {
+    let s = with(|x| x.hot = true);
+    assert_eq!(state_name(s.state), "hot");
+    assert_eq!((s.tone, s.cause), (Tone::Warn, Cause::None));
+    assert_eq!(s.headline, "慢：过热限速");
+    assert_eq!(s.headline_en, "Slow");
+    assert_eq!(s.hint, "机身太热，固件在限速，凉下来自动恢复");
+    assert_eq!(s.hint_en, "Too hot; speed limited until it cools");
+    let r = with(|x| {
+        x.hot = true;
+        x.roaming = 1
+    });
+    assert_eq!(r.hint, "机身太热，固件在限速，凉下来自动恢复；漫游中");
+    assert_eq!(r.hint_en, "Too hot; speed limited until it cools; roaming");
+    assert_eq!(state_name(with(|_| {}).state), "ok");
+}
+
+#[test]
+fn hot_sits_after_stall_and_before_the_slow_ones() {
+    let st = |f: fn(&mut NetIn<'static>)| state_name(with(f).state);
+    // before it
+    assert_eq!(
+        st(|x| {
+            x.hot = true;
+            x.data_up = false
+        }),
+        "nodata"
+    );
+    assert_eq!(
+        st(|x| {
+            x.hot = true;
+            x.win = Some(win(300, 0))
+        }),
+        "stall"
+    );
+    // after it
+    assert_eq!(
+        st(|x| {
+            x.hot = true;
+            x.ambr_dl = 4.6
+        }),
+        "hot"
+    );
+    assert_eq!(
+        st(|x| {
+            x.hot = true;
+            x.bars = 1
+        }),
+        "hot"
+    );
+    assert_eq!(
+        st(|x| {
+            x.hot = true;
+            x.net_type = "WCDMA"
+        }),
+        "hot"
+    );
+}
+
+#[test]
+fn hot_through_net_view_reads_thermal_hightemp_limit() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut state: Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("../tests/golden/normal.state.json")).unwrap(),
+    )
+    .unwrap();
+    let base = state_name(net_view(&state).story.state);
+    let base = base.as_str();
+    assert_ne!(base, "hot");
+    for (v, want) in [
+        (serde_json::json!(1), "hot"),
+        (serde_json::json!(0), base),
+        (Value::Null, base),
+        (serde_json::json!("1"), base),
+    ] {
+        state["thermal"]["hightemp_limit"] = v.clone();
+        assert_eq!(state_name(net_view(&state).story.state), want, "{v}");
+    }
 }
