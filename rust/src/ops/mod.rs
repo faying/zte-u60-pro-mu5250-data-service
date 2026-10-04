@@ -249,7 +249,8 @@ impl engine::Device for UbusDevice {
             .exec
             .task(async move {
                 let _lock = write_lock::acquire().await;
-                crate::executor::call(object, method, &args).await
+                // nwinfo_set_netselect 成功时什么都不回（T11 真机，B31）
+                crate::control::write_reply(crate::executor::call(object, method, &args).await)
             })
             .await;
         // 和 `/control` 一样：写过之后慢数据缓存作废，全部块下一轮立即读。

@@ -182,10 +182,19 @@ async fn call(service: &str, method: &str, args: Value) -> Outcome {
 /// 原厂有的写成功时什么都不回（`nwinfo_set_netselect`、`zwrt_wlan reload`，E4 T12 真机 B31），
 /// 这不算失败：结果靠之后的读回（事务）或调用方自己回读。
 fn write_outcome(reply: Result<Value, crate::ubus::client::UbusError>) -> Outcome {
-    match reply {
+    match write_reply(reply) {
         Ok(value) => Outcome::Ok(value),
-        Err(crate::ubus::client::UbusError::NoData { .. }) => Outcome::Ok(json!({})),
         Err(error) => Outcome::Failed(error.to_string()),
+    }
+}
+
+/// 原厂写的回复：什么都没回算成功（`{}`），其余原样。`/control` 和事务引擎共用。
+pub(crate) fn write_reply(
+    reply: Result<Value, crate::ubus::client::UbusError>,
+) -> Result<Value, crate::ubus::client::UbusError> {
+    match reply {
+        Err(crate::ubus::client::UbusError::NoData { .. }) => Ok(json!({})),
+        other => other,
     }
 }
 async fn mapped_call(
