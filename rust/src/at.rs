@@ -14,6 +14,10 @@ use std::{
     io::{Read, Write},
     os::unix::fs::OpenOptionsExt,
     path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -66,19 +70,76 @@ pub async fn send(cmd: Cmd) -> Result<String, String> {
 }
 
 /// `send` with the lock path and port given (`port` None = probe the list).
-/// Runs on a blocking thread; on the executor, every bounded stage that ends
+/// Runs on its own thread; on the executor, every bounded stage that ends
 /// (lock taken, a port probed, the answer read) counts as progress for the
-/// watchdog and `exec_age_ms` (STATE_V2.md V2-32): the whole command can take
-/// ~30 s of lock waits and probes, each stage at most 10 s.
+/// watchdog and `exec_age_ms` (STATE_V2.md V2-32). Each stage has its own
+/// limit, but a stage can still block inside the kernel: on B31 with the modem
+/// in LPM, a call on the AT port did not return for over 30 s and the watchdog
+/// killed datad twice (10-05). So the whole command gets `TOTAL_WAIT`, below
+/// the watchdog's 30 s; past it the thread is left behind, and until it
+/// returns every new command fails at once instead of piling up more threads.
 pub(crate) async fn send_with(
     cmd: Cmd,
     lock: Option<String>,
     port: Option<String>,
 ) -> Result<String, String> {
+    send_within(cmd, lock, port, TOTAL_WAIT).await
+}
+
+/// Whole-command limit (lock wait 10 s + probes + answer 6 s fit inside).
+const TOTAL_WAIT: Duration = Duration::from_secs(25);
+/// Commands left behind by `TOTAL_WAIT` and still blocked, by lock + port.
+static STUCK: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn stuck() -> std::sync::MutexGuard<'static, Vec<String>> {
+    STUCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+async fn send_within(
+    cmd: Cmd,
+    lock: Option<String>,
+    port: Option<String>,
+    total: Duration,
+) -> Result<String, String> {
+    let key = format!("{lock:?} {port:?}");
+    if stuck().contains(&key) {
+        return Err(format!(
+            "{}: the AT port is still stuck on an earlier command",
+            cmd.text()
+        ));
+    }
     let progress = crate::executor::progress_handle();
-    tokio::task::spawn_blocking(move || send_blocking(cmd, lock, port, &|| progress.tick()))
-        .await
-        .map_err(|e| format!("AT task: {e}"))?
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let done = Arc::new(AtomicBool::new(false));
+    let (thread_done, thread_key) = (done.clone(), key.clone());
+    std::thread::Builder::new()
+        .name("at".into())
+        .spawn(move || {
+            let r = send_blocking(cmd, lock, port, &|| progress.tick());
+            // under the same mutex as the timeout path below: either it sees
+            // `done`, or its entry is already there for us to remove
+            let mut s = stuck();
+            thread_done.store(true, Ordering::SeqCst);
+            s.retain(|k| *k != thread_key);
+            drop(s);
+            let _ = tx.send(r);
+        })
+        .map_err(|e| format!("AT thread: {e}"))?;
+    match tokio::time::timeout(total, rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => Err(format!("{}: AT thread ended without an answer", cmd.text())),
+        Err(_) => {
+            let mut s = stuck();
+            if !done.load(Ordering::SeqCst) {
+                s.push(key);
+            }
+            Err(format!(
+                "{}: no answer within {} s (the AT port is stuck)",
+                cmd.text(),
+                total.as_secs()
+            ))
+        }
+    }
 }
 
 fn take_lock(path: Option<String>) -> Result<Option<File>, String> {
@@ -294,5 +355,58 @@ pub(crate) mod tests {
         let got = take_lock(lock_path()).unwrap();
         assert!(got.is_some() && t.elapsed() >= Duration::from_millis(250));
         r.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stuck_stage_is_left_behind_and_blocks_later_commands_until_it_ends() {
+        let dir = std::env::temp_dir().join(format!("datad-at-stuck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("at.lock").to_string_lossy().into_owned();
+        let held = File::create(&lock).unwrap();
+        held.lock_exclusive().unwrap();
+        let (port, _) = fake_modem("\r\nOK\r\n");
+        let total = Duration::from_millis(300);
+        let t = Instant::now();
+        let e = send_within(
+            Cmd::CfunOnline,
+            Some(lock.clone()),
+            Some(port.clone()),
+            total,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            e.contains("stuck") && t.elapsed() < Duration::from_secs(2),
+            "{e}"
+        );
+        let e = send_within(
+            Cmd::CfunOnline,
+            Some(lock.clone()),
+            Some(port.clone()),
+            total,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("still stuck"), "{e}");
+        // the stage ends: the left-behind thread finishes and frees the key
+        FileExt::unlock(&held).unwrap();
+        let t = Instant::now();
+        loop {
+            match send_within(
+                Cmd::CfunOnline,
+                Some(lock.clone()),
+                Some(port.clone()),
+                total,
+            )
+            .await
+            {
+                Ok(a) => break assert!(a.contains("OK")),
+                Err(e) if t.elapsed() < Duration::from_secs(5) => {
+                    assert!(e.contains("stuck"), "{e}");
+                    tokio::time::sleep(Duration::from_millis(50)).await
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
     }
 }
