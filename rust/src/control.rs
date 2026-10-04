@@ -335,16 +335,7 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
         }
         "sim.set_slot" => sim_slot(params).await,
         "wifi.set_dual_band" => wifi_dual_band(params).await,
-        "wifi.set_module" => {
-            mapped_call(
-                params,
-                "zwrt_wlan",
-                "set",
-                &[("enabled", "SwitchOption", true, true)],
-                false,
-            )
-            .await
-        }
+        "wifi.set_module" => wifi_module(params).await,
         "wifi.set_chip" => {
             mapped_call(
                 params,
@@ -949,46 +940,92 @@ async fn client_rename(params: &Value) -> Outcome {
     .await
 }
 
-/// uci keys `wifi.apply` may set (zte-agent's Wi-Fi pages, AP switch, scenario,
-/// home-mode scan): section → options.
-const WIFI_APPLY_KEYS: &[(&str, &[&str], &[&str])] = &[
-    (
-        "wireless",
-        &["main_2g", "main_5g", "guest_2g", "guest_5g"],
-        &[
-            "ssid",
-            "key",
-            "encryption",
-            "hidden",
-            "isolate",
-            "disabled",
-            "guest_active_time",
-        ],
-    ),
-    (
-        "wireless",
-        &["wifi0", "wifi1"],
-        &["country", "channel", "txpowerpercent", "htmode", "disabled"],
-    ),
-    ("zte_mbb", &["wifi"], &["wifi_onoff", "wifi6_switch"]),
-];
+/// `zwrt_wlan set` arguments for the Wi-Fi master switch, as the stock web UI
+/// builds them (B31 `/usr/zte_web/web/js/`, read 10-04): `{"zte_mbb":{"wifi_onoff":
+/// "0"|"1"}}`, and when switching on also `lbd` (band steering) as it stands,
+/// so turning Wi-Fi back on keeps it. `lbd` is left out when it can't be read.
+fn wifi_module_args(enabled: bool, lbd: Option<&str>) -> Value {
+    let mut mbb = Map::new();
+    mbb.insert("wifi_onoff".into(), json!(if enabled { "1" } else { "0" }));
+    if enabled && let Some(lbd @ ("0" | "1")) = lbd {
+        mbb.insert("lbd".into(), json!(lbd));
+    }
+    json!({"zte_mbb": mbb})
+}
 
-fn wifi_apply_key_ok(path: &str) -> bool {
+/// `wifi.set_module {enabled: 0|1}`: the firmware's whole-Wi-Fi switch
+/// (`wireless.zte_mbb.wifi_onoff`), switched the stock way.
+async fn wifi_module(params: &Value) -> Outcome {
+    let enabled = match integer(params, "enabled", true) {
+        Ok(Some(v @ (0 | 1))) => v == 1,
+        Ok(_) => return Outcome::Invalid("enabled must be 0 or 1".into()),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let lbd = if enabled {
+        state::ubus(
+            "uci",
+            "get",
+            json!({"config":"wireless","section":"zte_mbb","option":"lbd"}),
+        )
+        .await
+        .ok()
+        .and_then(|v| v.get("value").and_then(Value::as_str).map(str::to_owned))
+    } else {
+        None
+    };
+    call(
+        "zwrt_wlan",
+        "set",
+        wifi_module_args(enabled, lbd.as_deref()),
+    )
+    .await
+}
+
+/// AP options `wifi.apply` may set (zte-agent's Wi-Fi pages, AP switch, scenario,
+/// home-mode scan) on `wireless.{main,guest}_{2g,5g}`.
+const WIFI_APPLY_AP_SECTIONS: &[&str] = &["main_2g", "main_5g", "guest_2g", "guest_5g"];
+const WIFI_APPLY_AP_OPTIONS: &[&str] = &[
+    "ssid",
+    "key",
+    "encryption",
+    "hidden",
+    "isolate",
+    "disabled",
+    "guest_active_time",
+];
+/// Radio options, on `wireless.wifi0`/`wifi1` (what callers write) or the radio
+/// sections the firmware names in `wireless.main_<band>.device`.
+const WIFI_APPLY_RADIO_OPTIONS: &[&str] =
+    &["country", "channel", "txpowerpercent", "htmode", "disabled"];
+/// Paths the agent before manager 1d9755a sends (best_effort, alone in their
+/// own call) for the Wi-Fi master switch and Wi-Fi 6. There is no `zte_mbb`
+/// uci package: the firmware keeps these in `wireless.zte_mbb`, and changes
+/// them through `zwrt_wlan set` (the master switch is `wifi.set_module`; Wi-Fi 6
+/// goes with each radio's hwmode). A raw uci write is neither, so these are
+/// accepted but never written, always listed in `skipped` — the same answer
+/// that agent got when the write failed, without a refused request per save.
+const WIFI_APPLY_DEAD_KEYS: &[&str] = &["zte_mbb.wifi.wifi_onoff", "zte_mbb.wifi.wifi6_switch"];
+
+fn wifi_apply_key_ok(path: &str, radios: &[String; 2]) -> bool {
+    if WIFI_APPLY_DEAD_KEYS.contains(&path) {
+        return true;
+    }
     let mut it = path.splitn(3, '.');
-    let (Some(cfg), Some(sec), Some(opt)) = (it.next(), it.next(), it.next()) else {
+    let (Some("wireless"), Some(sec), Some(opt)) = (it.next(), it.next(), it.next()) else {
         return false;
     };
-    WIFI_APPLY_KEYS
-        .iter()
-        .any(|(c, secs, opts)| *c == cfg && secs.contains(&sec) && opts.contains(&opt))
+    (WIFI_APPLY_AP_SECTIONS.contains(&sec) && WIFI_APPLY_AP_OPTIONS.contains(&opt))
+        || ((matches!(sec, "wifi0" | "wifi1") || radios.iter().any(|r| r == sec))
+            && WIFI_APPLY_RADIO_OPTIONS.contains(&opt))
 }
 
 /// Several uci options at once, one commit per package, then (unless
 /// `reload:false`) one `zwrt_wlan reload` — written and reloaded even when uci
 /// already holds the values: the agent's AP switch retries that way, and its
 /// own verify (polling hostapd) is the judge, not this reply (E4 T7b).
-/// `best_effort:true`: an option that cannot be set (a guest section or an
-/// mbb key this firmware lacks) is skipped and listed, not an error.
+/// `best_effort:true`: an option that cannot be set (a guest section this
+/// firmware lacks) is skipped and listed, not an error. The dead `zte_mbb.wifi.*`
+/// paths are always skipped (see [`WIFI_APPLY_DEAD_KEYS`]).
 async fn wifi_apply(params: &Value) -> Outcome {
     let Some(set) = object(params).get("set").and_then(Value::as_object) else {
         return Outcome::Invalid("missing parameter: set".into());
@@ -1005,9 +1042,11 @@ async fn wifi_apply(params: &Value) -> Outcome {
         .get("best_effort")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let radios = crate::wifi::radio_sections().await;
     let mut updates = Vec::new();
+    let mut skipped = Vec::new();
     for (path, v) in set {
-        if !wifi_apply_key_ok(path) {
+        if !wifi_apply_key_ok(path, &radios) {
             return Outcome::Invalid(format!("not a Wi-Fi option this action sets: {path}"));
         }
         let value = match v {
@@ -1023,30 +1062,24 @@ async fn wifi_apply(params: &Value) -> Outcome {
         if value.len() > 128 || value.contains(['\0', '\r', '\n']) {
             return Outcome::Invalid(format!("{path}: invalid value"));
         }
+        if WIFI_APPLY_DEAD_KEYS.contains(&path.as_str()) {
+            skipped.push(path.clone());
+            continue;
+        }
         updates.push((path.clone(), value));
     }
     let mut packages: Vec<&str> = Vec::new();
-    let mut skipped = Vec::new();
     for (path, value) in &updates {
         if let Err(e) = state::uci_write("set", path, Some(value)).await {
             if best_effort {
                 skipped.push(path.clone());
                 continue;
             }
-            for p in &packages {
-                let _ = state::uci_write("revert", p, None).await;
-            }
-            let pkg = path.split('.').next().unwrap_or("wireless");
-            let _ = state::uci_write("revert", pkg, None).await;
+            let _ = state::uci_write("revert", "wireless", None).await;
             return Outcome::Failed(format!("{path}: {e}"));
         }
-        let pkg = if path.starts_with("zte_mbb.") {
-            "zte_mbb"
-        } else {
-            "wireless"
-        };
-        if !packages.contains(&pkg) {
-            packages.push(pkg);
+        if packages.is_empty() {
+            packages.push("wireless");
         }
     }
     for p in &packages {
@@ -1385,11 +1418,8 @@ async fn wifi_power(params: &Value, operation: &str) -> Outcome {
         Ok(_) => return Outcome::Invalid("band must be 2g or 5g".into()),
         Err(e) => return Outcome::Invalid(e),
     };
-    let (section, factory) = if band == "2g" {
-        ("wifi0", 19)
-    } else {
-        ("wifi1", 18)
-    };
+    let section = crate::wifi::radio_section(&band).await;
+    let factory = if band == "2g" { 19 } else { 18 };
     let read = |option: &str| format!("wireless.{section}.{option}");
     let (Ok(old_percent), Ok(old_tx), Ok(old_limit)) = (
         state::uci_read(&read("txpowerpercent"))
@@ -1493,7 +1523,7 @@ async fn wifi_power(params: &Value, operation: &str) -> Outcome {
         return revert_wireless(e).await;
     }
     if state::ubus("zwrt_wlan", "reload", json!({})).await.is_err() {
-        let restored = restore_wifi_power(section, [old_percent, old_tx, old_limit]).await;
+        let restored = restore_wifi_power(&section, [old_percent, old_tx, old_limit]).await;
         return Outcome::Failed(format!(
             "wifi reload failed; previous configuration {}",
             if restored {
@@ -1631,7 +1661,7 @@ async fn wifi_dbm(params: &Value) -> Outcome {
             Err(e) => return Outcome::Invalid(e),
         }
     };
-    let section = if band == "2g" { "wifi0" } else { "wifi1" };
+    let section = crate::wifi::radio_section(&band).await;
     let path = format!("wireless.{section}.datad_txpower_dbm");
     let old = state::uci_read(&path).await;
     let write = if restore {
@@ -1703,15 +1733,19 @@ fn status_channels(status: &Value, band: &str) -> Vec<i64> {
         .map(|v| v.iter().filter_map(Value::as_i64).collect())
         .unwrap_or_default()
 }
-async fn restore_wireless_config(radio: &str, old0: &str, old1: &str, old_channel: &str) -> bool {
-    for (path, value) in [
-        ("wireless.wifi0.country", old0),
-        ("wireless.wifi1.country", old1),
-    ] {
+async fn restore_wireless_config(
+    radios: &[String; 2],
+    radio: &str,
+    old0: &str,
+    old1: &str,
+    old_channel: &str,
+) -> bool {
+    for (section, value) in [(&radios[0], old0), (&radios[1], old1)] {
+        let path = format!("wireless.{section}.country");
         let result = if value.is_empty() {
-            state::uci_write("delete", path, None).await
+            state::uci_write("delete", &path, None).await
         } else {
-            state::uci_write("set", path, Some(value)).await
+            state::uci_write("set", &path, Some(value)).await
         };
         if result.is_err() {
             return false;
@@ -1733,7 +1767,8 @@ async fn wireless_config(params: &Value) -> Outcome {
         Ok(_) => return Outcome::Invalid("band must be 2g or 5g".into()),
         Err(e) => return Outcome::Invalid(e),
     };
-    let radio = if band == "2g" { "wifi0" } else { "wifi1" };
+    let radios = crate::wifi::radio_sections().await;
+    let radio = radios[usize::from(band != "2g")].as_str();
     let initial = match crate::wifi::wireless_config_status().await {
         Ok(v) => v,
         Err(e) => return Outcome::Failed(e),
@@ -1778,8 +1813,9 @@ async fn wireless_config(params: &Value) -> Outcome {
         }
         None => None,
     };
-    let old0 = state::uci_read("wireless.wifi0.country").await;
-    let old1 = state::uci_read("wireless.wifi1.country").await;
+    let country_paths = radios.each_ref().map(|r| format!("wireless.{r}.country"));
+    let old0 = state::uci_read(&country_paths[0]).await;
+    let old1 = state::uci_read(&country_paths[1]).await;
     let channel_path = format!("wireless.{radio}.channel");
     let old_channel = state::uci_read(&channel_path).await;
     let country_changed = country.as_ref().is_some_and(|v| v != &old0 || v != &old1);
@@ -1799,9 +1835,9 @@ async fn wireless_config(params: &Value) -> Outcome {
     }
     if country_changed {
         let value = country.as_deref().unwrap();
-        for path in ["wireless.wifi0.country", "wireless.wifi1.country"] {
+        for path in &country_paths {
             if state::uci_write("set", path, Some(value)).await.is_err() {
-                let _ = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+                let _ = restore_wireless_config(&radios, radio, &old0, &old1, &old_channel).await;
                 return Outcome::Failed(
                     "failed to apply country; previous configuration restored".into(),
                 );
@@ -1812,13 +1848,14 @@ async fn wireless_config(params: &Value) -> Outcome {
                 .await
                 .is_err()
         {
-            let _ = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+            let _ = restore_wireless_config(&radios, radio, &old0, &old1, &old_channel).await;
             return Outcome::Failed("failed to stage automatic channel".into());
         }
         if state::uci_write("commit", "wireless", None).await.is_err()
             || state::ubus("zwrt_wlan", "reload", json!({})).await.is_err()
         {
-            let restored = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+            let restored =
+                restore_wireless_config(&radios, radio, &old0, &old1, &old_channel).await;
             return Outcome::Failed(format!(
                 "failed to apply country; previous configuration {}",
                 if restored {
@@ -1846,7 +1883,8 @@ async fn wireless_config(params: &Value) -> Outcome {
     }
     if let Some(v) = channel {
         if !status_channels(&final_status, &band).contains(&v) {
-            let restored = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+            let restored =
+                restore_wireless_config(&radios, radio, &old0, &old1, &old_channel).await;
             return Outcome::Invalid(format!(
                 "channel {v} is not permitted for {band} under country {}{}",
                 country.as_deref().unwrap_or(&old0),
@@ -1864,7 +1902,8 @@ async fn wireless_config(params: &Value) -> Outcome {
                 || state::uci_write("commit", "wireless", None).await.is_err()
                 || state::ubus("zwrt_wlan", "reload", json!({})).await.is_err())
         {
-            let restored = restore_wireless_config(radio, &old0, &old1, &old_channel).await;
+            let restored =
+                restore_wireless_config(&radios, radio, &old0, &old1, &old_channel).await;
             return Outcome::Failed(format!(
                 "failed to apply channel; previous configuration {}",
                 if restored {
@@ -2494,14 +2533,16 @@ mod wifi_apply_tests {
 
     #[test]
     fn only_listed_options() {
+        let fallback = ["wifi0".to_string(), "wifi1".to_string()];
         for ok in [
             "wireless.main_2g.disabled",
             "wireless.guest_5g.key",
             "wireless.wifi1.htmode",
             "wireless.wifi0.country",
             "zte_mbb.wifi.wifi6_switch",
+            "zte_mbb.wifi.wifi_onoff",
         ] {
-            assert!(wifi_apply_key_ok(ok), "{ok}");
+            assert!(wifi_apply_key_ok(ok, &fallback), "{ok}");
         }
         for bad in [
             "wireless.main_2g",
@@ -2511,8 +2552,41 @@ mod wifi_apply_tests {
             "zte_mbb.wifi.fota",
             "wireless.main_2g.ssid.x",
             "wireless.wifi0.disabled;reboot",
+            // the real place of the vendor switches: changed through zwrt_wlan, not here
+            "wireless.zte_mbb.wifi_onoff",
+            "wireless.zte_mbb.wifi6_switch",
+            "wireless.zte_mbb.lbd",
         ] {
-            assert!(!wifi_apply_key_ok(bad), "{bad}");
+            assert!(!wifi_apply_key_ok(bad, &fallback), "{bad}");
+        }
+        // radio sections named by wireless.main_<band>.device are radio sections too
+        let named = ["radio0".to_string(), "radio1".to_string()];
+        assert!(wifi_apply_key_ok("wireless.radio1.channel", &named));
+        assert!(!wifi_apply_key_ok("wireless.radio1.ssid", &named));
+        assert!(!wifi_apply_key_ok("wireless.radio1.channel", &fallback));
+        assert!(wifi_apply_key_ok("wireless.wifi0.channel", &named));
+    }
+
+    #[test]
+    fn wifi_module_is_the_stock_call() {
+        // stock web: fo("zwrt_wlan","set",{zte_mbb:{wifi_onoff, lbd only when on}})
+        assert_eq!(
+            wifi_module_args(false, Some("1")),
+            json!({"zte_mbb":{"wifi_onoff":"0"}})
+        );
+        assert_eq!(
+            wifi_module_args(true, Some("1")),
+            json!({"zte_mbb":{"wifi_onoff":"1","lbd":"1"}})
+        );
+        assert_eq!(
+            wifi_module_args(true, Some("0")),
+            json!({"zte_mbb":{"wifi_onoff":"1","lbd":"0"}})
+        );
+        for unreadable in [None, Some(""), Some("yes")] {
+            assert_eq!(
+                wifi_module_args(true, unreadable),
+                json!({"zte_mbb":{"wifi_onoff":"1"}})
+            );
         }
     }
 }

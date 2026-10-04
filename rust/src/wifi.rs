@@ -1,7 +1,7 @@
 use crate::{command, state};
 use futures_util::future::join_all;
 use serde_json::{Map, Value, json};
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::OnceLock, time::Duration};
 
 #[derive(Clone, Debug, Default)]
 struct Live {
@@ -42,6 +42,67 @@ fn runtime_dir() -> String {
     std::env::var("ZWRT_DATAD_WIFI_RUNTIME_DIR").unwrap_or_else(|_| "/data/zwrt-datad/wifi".into())
 }
 
+/// Radio (`wifi-device`) section behind each band's main AP, as the firmware
+/// names it in `wireless.main_<band>.device` (seen on this MU5250 under B31,
+/// 10-04: `wifi0`/`wifi1`).
+/// Fallback when the option is unreadable: the names every MU525x so far uses.
+const RADIO_FALLBACK: [&str; 2] = ["wifi0", "wifi1"];
+/// Read once, kept for the process: the radio sections never change at run
+/// time. Only a real answer is kept, so a ubus hiccup at start doesn't pin the
+/// fallback.
+static RADIO_SECTIONS: [OnceLock<String>; 2] = [OnceLock::new(), OnceLock::new()];
+
+/// `uci get` reply (ubus `{"value": …}`) → a usable uci section name, or None.
+fn radio_name(reply: Option<&Value>) -> Option<String> {
+    let value = reply?.get("value")?.as_str()?.trim();
+    (!value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then(|| value.to_owned())
+}
+
+fn band_index(band: &str) -> usize {
+    usize::from(band != "2g")
+}
+
+/// The radio section of `band` (`"2g"`/`"5g"`). Read through ubus `uci get`
+/// (sees uncommitted /tmp/.uci changes, no fork), cached once found.
+pub async fn radio_section(band: &str) -> String {
+    let index = band_index(band);
+    if let Some(name) = RADIO_SECTIONS[index].get() {
+        return name.clone();
+    }
+    let ap = if index == 0 { "main_2g" } else { "main_5g" };
+    let reply = state::ubus(
+        "uci",
+        "get",
+        json!({"config":"wireless","section":ap,"option":"device"}),
+    )
+    .await
+    .ok();
+    match radio_name(reply.as_ref()) {
+        Some(name) => RADIO_SECTIONS[index].get_or_init(|| name).clone(),
+        None => RADIO_FALLBACK[index].to_owned(),
+    }
+}
+
+/// Both radio sections, 2.4 GHz first.
+pub async fn radio_sections() -> [String; 2] {
+    [radio_section("2g").await, radio_section("5g").await]
+}
+
+/// Same as [`radio_section`], from a `wireless` package already in hand
+/// (`uci get {"config":"wireless"}` → `values`).
+fn radio_section_in(values: &Map<String, Value>, band: &str) -> String {
+    let index = band_index(band);
+    let ap = if index == 0 { "main_2g" } else { "main_5g" };
+    let device = values.get(ap).and_then(|section| section.get("device"));
+    radio_name(device.map(|value| json!({"value": value})).as_ref())
+        .unwrap_or_else(|| RADIO_FALLBACK[index].to_owned())
+}
+
 pub async fn advanced_status() -> Result<Value, String> {
     let model = state::uci_read("zwrt_common_info.common_config.model_name").await;
     if model != "MU5252" {
@@ -57,7 +118,10 @@ pub async fn advanced_status() -> Result<Value, String> {
         .ok()
         .and_then(|value| value.get("values").and_then(Value::as_object).cloned())
         .unwrap_or_default();
-    let radios = [radio(values, "wifi0", "2g")?, radio(values, "wifi1", "5g")?];
+    let radios = [
+        radio(values, &radio_section_in(values, "2g"), "2g")?,
+        radio(values, &radio_section_in(values, "5g"), "5g")?,
+    ];
     let mut interfaces = Vec::new();
     for (section, kind, band) in [
         ("main_2g", "main", 0),
@@ -135,14 +199,17 @@ pub async fn wireless_config_status() -> Result<Value, String> {
         parse_channels(&results, &mut channel_2g, &mut channel_5g);
     }
     let from_iwinfo = !channel_2g.is_empty() || !channel_5g.is_empty();
+    let [radio_2g, radio_5g] = radio_sections().await;
     if channel_2g.is_empty() {
-        channel_2g = parse_channel_list(&state::uci_read("wireless.wifi0.channellist").await);
+        channel_2g =
+            parse_channel_list(&state::uci_read(&format!("wireless.{radio_2g}.channellist")).await);
     }
     if channel_5g.is_empty() {
-        channel_5g = parse_channel_list(&state::uci_read("wireless.wifi1.channellist").await);
+        channel_5g =
+            parse_channel_list(&state::uci_read(&format!("wireless.{radio_5g}.channellist")).await);
     }
-    let country_2g = state::uci_read("wireless.wifi0.country").await;
-    let country_5g = state::uci_read("wireless.wifi1.country").await;
+    let country_2g = state::uci_read(&format!("wireless.{radio_2g}.country")).await;
+    let country_5g = state::uci_read(&format!("wireless.{radio_5g}.country")).await;
     let mut countries = iwinfo("countrylist")
         .await
         .map(|results| parse_countries(&results))
@@ -159,8 +226,8 @@ pub async fn wireless_config_status() -> Result<Value, String> {
         "channel_source":if from_iwinfo { "iwinfo" } else { "uci" },
         "countries":countries,
         "radios":{
-            "2g":wireless_radio("wifi0","main_2g",channel_2g).await,
-            "5g":wireless_radio("wifi1","main_5g",channel_5g).await,
+            "2g":wireless_radio(&radio_2g,"main_2g",channel_2g).await,
+            "5g":wireless_radio(&radio_5g,"main_5g",channel_5g).await,
         }
     }))
 }
@@ -460,6 +527,38 @@ fn parse_regulatory_limit(input: &str, frequency: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn radio_names_from_uci_device_or_fallback() {
+        assert_eq!(
+            radio_name(Some(&json!({"value":"wifi1"}))),
+            Some("wifi1".into())
+        );
+        assert_eq!(
+            radio_name(Some(&json!({"value":" radio0\n"}))),
+            Some("radio0".into())
+        );
+        for bad in [
+            json!({"value":""}),
+            json!({"value":"wifi0;reboot"}),
+            json!({"value":"a.b"}),
+            json!({"value":1}),
+            json!({"result":"success"}),
+            json!({"value":"x".repeat(33)}),
+        ] {
+            assert_eq!(radio_name(Some(&bad)), None, "{bad}");
+        }
+        assert_eq!(radio_name(None), None);
+
+        let wireless = json!({
+            "main_2g":{"device":"radioA","ssid":"a"},
+            "main_5g":{"ssid":"b"},
+        });
+        let values = wireless.as_object().unwrap();
+        assert_eq!(radio_section_in(values, "2g"), "radioA");
+        assert_eq!(radio_section_in(values, "5g"), "wifi1");
+        assert_eq!(radio_section_in(&Map::new(), "2g"), "wifi0");
+    }
 
     #[test]
     fn parses_iw_and_regulatory_limit() {

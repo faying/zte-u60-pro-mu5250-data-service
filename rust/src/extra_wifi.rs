@@ -356,11 +356,7 @@ pub async fn apply(config: &Config) -> Result<bool, String> {
         stop(&config.section).await?;
         return Ok(false);
     }
-    let radio = if config.band == "2g" {
-        "wifi0"
-    } else {
-        "wifi1"
-    };
+    let radio = crate::wifi::radio_section(&config.band).await;
     if state::uci_read(&format!("wireless.{radio}.disabled")).await == "1" {
         stop(&config.section).await?;
         return Ok(false);

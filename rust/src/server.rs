@@ -1328,7 +1328,8 @@ async fn control_task(app: App, action: &str, body: Value) -> Response {
             return (StatusCode::BAD_REQUEST,Json(json!({"ok":false,"action":action,"error":{"code":"invalid_parameter","message":"wifi power control is only supported on MU5252"}}))).into_response();
         }
         let mut result = Map::new();
-        for (band, section, factory_limit) in [("2g", "wifi0", 19), ("5g", "wifi1", 18)] {
+        let [radio_2g, radio_5g] = crate::wifi::radio_sections().await;
+        for (band, section, factory_limit) in [("2g", radio_2g, 19), ("5g", radio_5g, 18)] {
             let mut values = Vec::new();
             for option in ["disabled", "txpowerpercent", "txpower", "max_power"] {
                 let raw = state::uci_read(&format!("wireless.{section}.{option}")).await;

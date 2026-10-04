@@ -103,7 +103,7 @@ Wi-Fi（E4 T7b，zte-agent 的 Wi-Fi 页、热点开关、情景、家庭模式�
 
 | action | params | 说明 |
 |---|---|---|
-| `wifi.apply` | `set`（uci 路径 → 值，1–32 项）、`reload?`（默认 true）、`best_effort?` | 只认 `wireless.{main,guest}_{2g,5g}.{ssid,key,encryption,hidden,isolate,disabled,guest_active_time}`、`wireless.wifi{0,1}.{country,channel,txpowerpercent,htmode,disabled}`、`zte_mbb.wifi.{wifi_onoff,wifi6_switch}`。值和 uci 一样也照写，每个包 commit 一次，再 reload 一次（agent 靠「总是写 + reload + 自己轮询 hostapd」重试修复，不看这里的回复判断成没成）。`best_effort` 时设不上的项跳过并列在 `skipped`。回 `{committed, skipped, reloaded, reload_error}` |
+| `wifi.apply` | `set`（uci 路径 → 值，1–32 项）、`reload?`（默认 true）、`best_effort?` | 只认 `wireless.{main,guest}_{2g,5g}.{ssid,key,encryption,hidden,isolate,disabled,guest_active_time}`、`wireless.<射频>.{country,channel,txpowerpercent,htmode,disabled}`（射频 = `wifi0`/`wifi1`，或 `wireless.main_<频段>.device` 里写的名字）。值和 uci 一样也照写，commit 一次，再 reload 一次（agent 靠「总是写 + reload + 自己轮询 hostapd」重试修复，不看这里的回复判断成没成）。`best_effort` 时设不上的项跳过并列在 `skipped`。旧 agent 发的 `zte_mbb.wifi.{wifi_onoff,wifi6_switch}` 是死路径（没有 `zte_mbb` 这个包，原厂开关在 `wireless.zte_mbb`、要经 `zwrt_wlan set` 改）：照收、从不写、总列在 `skipped`。回 `{committed, skipped, reloaded, reload_error}` |
 | `wifi.reload` | — | 只 `zwrt_wlan reload` |
 
 其余原厂设置（E4 T7c，zte-agent 的路由、SIM PIN、STC、省电、快速开机、充电宝、自动休眠、恢复出厂、原样发短信）：
@@ -131,7 +131,7 @@ AT 只发这两条固定命令。AT 口和 zte-agent 共用，两边都拿 `ZWRT
 | `wireless.config` | 无参数时返回两频段国家码、信道、带宽、设备国家列表和当前监管域合法信道；写入时传 `band`，并可传 `country/channel` |
 | `wifi.dual_band_status` | 无，返回双频合一能力和开关状态 |
 | `wifi.set_dual_band` | `enabled`，布尔值或 `0/1` |
-| `wifi.set_module` | `enabled`，`0/1` |
+| `wifi.set_module` | `enabled`，`0/1`。整个 Wi-Fi 的原厂总开关（`wireless.zte_mbb.wifi_onoff`），按原厂网页的写法调 `zwrt_wlan set {"zte_mbb":{"wifi_onoff":"0"/"1"}}`；打开时带上当前的 `lbd`（双频合一），读不到就不带 |
 | `wifi.set_chip` | `chip`, `guest_enabled?` |
 | `wifi.configure` | `section` 与 `ssid/encryption/key/pmf/maxassoc/hidden/isolate/enabled` 可选字段 |
 | `wifi.txpower.status` | 无；返回两频段的启用状态、功率百分比、配置功率、配置上限和原厂上限 |
@@ -151,7 +151,7 @@ AT 只发这两条固定命令。AT 口和 zte-agent 共用，两边都拿 `ZWRT
 `wifi.configure.key` 是设备 WiFi 明文密码，只能在本机受 Token 保护的接口中传输，不应写入日志。
 
 `wireless.config` 的国家码作用于整台无线芯片，因此写入任一频段时会同步
-`wireless.wifi0.country` 与 `wireless.wifi1.country`。信道 `0` 或 `auto` 表示自动。
+两个射频的 `country`（射频段名读 `wireless.main_2g.device` / `main_5g.device`，读不到用 `wifi0` / `wifi1`）。信道 `0` 或 `auto` 表示自动。
 国家码变更后，datad 会先让厂商 `zwrt_wlan.reload` 应用监管域，再读取
 `iwinfo.freqlist` 校验目标信道；因此原厂静态 `channellist` 未列出的 100-144
 只有在目标国家的设备驱动实际开放时才能写入。设备重载期间会等待最长 20 秒让

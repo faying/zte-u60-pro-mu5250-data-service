@@ -136,6 +136,8 @@ post '{"action":"network.set_mode","params":{"mode":"Only_5G"}}' |
 post '{"action":"band.set_nr_sa","params":{"bands":"78,79"}}' >/dev/null
 post '{"action":"sim.set_slot","params":{"slot":2}}' >/dev/null
 post '{"action":"wifi.set_dual_band","params":{"enabled":true}}' >/dev/null
+# 原厂网页的 Wi-Fi 总开关写法：zwrt_wlan set {"zte_mbb":{"wifi_onoff":…}}（不是平铺的 SwitchOption）
+post '{"action":"wifi.set_module","params":{"enabled":0}}' >/dev/null
 # /control 布尔参数也接受 0/1；其余非法输入仍回 400 和原来的错误文字。
 post '{"action":"wifi.set_dual_band","params":{"enabled":0}}' |
     python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
@@ -285,6 +287,8 @@ for send in sends:
 PY
 ! grep -F '1;reboot' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'wireless.main_2g.ssid=Fixture New' "$MOCK_CALL_LOG" >/dev/null
+grep -F "$(printf 'zwrt_wlan\tset\t{"zte_mbb":{"wifi_onoff":"0"}}')" "$MOCK_CALL_LOG" >/dev/null
+! grep -F 'SwitchOption' "$MOCK_CALL_LOG" >/dev/null
 grep -F 'nwinfo_set_nrbandlock' "$MOCK_CALL_LOG" | grep -F '"nr5g_type":"0"' | grep -F '"nr5g_band":"78"' >/dev/null
 grep -F 'nwinfo_set_nrbandlock' "$MOCK_CALL_LOG" | grep -F '"nr5g_type":"1"' | grep -F '"nr5g_band":"41,78"' >/dev/null
 grep -F 'nwinfo_reset_band_cell_setting' "$MOCK_CALL_LOG" >/dev/null
