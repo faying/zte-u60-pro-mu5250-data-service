@@ -148,7 +148,12 @@ stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 **V2-18** datad 里只有一个**采集执行者**任务发 ubus 请求，同一时间最多一个在途。
 帧按 seq 和 peer 过滤；请求超时就重连，这个对象本轮跳过（算读失败，按 V2-12 置 stale）。
 阶段 1 的 `ZWRT_DATAD_UBUS=cli` 后端也经过这个执行者。
+旧采集（还没迁成块的读取）里超时的对象另有**跨轮冷却**：之后 10 秒内的采集轮都直接跳过它（`ZWRT_DATAD_UBUS_COOLDOWN_MS`，0 = 关，只按本轮跳过）。
+块不冷却（块有 V2-21 的 5 秒失败重读，电池/充电不能空太久），控制任务和内部任务也不管冷却。
+后端 `ZWRT_DATAD_UBUS=auto`：走 socket，请求**肯定没送到**时（连不上 ubusd、没收到 HELLO、LOOKUP 失败、INVOKE 没写出去）
+这一次改用 `ubus call`，之后 30 秒内都走 CLI 再试 socket；INVOKE 写出去之后的超时、断开不退回、不重发。`socket` 从不退回，默认仍是 `cli`。
 测试（T3）：`ubus_late_reply_is_dropped`、`ubus_timeout_reconnects_and_skips_object`；测试（T4）：`executor_is_only_ubus_caller`
+测试（性能审计）：`legacy_timeout_cools_object_across_rounds_then_expires`、`cooldown_ignores_blocks_failures_and_can_be_off`、`cooled_object_keeps_heartbeats_flowing`、`client_reports_whether_the_invoke_may_have_been_sent`、`auto_falls_back_to_cli_while_ubusd_is_down_then_retries_socket`、`auto_never_resends_an_invoke_that_may_have_run`
 
 **V2-19** 采集循环：先睡一个采样间隔（`state.set_interval`，500～5000 ms），再采一轮。
 单个 ubus 请求的超时是 2 秒。每轮 ubus 预算 3 秒，不算 `/control` 插进来的时间：

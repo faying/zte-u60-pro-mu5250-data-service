@@ -85,6 +85,9 @@ impl App {
         ));
         let cfg = executor::Config {
             cache: state::cache_enabled(),
+            cooldown: executor::Config::cooldown_from(
+                std::env::var(executor::ENV_COOLDOWN_MS).ok().as_deref(),
+            ),
             ..executor::Config::default()
         };
         let exec = Executor::spawn(

@@ -172,6 +172,9 @@ pub struct UbusClient {
     stats: ClientStats,
     /// 本次 request 在旧连接上写失败（请求没送到）。
     stale_write: bool,
+    /// 本次 `call` 的 INVOKE 帧可能已经到了 ubusd（写成功，或写到一半超时）。
+    /// 为假时请求肯定没执行，后端可以改走 CLI（`backend::AutoBackend`）。
+    invoke_maybe_sent: bool,
 }
 
 impl UbusClient {
@@ -188,6 +191,7 @@ impl UbusClient {
             ids: HashMap::new(),
             stats: ClientStats::default(),
             stale_write: false,
+            invoke_maybe_sent: false,
         }
     }
 
@@ -219,6 +223,13 @@ impl UbusClient {
         self.conn = None;
     }
 
+    /// 上一次 `call` 失败时请求肯定没到对象那里：连不上、没收到 HELLO、LOOKUP 失败（没有副作用），
+    /// 或 INVOKE 帧没写出去。只有这种失败可以换 CLI 再做一次；INVOKE 写出去之后的失败（超时、断开、
+    /// 坏回复）都不算，因为原厂可能已经执行了（写操作不能做两次）。
+    pub fn last_call_not_sent(&self) -> bool {
+        !self.invoke_maybe_sent
+    }
+
     /// 本轮已超时的对象直接返回 `Skipped`，不发请求；这次超时就记进 `skips`。
     pub async fn call_in_round(
         &mut self,
@@ -246,6 +257,7 @@ impl UbusClient {
         method: &str,
         args: &Value,
     ) -> Result<Option<Value>, UbusError> {
+        self.invoke_maybe_sent = false;
         super::validate_name(object).map_err(UbusError::InvalidArgument)?;
         super::validate_name(method).map_err(UbusError::InvalidArgument)?;
         let Some(map) = args.as_object() else {
@@ -456,7 +468,12 @@ impl UbusClient {
             self.connect(object, deadline).await?;
         }
         let conn = self.conn.as_mut().expect("connected");
-        match timeout_at(deadline, conn.stream.write_all(&frame)).await {
+        let write = timeout_at(deadline, conn.stream.write_all(&frame)).await;
+        // 写成功或写到一半超时，INVOKE 都可能已经到了 ubusd；写出错（对端关了）则没有。
+        if ty == msg_type::INVOKE && !matches!(write, Ok(Err(_))) {
+            self.invoke_maybe_sent = true;
+        }
+        match write {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 // 旧连接写失败多半是 ubusd 重启过：请求没送到，让 call 清掉 ID 后重发一次。

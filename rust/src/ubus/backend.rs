@@ -1,10 +1,13 @@
-//! ubus 读取后端（docs/STATE_V2.md V2-18）：`ZWRT_DATAD_UBUS=cli|socket` 选择，默认 `cli`。
+//! ubus 读取后端（docs/STATE_V2.md V2-18）：`ZWRT_DATAD_UBUS=cli|socket|auto` 选择，默认 `cli`。
 //!
 //! - `Cli`：默认，每次起一个 `ubus call`（和原来的 `state::ubus` 一样：同样的名字校验、8 秒超时、
 //!   同样的错误文字，`ZWRT_DATAD_UBUS_BIN` 指定程序）。
 //! - `Socket`：直连 ubusd（`client::UbusClient`），`ZWRT_DATAD_UBUS_SOCK` 指定 socket，
 //!   `ZWRT_DATAD_UBUS_TIMEOUT_MS` 指定采集轮里的单请求超时（默认 2000）；采集轮之外（控制任务、
 //!   内部任务）的请求用 `CONTROL_TIMEOUT`（8 秒，写操作可能要等较久；环境变量更大时取更大的）。
+//! - `Auto`：走 socket；请求**肯定没送到**时（连不上 ubusd、没收到 HELLO、LOOKUP 失败、INVOKE 没写出去，
+//!   见 `UbusClient::last_call_not_sent`）这一次改用 `ubus call`，之后 `FALLBACK_RETRY`（30 秒）内都走 CLI，
+//!   到时再试 socket。INVOKE 写出去之后的超时、断开不退回、不重发。`socket` 则从不退回。
 //!
 //! 执行者（`executor.rs`）持有一个 `Backend`；`state::ubus` 经执行者调到这里（T4）。
 
@@ -12,6 +15,7 @@ use super::client::{DEFAULT_SOCKET, DEFAULT_TIMEOUT, UbusClient, UbusError};
 use crate::command;
 use serde_json::Value;
 use std::{future::Future, time::Duration};
+use tokio::time::Instant;
 
 pub const ENV_BACKEND: &str = "ZWRT_DATAD_UBUS";
 pub const ENV_SOCKET: &str = "ZWRT_DATAD_UBUS_SOCK";
@@ -26,11 +30,15 @@ pub fn cli_bin() -> String {
 pub const CLI_TIMEOUT: Duration = Duration::from_secs(8);
 /// socket 后端在采集轮之外（控制任务、内部任务）的单请求超时（V2-19）。
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(8);
+/// `auto`：socket 不可用后多久内都走 CLI，再试 socket（同上游 v0.10.56）。
+pub const FALLBACK_RETRY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     Cli,
     Socket,
+    /// socket，肯定没送到时退回 CLI（`AutoBackend`）。
+    Auto,
 }
 
 impl BackendKind {
@@ -39,10 +47,11 @@ impl BackendKind {
         match value.map(str::trim) {
             None | Some("") | Some("cli") => (Self::Cli, None),
             Some("socket") => (Self::Socket, None),
+            Some("auto") => (Self::Auto, None),
             Some(other) => (
                 Self::Cli,
                 Some(format!(
-                    "{ENV_BACKEND}={other:?} 无效（只认 cli 或 socket），改用 cli"
+                    "{ENV_BACKEND}={other:?} 无效（只认 cli、socket 或 auto），改用 cli"
                 )),
             ),
         }
@@ -198,10 +207,83 @@ impl UbusBackend for SocketBackend {
     }
 }
 
+/// socket 优先，请求肯定没送到时退回 CLI。
+pub struct AutoBackend {
+    socket: SocketBackend,
+    cli: CliBackend,
+    retry: Duration,
+    /// 在这之前都走 CLI（socket 不可用）。
+    cli_until: Option<Instant>,
+    /// 退回过几次（测试和日志用）。
+    pub fallbacks: u64,
+}
+
+impl AutoBackend {
+    pub fn new(socket: SocketBackend, cli: CliBackend, retry: Duration) -> Self {
+        Self {
+            socket,
+            cli,
+            retry,
+            cli_until: None,
+            fallbacks: 0,
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::new(
+            SocketBackend::from_env(),
+            CliBackend::from_env(),
+            FALLBACK_RETRY,
+        )
+    }
+
+    /// 现在是否在走 CLI。
+    pub fn on_cli(&self, now: Instant) -> bool {
+        self.cli_until.is_some_and(|t| now < t)
+    }
+}
+
+impl UbusBackend for AutoBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Auto
+    }
+
+    fn set_round(&mut self, round: bool) {
+        self.socket.set_round(round);
+    }
+
+    async fn call(&mut self, object: &str, method: &str, args: &Value) -> Result<Value, UbusError> {
+        if self.on_cli(Instant::now()) {
+            return self.cli.call(object, method, args).await;
+        }
+        if self.cli_until.take().is_some() {
+            eprintln!("zwrt-datad: trying the ubus socket again");
+        }
+        match self.socket.call(object, method, args).await {
+            Err(e)
+                if matches!(
+                    e,
+                    UbusError::Io(_) | UbusError::Timeout { .. } | UbusError::Protocol(_)
+                ) && self.socket.client().last_call_not_sent() =>
+            {
+                self.fallbacks += 1;
+                self.cli_until = Some(Instant::now() + self.retry);
+                eprintln!(
+                    "zwrt-datad: ubus socket unusable ({e}); using `ubus call` for {} s",
+                    self.retry.as_secs()
+                );
+                self.cli.call(object, method, args).await
+            }
+            r => r,
+        }
+    }
+}
+
 /// 按环境变量选出的后端。
 pub enum Backend {
     Cli(CliBackend),
     Socket(SocketBackend),
+    Auto(AutoBackend),
 }
 
 impl Backend {
@@ -209,6 +291,7 @@ impl Backend {
         match BackendKind::from_env() {
             BackendKind::Cli => Self::Cli(CliBackend::from_env()),
             BackendKind::Socket => Self::Socket(SocketBackend::from_env()),
+            BackendKind::Auto => Self::Auto(AutoBackend::from_env()),
         }
     }
 }
@@ -218,6 +301,7 @@ impl UbusBackend for Backend {
         match self {
             Self::Cli(b) => b.kind(),
             Self::Socket(b) => b.kind(),
+            Self::Auto(b) => b.kind(),
         }
     }
 
@@ -225,6 +309,7 @@ impl UbusBackend for Backend {
         match self {
             Self::Cli(b) => b.call(object, method, args).await,
             Self::Socket(b) => b.call(object, method, args).await,
+            Self::Auto(b) => b.call(object, method, args).await,
         }
     }
 
@@ -232,6 +317,7 @@ impl UbusBackend for Backend {
         match self {
             Self::Cli(b) => b.set_round(round),
             Self::Socket(b) => b.set_round(round),
+            Self::Auto(b) => b.set_round(round),
         }
     }
 }

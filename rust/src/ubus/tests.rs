@@ -1,7 +1,7 @@
 //! T3 测试：blob 编解码（手写字节对照 + 往返）、客户端对 mock ubusd（迟到回复、换 ID、ubusd 重启、
 //! 超时重连与本轮跳过）、后端选择与 CLI 后端。
 
-use super::backend::{BackendKind, CliBackend, SocketBackend, UbusBackend};
+use super::backend::{AutoBackend, BackendKind, CliBackend, SocketBackend, UbusBackend};
 use super::blob::{self, Attr, MsgHdr, attr, blobmsg_type, msg_type, status};
 use super::client::{RoundSkips, UbusClient, UbusError};
 use super::mock_ubusd::{Action, Inject, MockUbusd};
@@ -554,6 +554,10 @@ fn backend_kind_parse() {
         BackendKind::parse(Some(" socket\n")),
         (BackendKind::Socket, None)
     );
+    assert_eq!(
+        BackendKind::parse(Some(" auto ")),
+        (BackendKind::Auto, None)
+    );
     let (k, w) = BackendKind::parse(Some("SOCKET"));
     assert_eq!(k, BackendKind::Cli);
     assert!(w.unwrap().contains("SOCKET"));
@@ -672,4 +676,214 @@ fn backend_futures_are_send() {
     assert_send(b.call("a", "b", &args));
     let mut c = UbusClient::new("/nonexistent");
     assert_send(c.call("a", "b", &args));
+}
+
+// ------------------------------------------------------------ auto：socket 优先，肯定没送到才退回 CLI
+
+/// 记录每次被调用的 CLI 替身，回 `{"via":"cli"}`。返回 (程序路径, 记录文件)。
+fn counting_cli(name: &str) -> (std::path::PathBuf, String, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("zwrt-ubus-auto-{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("calls");
+    let _ = std::fs::remove_file(&log);
+    let bin = script(
+        &dir,
+        "ubus.sh",
+        &format!(
+            "echo \"$2 $3\" >> '{}'\necho '{{\"via\":\"cli\"}}'",
+            log.display()
+        ),
+    );
+    (dir, bin, log)
+}
+
+fn cli_calls(log: &std::path::Path) -> usize {
+    std::fs::read_to_string(log).map_or(0, |s| s.lines().count())
+}
+
+/// ETXTBSY 重试（同 `cli_call`）。
+async fn auto_call(b: &mut AutoBackend, o: &str, m: &str) -> Result<Value, UbusError> {
+    for _ in 0..20 {
+        let r = b.call(o, m, &json!({})).await;
+        match &r {
+            Err(UbusError::Io(msg)) if msg.contains("spawn") => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            _ => return r,
+        }
+    }
+    b.call(o, m, &json!({})).await
+}
+
+#[tokio::test]
+async fn client_reports_whether_the_invoke_may_have_been_sent() {
+    let mut m = MockUbusd::start_new().await;
+    m.add_method("svc", 3, "get", json!({"ok":1}));
+    let mut c = client(&m);
+    // 成功、服务报错：INVOKE 已送到。
+    c.call("svc", "get", &json!({})).await.unwrap();
+    assert!(!c.last_call_not_sent());
+    m.script("svc", "get", Action::Status(2));
+    c.call("svc", "get", &json!({})).await.unwrap_err();
+    assert!(!c.last_call_not_sent());
+    // INVOKE 写出去后超时：可能已执行。
+    m.script("svc", "get", Action::Hang);
+    let e = c.call("svc", "get", &json!({})).await.unwrap_err();
+    assert!(e.is_timeout(), "{e:?}");
+    assert!(!c.last_call_not_sent(), "a timed-out invoke may have run");
+    // 找不到对象（LOOKUP 没有副作用，也算没送到；后端只对传输错误退回，NotFound 不退）。
+    let e = c.call("nope", "get", &json!({})).await.unwrap_err();
+    assert!(matches!(e, UbusError::NotFound { .. }), "{e:?}");
+    assert!(c.last_call_not_sent());
+    // 参数不合法：什么都没发。
+    c.call("svc", "get", &json!("x")).await.unwrap_err();
+    assert!(c.last_call_not_sent());
+    // ubusd 不在：连不上。
+    m.stop().await;
+    let e = c.call("svc", "get", &json!({})).await.unwrap_err();
+    assert!(matches!(e, UbusError::Io(_)), "{e:?}");
+    assert!(c.last_call_not_sent());
+}
+
+#[tokio::test]
+async fn auto_falls_back_to_cli_while_ubusd_is_down_then_retries_socket() {
+    let mut m = MockUbusd::start_new().await;
+    m.add_method("system", 1, "info", json!({"via":"socket"}));
+    let (dir, bin, log) = counting_cli("down");
+    let retry = Duration::from_millis(400);
+    let mut b = AutoBackend::new(
+        SocketBackend::new(client(&m)),
+        CliBackend::new(bin, Duration::from_secs(8)),
+        retry,
+    );
+    assert_eq!(b.kind(), BackendKind::Auto);
+    assert_eq!(
+        auto_call(&mut b, "system", "info").await.unwrap(),
+        json!({"via":"socket"})
+    );
+    assert_eq!(cli_calls(&log), 0);
+
+    // ubusd 不在：这一次换 CLI 做，之后 retry 内都走 CLI，不再碰 socket。
+    m.stop().await;
+    assert_eq!(
+        auto_call(&mut b, "system", "info").await.unwrap(),
+        json!({"via":"cli"})
+    );
+    assert_eq!((b.fallbacks, cli_calls(&log)), (1, 1));
+    m.start();
+    let conns = m.connections();
+    assert_eq!(
+        auto_call(&mut b, "system", "info").await.unwrap(),
+        json!({"via":"cli"})
+    );
+    assert_eq!(cli_calls(&log), 2);
+    assert_eq!(
+        m.connections(),
+        conns,
+        "socket left alone during the window"
+    );
+
+    // 过了 retry：再试 socket，成功后一直走 socket。
+    tokio::time::sleep(retry + Duration::from_millis(50)).await;
+    assert_eq!(
+        auto_call(&mut b, "system", "info").await.unwrap(),
+        json!({"via":"socket"})
+    );
+    assert_eq!(
+        auto_call(&mut b, "system", "info").await.unwrap(),
+        json!({"via":"socket"})
+    );
+    assert_eq!((b.fallbacks, cli_calls(&log)), (1, 2));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn auto_never_resends_an_invoke_that_may_have_run() {
+    // 写操作超时：原厂可能已经执行，不能换 CLI 再做一次（总共只执行一次）。
+    let m = MockUbusd::start_new().await;
+    m.add_method("svc", 3, "set", json!({"ok":1}));
+    m.script("svc", "set", Action::Hang);
+    let (dir, bin, log) = counting_cli("hang");
+    let mut b = AutoBackend::new(
+        SocketBackend::new(client(&m)),
+        CliBackend::new(bin, Duration::from_secs(8)),
+        Duration::from_secs(30),
+    );
+    b.set_round(true);
+    let e = auto_call(&mut b, "svc", "set").await.unwrap_err();
+    assert!(e.is_timeout(), "{e:?}");
+    assert_eq!(m.invokes("svc"), 1);
+    assert_eq!((b.fallbacks, cli_calls(&log)), (0, 0));
+    // 服务报错、找不到对象、OK 没数据：都是 ubusd 的回答，不退回。
+    m.script("svc", "set", Action::Status(2));
+    auto_call(&mut b, "svc", "set").await.unwrap_err();
+    auto_call(&mut b, "nope", "get").await.unwrap_err();
+    m.script("svc", "set", Action::NoData);
+    let e = auto_call(&mut b, "svc", "set").await.unwrap_err();
+    assert!(matches!(e, UbusError::NoData { .. }), "{e:?}");
+    assert_eq!((b.fallbacks, cli_calls(&log)), (0, 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------------------ 基准（手动跑，不进 CI）
+//
+// `cargo test --release bench_socket_vs_cli -- --ignored --nocapture`
+// 同一个只读调用经 socket（mock ubusd）和 CLI（`tests/mock_ubus.sh`，一次一个 sh 进程）各做 N 次，
+// 打印 p50/p95/p99 和起进程次数。这是容器/开发机上的相对数字，不代表设备；设备上的数字见
+// docs/PERF-AUDIT.md（9-29 设备探测：socket 0～1 ms，`ubus call` 3～5 ms）。
+
+fn pct(sorted: &[Duration], p: f64) -> Duration {
+    sorted[((sorted.len() as f64 - 1.0) * p).round() as usize]
+}
+
+fn report(name: &str, mut v: Vec<Duration>, forks: usize) {
+    v.sort();
+    let sum: Duration = v.iter().sum();
+    println!(
+        "bench {name:<6} n={} p50={:?} p95={:?} p99={:?} max={:?} total={:?} forks={forks}",
+        v.len(),
+        pct(&v, 0.50),
+        pct(&v, 0.95),
+        pct(&v, 0.99),
+        v[v.len() - 1],
+        sum
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_socket_vs_cli() {
+    let n: usize = std::env::var("BENCH_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
+    let m = MockUbusd::start_new().await;
+    m.add_method(
+        "system",
+        1,
+        "board",
+        json!({"board_name":"mu5250","model":"x"}),
+    );
+    let mut s = SocketBackend::new(client(&m));
+    s.set_round(true);
+    let mut lat = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t = Instant::now();
+        s.call("system", "board", &json!({})).await.unwrap();
+        lat.push(t.elapsed());
+    }
+    report("socket", lat, 0);
+    assert_eq!(m.connections(), 1, "one connection for all calls");
+
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/mock_ubus.sh");
+    let mut c = CliBackend::new(fixture, Duration::from_secs(8));
+    let mut lat = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t = Instant::now();
+        cli_call(&mut c, "system", "board", &json!({}))
+            .await
+            .unwrap();
+        lat.push(t.elapsed());
+    }
+    report("cli", lat, n);
 }

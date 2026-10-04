@@ -1190,3 +1190,108 @@ async fn read_timeouts_do_not_close_the_gate() {
         ]
     );
 }
+
+// ------------------------------------------------------------ 旧采集超时的跨轮冷却（上游 v0.10.56 回学）
+
+/// 一轮旧采集：调一次 `x status`，返回是否成功。
+async fn legacy_x(exec: &Executor) -> Result<Value, UbusError> {
+    exec.round_now(async { call("x", "status", &json!({})).await })
+        .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_timeout_cools_object_across_rounds_then_expires() {
+    let (exec, mock, _) = setup(vec![], Config::default(), 1000);
+    mock.push("x.status", Step::Timeout(Duration::from_secs(2)));
+    assert!(legacy_x(&exec).await.unwrap_err().is_timeout());
+    let t0 = Instant::now();
+    // 冷却期内：下几轮都不发请求，算跳过。
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let e = legacy_x(&exec).await.unwrap_err();
+        assert!(matches!(e, UbusError::Skipped { .. }), "{e:?}");
+    }
+    assert_eq!(mock.names(), ["x.status"]);
+    // 控制任务不管冷却，照常调。
+    exec.control(async { call("x", "set", &json!({})).await.unwrap() })
+        .await
+        .unwrap();
+    assert_eq!(mock.names(), ["x.status", "x.set"]);
+    // 冷却过了：照常读。
+    tokio::time::sleep_until(t0 + COOLDOWN).await;
+    assert!(legacy_x(&exec).await.is_ok());
+    assert_eq!(mock.names(), ["x.status", "x.set", "x.status"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cooldown_ignores_blocks_failures_and_can_be_off() {
+    // 块超时不进冷却（块有自己的 5 秒失败重读，电池/充电不能空 30 秒以上）；
+    // 旧采集里的非超时失败也不进冷却。
+    let (exec, mock, _) = setup(vec![spec("b", 0)], Config::default(), 1000);
+    mock.push("b.list", Step::Timeout(Duration::from_secs(2)));
+    mock.push("x.status", Step::Fail(Duration::ZERO));
+    let _ = legacy_x(&exec).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(legacy_x(&exec).await.is_ok());
+    let names = mock.names();
+    assert_eq!(
+        names.iter().filter(|n| *n == "b.list").count(),
+        2,
+        "{names:?}"
+    );
+    assert_eq!(
+        names.iter().filter(|n| *n == "x.status").count(),
+        2,
+        "{names:?}"
+    );
+
+    // cooldown = 0：只按本轮跳过（原来的行为），下一轮就再读。
+    let cfg = Config {
+        cooldown: Duration::ZERO,
+        ..Config::default()
+    };
+    let (exec, mock, _) = setup(vec![], cfg, 1000);
+    mock.push("x.status", Step::Timeout(Duration::from_secs(2)));
+    let _ = legacy_x(&exec).await;
+    assert!(legacy_x(&exec).await.is_ok());
+    assert_eq!(mock.names(), ["x.status", "x.status"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cooled_object_keeps_heartbeats_flowing() {
+    // 被冷却的对象一直挂着也不拖慢轮次：心跳间隔保持在 agent 的 20 秒静默线以内。
+    let (exec, mock, sink) = setup(vec![spec("b", 0)], Config::default(), 1000);
+    mock.default_step("x.status", Step::Timeout(Duration::from_secs(8)));
+    struct HungLegacy;
+    impl RoundDriver for HungLegacy {
+        fn legacy(&self) -> BoxFuture<'static, ()> {
+            Box::pin(async {
+                preempt().await;
+                let _ = call("x", "status", &json!({})).await;
+            })
+        }
+    }
+    exec.start_heartbeat(Duration::from_secs(5));
+    exec.start_rounds(Arc::new(HungLegacy));
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let x = mock.times("x.status").len();
+    // 每 ~10 秒冷却 + 8 秒超时：60 秒里最多 4 次（不冷却时是 60/9 ≈ 6～7 次）。
+    assert!((2..=4).contains(&x), "x.status called {x} times");
+    let hb = sink.heartbeats();
+    let gaps: Vec<_> = hb.windows(2).map(|w| w[1].0 - w[0].0).collect();
+    assert!(
+        gaps.iter().all(|g| *g <= Duration::from_secs(10)),
+        "{gaps:?}"
+    );
+}
+
+#[test]
+fn cooldown_env_parsing() {
+    assert_eq!(Config::cooldown_from(None), COOLDOWN);
+    assert_eq!(Config::cooldown_from(Some("x")), COOLDOWN);
+    assert_eq!(Config::cooldown_from(Some("0")), Duration::ZERO);
+    assert_eq!(
+        Config::cooldown_from(Some(" 30000 ")),
+        Duration::from_secs(30)
+    );
+}

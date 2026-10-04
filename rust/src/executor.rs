@@ -23,7 +23,7 @@ use crate::{
 };
 use serde_json::Value;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::{
@@ -48,6 +48,11 @@ pub const CONTROL_QUEUE: usize = 8;
 pub const CALL_LIMIT: Duration = Duration::from_secs(10);
 /// V2-33：调用超时后最多探测几次。
 pub const GATE_PROBES: u32 = 4;
+/// 旧采集里超时过的对象跨轮冷却多久（`ZWRT_DATAD_UBUS_COOLDOWN_MS`，0 = 关，只按本轮跳过）。
+/// 上游 v0.10.56 用 30 秒（它的采集超时是 5 秒）；我们 socket 采集超时 2 秒，慢但有效的基带回复
+/// 也可能踩到，所以取短一些，免得信号数据空太久。
+pub const COOLDOWN: Duration = Duration::from_secs(10);
+pub const ENV_COOLDOWN_MS: &str = "ZWRT_DATAD_UBUS_COOLDOWN_MS";
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -55,6 +60,17 @@ pub struct Config {
     /// `ZWRT_DATAD_CACHE` 没设成 0。
     pub cache: bool,
     pub control_queue: usize,
+    /// 旧采集里超时的对象之后多久不再调（跨轮）。块不受影响（块有自己的失败重读间隔）。
+    pub cooldown: Duration,
+}
+
+impl Config {
+    /// `ZWRT_DATAD_UBUS_COOLDOWN_MS` 的值：未设置或不是数字 → 默认；0 → 关。
+    pub fn cooldown_from(value: Option<&str>) -> Duration {
+        value
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(COOLDOWN, Duration::from_millis)
+    }
 }
 
 impl Default for Config {
@@ -63,6 +79,7 @@ impl Default for Config {
             budget: ROUND_BUDGET,
             cache: true,
             control_queue: CONTROL_QUEUE,
+            cooldown: COOLDOWN,
         }
     }
 }
@@ -201,6 +218,8 @@ struct Shared {
     gate: Mutex<Option<String>>,
     /// 正在做写（拿着跨进程写锁的任务，`write_scope`）。
     writing: AtomicBool,
+    /// 旧采集里超时过的对象 → 冷却到什么时候（跨轮，`Config::cooldown`）。
+    cooldown: Mutex<HashMap<String, Instant>>,
 }
 
 /// 写的上下文：拿着跨进程写锁的那段（`ops::write_lock`）。只有这里面的调用超时才关闸，
@@ -274,7 +293,10 @@ pub fn on_executor() -> bool {
 /// 发一个 ubus 请求。执行者里直接发；执行者外包成内部任务排队。
 pub async fn call(object: &str, method: &str, args: &Value) -> Result<Value, UbusError> {
     if let Ok(ctx) = CTX.try_with(Ctx::clone) {
-        return ctx.shared.call_here(ctx.round, object, method, args).await;
+        return ctx
+            .shared
+            .call_here(ctx.round, ctx.round, object, method, args)
+            .await;
     }
     let Some(exec) = GLOBAL.get() else {
         return Err(UbusError::Io("ubus executor not running".into()));
@@ -292,9 +314,11 @@ pub async fn preempt() {
 }
 
 impl Shared {
+    /// `cool`：旧采集里的调用（跨轮冷却只管这些；块和任务不管）。
     async fn call_here(
         &self,
         round: bool,
+        cool: bool,
         object: &str,
         method: &str,
         args: &Value,
@@ -304,7 +328,7 @@ impl Shared {
         if writing {
             self.reopen_gate().await;
         }
-        let r = self.raw_call(round, object, method, args).await;
+        let r = self.raw_call(round, cool, object, method, args).await;
         if writing && matches!(r, Err(UbusError::Timeout { .. })) {
             // 我们这边超时了，原厂那边可能还在做：结果未知，闸先关上。
             eprintln!(
@@ -323,7 +347,7 @@ impl Shared {
         };
         let (o, m, a) = self.probe_for(&object);
         for n in 1..=GATE_PROBES {
-            match self.raw_call(false, &o, &m, &a).await {
+            match self.raw_call(false, false, &o, &m, &a).await {
                 Err(UbusError::Timeout { .. }) => {
                     eprintln!("executor: {object} probe {n}/{GATE_PROBES} timed out");
                 }
@@ -366,11 +390,15 @@ impl Shared {
     async fn raw_call(
         &self,
         round: bool,
+        cool: bool,
         object: &str,
         method: &str,
         args: &Value,
     ) -> Result<Value, UbusError> {
-        if round && lock(&self.round).skips.is_skipped(object) {
+        let cool = round && cool && !self.cfg.cooldown.is_zero();
+        if (round && lock(&self.round).skips.is_skipped(object))
+            || (cool && self.cooling(object, Instant::now()))
+        {
             return Err(UbusError::Skipped {
                 object: object.into(),
             });
@@ -392,7 +420,28 @@ impl Shared {
                 rs.skips.record(e);
             }
         }
+        if cool && matches!(r, Err(UbusError::Timeout { .. })) {
+            let until = Instant::now() + self.cfg.cooldown;
+            eprintln!(
+                "executor: {object} {method} timed out in a round; not read again for {} ms",
+                self.cfg.cooldown.as_millis()
+            );
+            lock(&self.cooldown).insert(object.to_owned(), until);
+        }
         r
+    }
+
+    /// 这个对象还在跨轮冷却里吗（过期的顺手删掉）。
+    fn cooling(&self, object: &str, now: Instant) -> bool {
+        let mut c = lock(&self.cooldown);
+        match c.get(object) {
+            Some(&until) if now < until => true,
+            Some(_) => {
+                c.remove(object);
+                false
+            }
+            None => false,
+        }
     }
 
     /// 安全点：按先后做完「进入时已在排队的」任务（快照计数），做的过程中新来的留给下一个安全点。
@@ -482,7 +531,7 @@ impl Shared {
                 return;
             }
             let (object, method, args) = self.hub.request(i);
-            let r = self.call_here(true, object, method, &args).await;
+            let r = self.call_here(true, false, object, method, &args).await;
             self.hub
                 .record_read(i, r.map_err(|e| e.to_string()), Instant::now());
         }
@@ -568,6 +617,7 @@ impl Executor {
             live: Liveness::new(),
             gate: Mutex::new(None),
             writing: AtomicBool::new(false),
+            cooldown: Mutex::default(),
         });
         tokio::spawn(shared.clone().run());
         Self { shared }
@@ -668,12 +718,15 @@ impl Executor {
     /// 发一个 ubus 请求：执行者里直接发，执行者外包成内部任务排队（不计控制队列上限）。
     pub async fn call(&self, object: &str, method: &str, args: &Value) -> Result<Value, UbusError> {
         if let Ok(ctx) = CTX.try_with(Ctx::clone) {
-            return ctx.shared.call_here(ctx.round, object, method, args).await;
+            return ctx
+                .shared
+                .call_here(ctx.round, ctx.round, object, method, args)
+                .await;
         }
         let (o, m, a) = (object.to_owned(), method.to_owned(), args.clone());
         self.task(async move {
             let ctx = CTX.with(Ctx::clone);
-            ctx.shared.call_here(false, &o, &m, &a).await
+            ctx.shared.call_here(false, false, &o, &m, &a).await
         })
         .await
     }
