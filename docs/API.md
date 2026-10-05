@@ -183,6 +183,22 @@ data: {"ts":1782396733,...}
 启动中（`starting`）其余接口：`/state`、`/events`、`/v2/*` 先等第一轮采完（最多 10 秒），还没好回 `503 {"ok":false,"error":{"code":"starting",…}}`，客户端按连不上处理、稍后重试；
 `/control` 先等第一轮和事务恢复做完（最多 20 秒），还没好就回 `503 busy`（同控制队列满）；`/`、`/version`、`/capabilities` 照常。
 
+### `GET /debug/legacy-hits`
+
+旧接口访问计数，准备删 `/state`、`/events` 和没人调用的 `/control` 动作时用：先看一段时间是零再删。
+`/v2/*` 不算。计数存在数据目录的 `legacy-hits.json`，datad 重启、换版本、整机重启都接着数。
+
+```json
+{"ok": true, "since": 1791200000, "now": 1791286400, "open_events": 0,
+ "hits": {"/state": {"count": 3, "first": 1791201000, "last": 1791280000,
+                     "callers": ["wget pid 1234 parent: sh /data/foo.sh"]}}}
+```
+
+- `since`：开始数的时间（秒）；`open_events`：此刻开着的 `/events` 连接数（不存盘），大于 0 时调用者就在线上。
+- 键：`/state`、`/events`、`control:<动作>`；带 `source` 的控制请求记在 `control:<动作>+source`；不同的键最多 256 个，多出来的记在 `control:(other)`。
+  没登录、启动中被 503 的请求也数。
+- `callers`：最近 4 个不同的调用者。本机连接按对端端口在 `/proc` 里找进程（`comm`、pid、父进程命令行），局域网连接只记 IP，找不到写 `?`。同一个键 5 秒内只找一次。
+
 ## Status Codes
 
 - `200`：读取或控制成功

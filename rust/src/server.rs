@@ -300,7 +300,8 @@ impl App {
             .route("/v2/state", get(v2_state))
             .route("/v2/screen", get(v2_screen))
             .route("/capabilities", get(capabilities))
-            .route("/control", post(control));
+            .route("/control", post(control))
+            .route("/debug/legacy-hits", get(legacy_hits));
         if open_auth_routes {
             router = router
                 .route("/auth/login", post(auth_login))
@@ -310,6 +311,8 @@ impl App {
         if require_auth {
             router = router.layer(middleware::from_fn_with_state(self.clone(), authenticate));
         }
+        // 最外层：没登录、还在启动被 503 的旧请求也要数到。
+        router = router.layer(middleware::from_fn(count_legacy));
         let router = router
             .layer(RequestBodyLimitLayer::new(1024 * 1024))
             .with_state(self.clone());
@@ -350,6 +353,7 @@ async fn starting_gate(State(app): State<App>, request: Request, next: Next) -> 
             | "/version"
             | "/capabilities"
             | "/control"
+            | "/debug/legacy-hits"
             | "/auth/login"
             | "/auth/exchange"
     );
@@ -361,6 +365,27 @@ async fn starting_gate(State(app): State<App>, request: Request, next: Next) -> 
         Json(json!({"ok":false,"error":{"code":"starting","message":"datad is starting (first collection round not finished)"}})),
     )
         .into_response()
+}
+
+/// 旧接口访问计数（legacy_hits.rs）：`/state`、`/events` 在这里数；`/control` 要先解出动作，
+/// 在处理函数里数，这里只把对端地址放进请求扩展。
+async fn count_legacy(mut request: Request, next: Next) -> Response {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<crate::conn::Peer>>()
+        .map(|info| info.0.0);
+    if let path @ ("/state" | "/events") = request.uri().path() {
+        crate::legacy_hits::hit(path, peer).await;
+    }
+    request.extensions_mut().insert(LegacyPeer(peer));
+    next.run(request).await
+}
+
+#[derive(Clone, Copy)]
+struct LegacyPeer(Option<std::net::SocketAddr>);
+
+async fn legacy_hits() -> Json<Value> {
+    Json(crate::legacy_hits::report())
 }
 
 async fn authenticate(State(app): State<App>, request: Request, next: Next) -> Response {
@@ -613,8 +638,10 @@ async fn events(State(app): State<App>) -> Response {
     let Ok(permit) = app.inner.sse_slots.clone().try_acquire_owned() else {
         return sse_limit();
     };
+    let open = crate::legacy_hits::OpenEvents::new();
     let stream = WatchStream::new(app.inner.tx.subscribe()).map(move |v| {
         let _keep_permit_alive = &permit;
+        let _keep_open_count = &open;
         Ok::<_, Infallible>(Event::default().event("state").json_data(v).unwrap())
     });
     // 退出时流结束，连接才能收尾（P2-4）。
@@ -664,6 +691,7 @@ fn screen_json(ts: i64, net: crate::screen::NetView, op: Value, exec_age_ms: u64
 
 async fn control(
     State(app): State<App>,
+    peer: Option<axum::Extension<LegacyPeer>>,
     method: Method,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
@@ -697,6 +725,11 @@ async fn control(
             .into_response();
     }
     let action = action.to_owned();
+    crate::legacy_hits::hit(
+        &crate::legacy_hits::control_key(&action, body.get("source").is_some()),
+        peer.and_then(|p| p.0.0),
+    )
+    .await;
     // P1-3：启动中（第一轮、事务恢复还没做完）先等，最多 20 秒；还没好就照队列满回 503 `busy`。
     if !app.wait_stage(Stage::Ready, CONTROL_START_WAIT).await {
         return control_busy(&action);
@@ -1534,6 +1567,7 @@ async fn shutdown(app: App) {
     // 收到 SIGTERM/SIGINT：先让 SSE 流结束（P2-4），再同时收掉 ubus listen 和邻区扫描的子进程（各最多 2 秒），
     // 然后 axum 等连接收尾（`serve` 里另有总上限）。
     app.inner.stop.send_replace(true);
+    let _ = tokio::task::spawn_blocking(|| crate::legacy_hits::flush(true)).await;
     tokio::join!(
         crate::ubus::listen::shutdown(std::time::Duration::from_secs(2)),
         async { app.inner.neighbor.lock().await.shutdown().await },

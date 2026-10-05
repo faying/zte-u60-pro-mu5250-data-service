@@ -8,6 +8,7 @@ mod control;
 mod cooling;
 mod executor;
 mod extra_wifi;
+mod legacy_hits;
 mod model;
 mod neighbor;
 mod neighbor_manager;
@@ -111,6 +112,7 @@ async fn main() -> Result<()> {
         None => None,
     };
     let local_requires_auth = args.lan_bind.is_none() && token.is_some();
+    legacy_hits::init(&args.data_dir);
     let app = App::new(args.data_dir, interval, token, args.neighbor).await?;
     if args.once {
         app.start().await;
@@ -130,6 +132,13 @@ async fn main() -> Result<()> {
         None => None,
     };
     server::write_pid_file();
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            let _ = tokio::task::spawn_blocking(|| legacy_hits::flush(false)).await;
+        }
+    });
     let starting = app.clone();
     tokio::spawn(async move { starting.start().await });
     let result = if let Some(lan) = lan {
