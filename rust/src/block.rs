@@ -116,6 +116,8 @@ pub fn phase1_blocks() -> Vec<BlockSpec> {
         BlockSpec::derived("dhcp", Box::new(OnChange)),
         BlockSpec::derived("interfaces", Box::new(OnChange)),
         BlockSpec::derived("uci_device_info", Box::new(OnChange)),
+        // V2-47（2026-10-05）：旧 /state 的 `sms.list`（两库第一页解密后的最新几条），触屏迁到 /v2 用，变了才发。
+        BlockSpec::derived("sms_list", Box::new(OnChange)),
     ]
 }
 

@@ -1318,6 +1318,7 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     let nfc = object(nfc);
     let sms_ok = sms_capacity.is_ok();
     // V2-30：短信块。容量和两库第一页都读成功才算读成功（任一失败 → stale）。
+    let sms_list_ok = matches!((&sms_nv, &sms_sim), (Ok(_), Ok(_))) && nv_read && sim_list_read;
     let sms_block = match (&sms_capacity, &sms_nv, &sms_sim) {
         (Ok(capacity), Ok(nv), Ok(sim)) if capacity_read && nv_read && sim_list_read => {
             Ok(crate::sms::block_data(capacity, nv, sim))
@@ -1956,6 +1957,15 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         now,
     );
     hub.record("sms", sms_block, now);
+    // V2-47：短信列表 = `{list: 旧 /state 的 sms.list}`（块的 data 必须是对象）；两库第一页都读到才算读到（容量另算，在 sms 块里）。
+    hub.record(
+        "sms_list",
+        match fields.get("sms").and_then(|v| v.get("list")) {
+            Some(v) if sms_list_ok => Ok(json!({ "list": v })),
+            _ => Err("zwrt_wms SMS list read failed".into()),
+        },
+        now,
+    );
     // sim 块 = 旧 `/state` 的 `sim` 对象（含 iccid）。zte-agent 的换卡监视靠它，
     // 不再自己每 10 秒调 ubus（2026-10-03，apn_pick）。
     hub.record(
@@ -2355,6 +2365,53 @@ mod tests {
         exec.round_now(async move { collect(1000, &h).await }).await;
         assert!(hub.view("clients").unwrap().stale);
         assert!(!hub.view("interfaces").unwrap().stale);
+    }
+
+    /// V2-47：`sms_list` 块 = 旧 `/state` 的 `sms.list`（解密、去重后的明文）；列表读失败就 stale。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v2_sms_list_block_mirrors_legacy_list() {
+        use crate::ubus::mock_ubusd::{Action, MockUbusd};
+        let _serial = CACHE_TEST.lock().await;
+        invalidate_cache();
+        let m = MockUbusd::start_new().await;
+        let mut objects: Vec<&str> = COLLECT_CALLS.iter().map(|(o, _)| *o).collect();
+        objects.dedup();
+        for (o, method) in COLLECT_CALLS {
+            let id = 0x100 + objects.iter().position(|x| x == o).unwrap() as u32;
+            let reply = if *method == "zte_libwms_get_sms_data" {
+                json!({"messages":[{"id":"7","num":"10086","date":"26,08,27,04,00,00,+,0","tag":"1","text":"6D4B8BD5"}]})
+            } else {
+                json!({})
+            };
+            m.add_method(o, id, method, reply);
+        }
+        let hub = std::sync::Arc::new(crate::block::Hub::new(
+            crate::block::phase1_blocks(),
+            Box::new(crate::block::NoSink),
+        ));
+        let exec = crate::executor::Executor::spawn(
+            m.backend(Duration::from_millis(300)),
+            hub.clone(),
+            crate::executor::Config::default(),
+            Duration::from_secs(1),
+        );
+        let h = hub.clone();
+        let snap = exec.round_now(async move { collect(1000, &h).await }).await;
+        let v = hub.view("sms_list").unwrap();
+        assert!(!v.stale);
+        assert_eq!(v.data["list"], snap.fields["sms"]["list"]);
+        assert_eq!(v.data["list"][0]["text"], "测试");
+        assert_eq!(v.data["list"][0]["unread"], 1);
+        // 列表读失败：sms_list stale（旧值保留），旧 /state 照 V2-29 没有这条短信。
+        invalidate_cache();
+        for _ in 0..8 {
+            m.script("zwrt_wms", "zte_libwms_get_sms_data", Action::Hang);
+        }
+        let h = hub.clone();
+        exec.round_now(async move { collect(1000, &h).await }).await;
+        let v = hub.view("sms_list").unwrap();
+        assert!(v.stale);
+        assert_eq!(v.data["list"][0]["text"], "测试");
     }
 
     /// P1-2（V2-19）：ubusd 整个不回（mock 的 `Hang`：不回也不断开）时，旧采集到了 `LEGACY_TIMEOUT_LIMIT`

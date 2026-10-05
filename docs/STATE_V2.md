@@ -97,6 +97,7 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
 | `sim` | 旧 `/state` 的 `sim` 对象（`iccid`、`imsi`、`spn`、`state`、`current_slot` …），2026-10-03 加；变了才发 | 旧采集读好的 `zwrt_zte_mdm.api get_sim_info`（不另调 ubus） |
 | `op` | 写操作的界面数据（第 12 节，E4 T13）：`{ "rollback_enabled", "active", "last" }` | 事务引擎（不调 ubus） |
 | `qos`、`clients`、`wlan`、`nfc`、`dhcp`、`interfaces`、`uci_device_info` | 旧 `/state` 的同名对象（V2-46，2026-10-05 加）；变了才发 | 旧采集读好的结果（不另调 ubus） |
+| `sms_list` | `{ "list" }`：旧 `/state` 的 `sms.list`（两库第一页解密后的最新几条，V2-47，2026-10-05 加）；变了才发 | 旧采集读好的两库第一页（不另调 ubus） |
 
 stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 `signal` 在 `nwinfo_get_netinfo` 失败时读失败；`live` 在 `system info` 或实时流量 `get_wwandst` 失败时读失败。
@@ -237,7 +238,7 @@ ubusd 整个不回时，一轮从十几个对象挨个超时（socket 约 26 秒
 
 ## 10. 短信
 
-**V2-30** `sms` 块是短信摘要，用来告诉订阅方「有没有新短信」，不带短信内容：
+**V2-30** `sms` 块是短信摘要，用来告诉订阅方「有没有新短信」，不带短信内容（最新几条的内容在 `sms_list` 块，V2-47）：
 
 - `unread` = `sms_dev_unread_num` + `sms_sim_unread_num`（和旧 `/state` 的 `sms.unread` 相同）。
 - `max_id` = NV（`mem_store=1`）和 SIM（`mem_store=0`）两库降序第一页里最大的编号（含已发送、草稿；两库共用一个编号计数）。
@@ -393,6 +394,15 @@ cancelled 里 sim_changed 不能（「换过卡」）、superseded 不能（「�
 | `interfaces` | 触屏（移动数据、漫游开关）、agent（运营商 DNS 的退路 `wan4.dns`） | `zte_wan` 状态或 `get_wwaniface` 失败 |
 | `uci_device_info` | agent（运营商 DNS `wan_dns`） | uci 一项都没读到 |
 
-不另调 ubus，节拍跟旧采集；带 TTL 的读取沿用缓存值时算读成功（和旧 `/state` 一样）。短信内容不进块：用 `sms.list_after`（V2-30）。
+不另调 ubus，节拍跟旧采集；带 TTL 的读取沿用缓存值时算读成功（和旧 `/state` 一样）。短信内容见 V2-47。
 测试：`v2_legacy_mirror_blocks_same_shape_and_stale`
+
+**V2-47** `sms_list` 块：`data` 是 `{ "list": … }`，`list` 就是旧 `/state` 的 `sms.list`（数组，每条 `{id, num, date, unread, text}`，号码和正文已解密成 UTF-8，
+`date` 是 `MM-DD HH:MM`，两库各读第一页 8 条、合并去重，所以最多 16 条；块的 `data` 必须是对象，所以包一层）。两库第一页都读到才算读成功，否则 stale；容量读失败时旧 `/state` 没有 `sms`，这块照样按列表判断。
+发布按 V2-17（变了才发：新短信、标已读、删除）。
+为什么不让触屏用 `sms.list_after`：旧采集为了 `sms` 块本来就每 10 秒读两库第一页，列表已经解密好；
+触屏要的是「最新几条」，用 `sms.list_after` 得从 `after_id=0` 翻完全部短信、每次变化都多调 ubus（占执行者），
+触屏还得自己解 UCS-2 hex、改日期格式。这块不多调 ubus，只在变化时推，比旧 `/events` 每秒推整份快照省。
+`sms` 块（V2-30）的形状不变，仍不带内容；要完整历史（转发、补漏）的订阅方照旧用 `sms.list_after`。
+测试：`v2_sms_list_block_mirrors_legacy_list`
 
