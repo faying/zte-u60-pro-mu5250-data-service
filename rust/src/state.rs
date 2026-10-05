@@ -1290,6 +1290,10 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     let live_ok = info.is_ok() && traffic.is_ok();
     // 没发请求、沿用上一次值的不算读到（`ubus_ttl_read`）：块照 V2-12 置 stale。
     let sim_ok = sim_read;
+    // 旧 /state 读者迁到 /v2 用的块（u60-features.md §0.1，V2-46）：各看自己的来源。
+    let clients_ok = lan_clients.is_ok() && wifi_clients.is_ok();
+    let qos_ok = signal_ok && usb.is_ok();
+    let interfaces_ok = wan4_if.is_ok() && cellular.is_ok();
     // stall 的 30 秒窗口：厂商收发包数（cell_window.rs；没读到就作废窗口）
     crate::cell_window::sample(
         now_ms(),
@@ -1962,6 +1966,34 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         },
         now,
     );
+    // V2-46：data 和旧 /state 的同名对象同形；没生成（wlan、nfc）或来源没读到就 stale。
+    let dhcp_ok = !uci_get(&uci_sets, "network.lan.ipaddr").is_empty();
+    let device_ok = fields
+        .get("uci_device_info")
+        .and_then(Value::as_object)
+        .is_some_and(|m| !m.is_empty());
+    for (name, ok, why) in [
+        ("qos", qos_ok, "nwinfo or zwrt_bsp.usb read failed"),
+        ("clients", clients_ok, "router access lists read failed"),
+        ("wlan", true, "no wireless section"),
+        ("nfc", true, "zwrt_nfc read failed or no NFC"),
+        ("dhcp", dhcp_ok, "uci network/dhcp read failed"),
+        (
+            "interfaces",
+            interfaces_ok,
+            "zte_wan status or get_wwaniface failed",
+        ),
+        ("uci_device_info", device_ok, "uci read failed"),
+    ] {
+        hub.record(
+            name,
+            match fields.get(name) {
+                Some(v) if ok => Ok(v.clone()),
+                _ => Err(why.into()),
+            },
+            now,
+        );
+    }
     Snapshot {
         ts: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2278,6 +2310,53 @@ mod tests {
         ("network.interface.zte_wan6", "status"),
     ];
 
+    /// V2-46：迁移用的块和旧 /state 的同名对象同形；来源读不到（或旧 /state 没生成）就 stale。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v2_legacy_mirror_blocks_same_shape_and_stale() {
+        use crate::ubus::mock_ubusd::{Action, MockUbusd};
+        let _serial = CACHE_TEST.lock().await;
+        invalidate_cache();
+        let m = MockUbusd::start_new().await;
+        let mut objects: Vec<&str> = COLLECT_CALLS.iter().map(|(o, _)| *o).collect();
+        objects.dedup();
+        for (o, method) in COLLECT_CALLS {
+            let id = 0x100 + objects.iter().position(|x| x == o).unwrap() as u32;
+            m.add_method(o, id, method, json!({}));
+        }
+        let hub = std::sync::Arc::new(crate::block::Hub::new(
+            crate::block::phase1_blocks(),
+            Box::new(crate::block::NoSink),
+        ));
+        let exec = crate::executor::Executor::spawn(
+            m.backend(Duration::from_millis(300)),
+            hub.clone(),
+            crate::executor::Config::default(),
+            Duration::from_secs(1),
+        );
+        let h = hub.clone();
+        let snap = exec.round_now(async move { collect(1000, &h).await }).await;
+        for name in ["qos", "clients", "interfaces"] {
+            let v = hub.view(name).unwrap();
+            assert!(!v.stale, "{name}");
+            assert_eq!(v.data, snap.fields[name], "{name}");
+        }
+        // mock 回 {}：没有无线 section、没有 NFC、uci 是空的。
+        for name in ["wlan", "nfc", "dhcp", "uci_device_info"] {
+            assert!(hub.view(name).unwrap().stale, "{name}");
+        }
+        // 终端列表读失败：clients stale，别的不受影响。
+        invalidate_cache();
+        for method in ["router_lan_access_list", "router_wireless_access_list"] {
+            for _ in 0..4 {
+                m.script("zwrt_router.api", method, Action::Hang);
+            }
+        }
+        let h = hub.clone();
+        exec.round_now(async move { collect(1000, &h).await }).await;
+        assert!(hub.view("clients").unwrap().stale);
+        assert!(!hub.view("interfaces").unwrap().stale);
+    }
+
     /// P1-2（V2-19）：ubusd 整个不回（mock 的 `Hang`：不回也不断开）时，旧采集到了 `LEGACY_TIMEOUT_LIMIT`
     /// 个超时对象就不再发新请求，一轮的长度有上限；派生块（信号、live）这一轮就置 stale。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2308,7 +2387,6 @@ mod tests {
         exec.round_now(async move { collect(1000, &h).await }).await;
         assert!(!hub.view("signal").unwrap().stale);
         assert!(!hub.view("live").unwrap().stale);
-
         // ubusd 不回了（慢数据缓存也清掉：最坏情况，每个对象都要读）。
         invalidate_cache();
         for (o, method) in COLLECT_CALLS {

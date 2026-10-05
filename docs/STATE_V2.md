@@ -96,6 +96,7 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
 | `sms` | `{ "unread", "max_id", "count" }`：`unread` 同旧 `/state` 的 `sms.unread`；`max_id`、`count` 是 `/v2` 新加的（V2-30）；不带 `list` | 旧采集读好的容量和两库第一页（不另调 ubus） |
 | `sim` | 旧 `/state` 的 `sim` 对象（`iccid`、`imsi`、`spn`、`state`、`current_slot` …），2026-10-03 加；变了才发 | 旧采集读好的 `zwrt_zte_mdm.api get_sim_info`（不另调 ubus） |
 | `op` | 写操作的界面数据（第 12 节，E4 T13）：`{ "rollback_enabled", "active", "last" }` | 事务引擎（不调 ubus） |
+| `qos`、`clients`、`wlan`、`nfc`、`dhcp`、`interfaces`、`uci_device_info` | 旧 `/state` 的同名对象（V2-46，2026-10-05 加）；变了才发 | 旧采集读好的结果（不另调 ubus） |
 
 stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 `signal` 在 `nwinfo_get_netinfo` 失败时读失败；`live` 在 `system info` 或实时流量 `get_wwandst` 失败时读失败。
@@ -377,3 +378,21 @@ cancelled 里 sim_changed 不能（「换过卡」）、superseded 不能（「�
 原厂 `net.roaming`（`simcard_roam`）在国外插当地卡时说「不漫游」，这里不用它。「在国内」= `serving_mcc == 460`。
 只进 `/v2`：旧 `/state` 的 `net` 冻结（第 9 节），不加这三个字段。
 测试：`roaming_fields_compare_countries`
+
+## 14. 旧 /state 读者迁到 /v2 用的块（2026-10-05）
+
+**V2-46** 为了让旧 `/state`、`/events` 的读者迁走（manager `docs/designs/u60-features.md` §0.1），`/v2` 加 7 块，`data` 和旧 `/state` 的同名对象同形，发布按 V2-17（变了才发）：
+
+| 块 | 谁要 | 什么时候算读失败（stale） |
+|---|---|---|
+| `qos` | 触屏、agent netwatch / 深查 / `cell_extra` | `nwinfo_get_netinfo` 或 `zwrt_bsp.usb` 失败 |
+| `clients` | 触屏 | 有线或无线终端列表任一失败 |
+| `wlan` | 触屏 | 旧 `/state` 没生成它（找不到无线 section） |
+| `nfc` | 触屏 | `zwrt_nfc` 失败或没有 NFC（旧 `/state` 没有 `nfc`；这台一直 stale、`data=null` 是正常的） |
+| `dhcp` | 触屏 | uci 读不到 `network.lan.ipaddr` |
+| `interfaces` | 触屏（移动数据、漫游开关）、agent（运营商 DNS 的退路 `wan4.dns`） | `zte_wan` 状态或 `get_wwaniface` 失败 |
+| `uci_device_info` | agent（运营商 DNS `wan_dns`） | uci 一项都没读到 |
+
+不另调 ubus，节拍跟旧采集；带 TTL 的读取沿用缓存值时算读成功（和旧 `/state` 一样）。短信内容不进块：用 `sms.list_after`（V2-30）。
+测试：`v2_legacy_mirror_blocks_same_shape_and_stale`
+

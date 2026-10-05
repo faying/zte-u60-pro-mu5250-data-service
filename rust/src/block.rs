@@ -108,6 +108,14 @@ pub fn phase1_blocks() -> Vec<BlockSpec> {
         BlockSpec::derived("sim", Box::new(OnChange)),
         // E4 T13（V2-34）：写操作的界面数据，由事务引擎交（每轮一次 + 每次状态变化）。
         BlockSpec::derived("op", Box::new(OnChange)),
+        // V2-46（2026-10-05）：旧 /state 的读者迁到 /v2 用，data 和旧 /state 同名对象同形，变了才发。
+        BlockSpec::derived("qos", Box::new(OnChange)),
+        BlockSpec::derived("clients", Box::new(OnChange)),
+        BlockSpec::derived("wlan", Box::new(OnChange)),
+        BlockSpec::derived("nfc", Box::new(OnChange)),
+        BlockSpec::derived("dhcp", Box::new(OnChange)),
+        BlockSpec::derived("interfaces", Box::new(OnChange)),
+        BlockSpec::derived("uci_device_info", Box::new(OnChange)),
     ]
 }
 
