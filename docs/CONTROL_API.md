@@ -96,7 +96,7 @@ UFI 自己的登录口令、HTTP 签名和浏览器会话不属于这里。
 | `netselect.auto` | — | `AT+COPS=0`（原厂没有能用的 ubus 调用） |
 | `cellular.redial` | `type?`（1 IPv4、2 IPv6，不给两条都拨） | `zwrt_qcmap_cli set_qcliiface` |
 | `modem.airplane` | `operate_mode`（ONLINE 以外） | `nwinfo_set_mode` |
-| `modem.online` | — | `AT+CFUN=1`（`nwinfo_set_mode ONLINE` 拉不回 LPM） |
+| `modem.online` | — | `AT+CFUN=1`（`nwinfo_set_mode ONLINE` 拉不回 LPM）。B31 上两条都拉不回来（10-05 真机）：AT 口在 LPM 下不回话，25 s 后报错；只能重启 |
 | `apn.set_pdp_type` | `ipv6`（布尔） | 拨号 APN 的 PDP 类型改成 IPv4v6 / IPv4（其他字段照原样），再拉起或断开 IPv6 那条腿 |
 
 Wi-Fi（E4 T7b，zte-agent 的 Wi-Fi 页、热点开关、情景、家庭模式扫描用）：
