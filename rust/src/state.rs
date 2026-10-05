@@ -385,6 +385,46 @@ fn normalize_profile(v: &str) -> String {
         out
     }
 }
+/// MCC → 国家。一个国家有几个 MCC 的归到同一个（美国 310–316、印度 404–406、日本 440/441、
+/// 英国 234/235）；港 454、澳 455、台 466 和 460 是不同的。901（国际共享）、001/999（测试）
+/// 和不像 MCC 的值没有国家，给 None。
+fn mcc_country(mcc: i64) -> Option<i64> {
+    match mcc {
+        310..=316 => Some(310),
+        404..=406 => Some(404),
+        440 | 441 => Some(440),
+        234 | 235 => Some(234),
+        901 | 999 => None,
+        200..=799 => Some(mcc),
+        _ => None,
+    }
+}
+
+/// `/v2` signal 块专有的三个字段（E3 D2，全项目一处判断「在哪、是不是真漫游」）：
+/// `serving_mcc` = 所在网络的 MCC（`net.mcc`，没注册上为 null）；`home_mcc` = 卡的 MCC
+/// （IMSI 前三位，读不到为 null）；`true_roaming` = 两者不是同一个国家，任一为 null 就是 null。
+/// 原厂 `roaming`（simcard_roam）在国外插当地卡时说「不漫游」，这里不用它。
+/// 只进 `/v2`：旧 `/state` 的 `net` 冻结，不加。
+fn add_roaming_fields(net: &mut Value, imsi: &str) {
+    let Some(obj) = net.as_object_mut() else {
+        return;
+    };
+    let serving = obj
+        .get("mcc")
+        .and_then(Value::as_i64)
+        .filter(|m| mcc_country(*m).is_some());
+    let home = crate::screen::imsi_plmn(imsi)
+        .map(|(c, _)| c)
+        .filter(|m| mcc_country(*m).is_some());
+    let roaming = match (serving, home) {
+        (Some(s), Some(h)) => Some(mcc_country(s) != mcc_country(h)),
+        _ => None,
+    };
+    obj.insert("serving_mcc".into(), json!(serving));
+    obj.insert("home_mcc".into(), json!(home));
+    obj.insert("true_roaming".into(), json!(roaming));
+}
+
 fn valid_imsi(value: &str) -> bool {
     (5..=20).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
@@ -1894,7 +1934,9 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     hub.record(
         "signal",
         if signal_ok {
-            Ok(fields["net"].clone())
+            let mut net = fields["net"].clone();
+            add_roaming_fields(&mut net, &imsi);
+            Ok(net)
         } else {
             Err("zte_nwinfo_api nwinfo_get_netinfo failed".into())
         },
@@ -1940,6 +1982,60 @@ pub async fn ubus(service: &str, method: &str, args: Value) -> Result<Value, Str
 
 #[cfg(test)]
 mod tests {
+    /// E3 D2：真漫游按国家比，不按原厂的 roaming 标志。
+    #[test]
+    fn roaming_fields_compare_countries() {
+        use serde_json::{Value, json};
+        let run = |mcc: i64, imsi: &str| {
+            let mut net = json!({"mcc": mcc, "roaming": "Home"});
+            super::add_roaming_fields(&mut net, imsi);
+            (
+                net["serving_mcc"].clone(),
+                net["home_mcc"].clone(),
+                net["true_roaming"].clone(),
+            )
+        };
+        // 国外插当地卡：原厂说不漫游，这里也不是真漫游
+        assert_eq!(
+            run(440, "440101234567890"),
+            (json!(440), json!(440), json!(false))
+        );
+        // 中国卡在日本
+        assert_eq!(
+            run(440, "460001234567890"),
+            (json!(440), json!(460), json!(true))
+        );
+        // 在国内
+        assert_eq!(
+            run(460, "460011234567890"),
+            (json!(460), json!(460), json!(false))
+        );
+        // 同一国家的不同 MCC：美国 310 卡在 311 网、日本 441
+        assert_eq!(
+            run(311, "310260123456789"),
+            (json!(311), json!(310), json!(false))
+        );
+        assert_eq!(run(441, "440101234567890").2, json!(false));
+        // 香港卡在内地是真漫游
+        assert_eq!(run(460, "454001234567890").2, json!(true));
+        // 901 国际共享号段的卡：没有国家
+        assert_eq!(
+            run(460, "901281234567890"),
+            (json!(460), Value::Null, Value::Null)
+        );
+        // 没注册上（mcc 0）
+        assert_eq!(
+            run(0, "460001234567890"),
+            (Value::Null, json!(460), Value::Null)
+        );
+        // IMSI 读不到
+        assert_eq!(run(460, ""), (json!(460), Value::Null, Value::Null));
+        // 不是对象就不动
+        let mut v = Value::Null;
+        super::add_roaming_fields(&mut v, "460001234567890");
+        assert!(v.is_null());
+    }
+
     #[test]
     fn spn_decodes_vendor_ucs2_hex() {
         assert_eq!(

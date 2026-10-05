@@ -465,7 +465,7 @@ fn bars_tier(bars: i64) -> i64 {
     }
 }
 
-fn imsi_plmn(imsi: &str) -> Option<(i64, i64)> {
+pub(crate) fn imsi_plmn(imsi: &str) -> Option<(i64, i64)> {
     const MNC3: [i64; 24] = [
         302, 310, 311, 312, 313, 314, 315, 316, 334, 338, 342, 344, 346, 348, 354, 356, 358, 360,
         365, 376, 405, 708, 722, 732,

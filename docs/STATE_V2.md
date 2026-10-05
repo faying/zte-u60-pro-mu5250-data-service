@@ -91,7 +91,7 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
 |---|---|---|
 | `battery` | 旧 `/state` 的 `battery` 对象 | `zwrt_bsp.battery` 的回复 + 充电器块最近一次读成功的回复 + sysfs 电压电流 |
 | `charger` | 旧 `/state` 的 `power` 对象；旧 `/state` 没有 `power` 时是 `{}` | `zwrt_bsp.charger` 的回复 |
-| `signal` | 旧 `/state` 的 `net` 对象 | 旧采集算好的 `net`（不另调 ubus） |
+| `signal` | 旧 `/state` 的 `net` 对象，另加 `/v2` 专有的 `serving_mcc`、`home_mcc`、`true_roaming`（第 13 节） | 旧采集算好的 `net` 和 `sim.imsi`（不另调 ubus） |
 | `live` | `{ "system", "runtime", "traffic" }`，三个值分别是旧 `/state` 的同名对象 | 旧采集算好的结果（不另调 ubus） |
 | `sms` | `{ "unread", "max_id", "count" }`：`unread` 同旧 `/state` 的 `sms.unread`；`max_id`、`count` 是 `/v2` 新加的（V2-30）；不带 `list` | 旧采集读好的容量和两库第一页（不另调 ubus） |
 | `sim` | 旧 `/state` 的 `sim` 对象（`iccid`、`imsi`、`spn`、`state`、`current_slot` …），2026-10-03 加；变了才发 | 旧采集读好的 `zwrt_zte_mdm.api get_sim_info`（不另调 ubus） |
@@ -367,3 +367,13 @@ cancelled 里 sim_changed 不能（「换过卡」）、superseded 不能（「�
 测试：`rollback_notice_until_acked`
 
 不在 datad 的几行（客户端自己判断的）：「数据服务没响应」（心跳 `exec_age_ms`，V2-32）、「和设备断开了 · 操作结果未知」（网页）、改动记录的空和读不到，归触屏 T8、网页 T9 和术语表 T14。
+
+## 13. 在哪、是不是真漫游（E3 D2）
+
+**V2-45** `signal` 块多三个字段，全项目只在这里判断「在国内 / 真漫游」（家里出口、测速确认、以后的落地卡片都读它们）：
+`serving_mcc` = 所在网络的 MCC（`net.mcc`），没注册上（0）为 null；`home_mcc` = 卡的 MCC（IMSI 前三位），IMSI 读不到为 null；
+`true_roaming` = 两者不是同一个国家，任一为 null 就是 null。同一国家的几个 MCC 算一个（美国 310–316、印度 404–406、日本 440/441、英国 234/235）；
+港 454、澳 455、台 466 和 460 是不同的国家；901（国际共享）、999 和不在 200–799 的值没有国家，按读不到算（null）。
+原厂 `net.roaming`（`simcard_roam`）在国外插当地卡时说「不漫游」，这里不用它。「在国内」= `serving_mcc == 460`。
+只进 `/v2`：旧 `/state` 的 `net` 冻结（第 9 节），不加这三个字段。
+测试：`roaming_fields_compare_countries`
