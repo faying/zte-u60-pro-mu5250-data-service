@@ -73,6 +73,7 @@ impl BackendKind {
 
 /// 一次 ubus 读取。返回 `Send` 的 future，T4 的执行者可以放进 `tokio::spawn` 的任务里。
 pub trait UbusBackend: Send {
+    #[cfg(test)]
     fn kind(&self) -> BackendKind;
     fn call(
         &mut self,
@@ -105,6 +106,7 @@ impl CliBackend {
 }
 
 impl UbusBackend for CliBackend {
+    #[cfg(test)]
     fn kind(&self) -> BackendKind {
         BackendKind::Cli
     }
@@ -187,6 +189,7 @@ fn empty_output_error() -> String {
 }
 
 impl UbusBackend for SocketBackend {
+    #[cfg(test)]
     fn kind(&self) -> BackendKind {
         BackendKind::Socket
     }
@@ -248,6 +251,7 @@ impl AutoBackend {
 }
 
 impl UbusBackend for AutoBackend {
+    #[cfg(test)]
     fn kind(&self) -> BackendKind {
         BackendKind::Auto
     }
@@ -307,6 +311,7 @@ impl Backend {
 }
 
 impl UbusBackend for Backend {
+    #[cfg(test)]
     fn kind(&self) -> BackendKind {
         match self {
             Self::Cli(b) => b.kind(),

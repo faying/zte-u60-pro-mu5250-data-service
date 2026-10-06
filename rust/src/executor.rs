@@ -51,8 +51,8 @@ pub const CALL_LIMIT: Duration = Duration::from_secs(10);
 pub const GATE_PROBES: u32 = 4;
 /// 旧采集里超时过的对象跨轮冷却的建议值（`ZWRT_DATAD_UBUS_COOLDOWN_MS=10000`）。**默认关**（0，只按本轮跳过），
 /// 设备试跑验证后才在启动环境里打开。上游 v0.10.56 用 30 秒（它的采集超时是 5 秒）；我们 socket 采集超时 2 秒，
-/// 慢但有效的基带回复也可能踩到，所以取短一些，免得信号数据空太久。
-#[allow(dead_code)] // 建议值：程序里不用（默认关），测试和文档引用
+/// 慢但有效的基带回复也可能踩到，所以取短一些，免得信号数据空太久。程序里不用（默认关），只给测试。
+#[cfg(test)]
 pub const COOLDOWN: Duration = Duration::from_secs(10);
 pub const ENV_COOLDOWN_MS: &str = "ZWRT_DATAD_UBUS_COOLDOWN_MS";
 /// 旧采集的超时上限（V2-19）：本轮已有这么多个对象超时（块和旧采集合计），旧采集就不再发新请求，

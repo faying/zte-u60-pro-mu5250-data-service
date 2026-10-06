@@ -7,8 +7,7 @@
 //! - `compare`：`zwrt-datad --ubus-compare 对象:方法 …`，同一个只读调用经 socket 后端和 `ubus call` 各做一遍比结果（上机前核对协议）。
 //!
 //! 执行者（`executor.rs`，T4）持有一个 `Backend`，datad 的全部 ubus 调用都经过它。
-//! 客户端里有些接口只给测试和日志用（统计、缓存查询），所以整个模块允许未使用。
-#![allow(dead_code)]
+//! 只给测试用的接口标了 `#[cfg(test)]`。
 
 pub mod backend;
 pub mod blob;

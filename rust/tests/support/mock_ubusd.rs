@@ -40,8 +40,6 @@ pub enum Action {
     Status(i32),
     /// STATUS OK，不带 DATA。
     NoData,
-    /// 用这个值回复。
-    Reply(Value),
     /// 把收到的参数原样回复（测参数编码）。
     Echo,
 }
@@ -408,10 +406,6 @@ fn invoke(state: &Mutex<State>, hdr: MsgHdr, body: &[u8]) -> Step {
     match action {
         None => {
             pre.extend(reply_frames(hdr.seq, hdr.peer, &default));
-            Step::Now(pre)
-        }
-        Some(Action::Reply(v)) => {
-            pre.extend(reply_frames(hdr.seq, hdr.peer, &v));
             Step::Now(pre)
         }
         Some(Action::Echo) => {

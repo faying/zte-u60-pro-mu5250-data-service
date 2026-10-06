@@ -45,7 +45,7 @@ struct Args {
     once: bool,
     #[arg(long)]
     neighbor: bool,
-    /// 已删除的 WebShell 的旧开关，只为兼容旧启动脚本（scripts/service.sh 带着它），不起作用。
+    /// 已删除的 WebShell 的旧开关，只为不让还带着它的旧启动脚本起不来，不起作用。
     #[arg(long, hide = true)]
     webshell: bool,
     #[arg(long)]

@@ -41,38 +41,28 @@ pub mod blobmsg_type {
     pub const BOOL: u8 = INT8;
 }
 
-/// `enum ubus_msg_type`（ubus/ubusmsg.h）[Gate 0]。
+/// `enum ubus_msg_type`（ubus/ubusmsg.h）[Gate 0]；只列用到的，取值照原表。
 pub mod msg_type {
     pub const HELLO: u8 = 0;
     pub const STATUS: u8 = 1;
     pub const DATA: u8 = 2;
-    pub const PING: u8 = 3;
     pub const LOOKUP: u8 = 4;
     pub const INVOKE: u8 = 5;
-    pub const ADD_OBJECT: u8 = 6;
-    pub const REMOVE_OBJECT: u8 = 7;
-    pub const SUBSCRIBE: u8 = 8;
-    pub const UNSUBSCRIBE: u8 = 9;
+    /// mock 发「无关帧」用。
+    #[cfg(test)]
     pub const NOTIFY: u8 = 10;
-    pub const MONITOR: u8 = 11;
 }
 
-/// `enum ubus_msg_attr`（ubus/ubusmsg.h）[Gate 0]。
+/// `enum ubus_msg_attr`（ubus/ubusmsg.h）[Gate 0]；只列用到的，取值照原表（0–13）。
 pub mod attr {
-    pub const UNSPEC: u8 = 0;
     pub const STATUS: u8 = 1;
     pub const OBJPATH: u8 = 2;
     pub const OBJID: u8 = 3;
     pub const METHOD: u8 = 4;
+    /// mock 的 LOOKUP 回复用。
+    #[cfg(test)]
     pub const OBJTYPE: u8 = 5;
-    pub const SIGNATURE: u8 = 6;
     pub const DATA: u8 = 7;
-    pub const TARGET: u8 = 8;
-    pub const ACTIVE: u8 = 9;
-    pub const NO_REPLY: u8 = 10;
-    pub const SUBSCRIBERS: u8 = 11;
-    pub const USER: u8 = 12;
-    pub const GROUP: u8 = 13;
     /// `UBUS_ATTR_MAX`
     pub const MAX: usize = 14;
 }
@@ -296,6 +286,7 @@ pub fn blobmsg_table(map: &Map<String, Value>) -> Vec<u8> {
 
 /// 解一个 blobmsg 字段，返回（名字，值）。值的 JSON 形式和 ubus CLI（`blobmsg_format_json`）一致：
 /// INT8 → true/false，INT16/32/64 → 有符号整数，DOUBLE → 数（NaN/Inf → null），UNSPEC → null。
+#[cfg(test)]
 pub fn blobmsg_decode(a: &Attr<'_>) -> Result<(String, Value), BlobError> {
     decode_at(a, 0)
 }
@@ -369,7 +360,8 @@ fn object_at(buf: &[u8], depth: usize) -> Result<Map<String, Value>, BlobError> 
     Ok(m)
 }
 
-/// 一串 blobmsg 字段 → JSON 数组（忽略名字）。
+/// 一串 blobmsg 字段 → JSON 数组（忽略名字）。测试用。
+#[cfg(test)]
 pub fn blobmsg_array(buf: &[u8]) -> Result<Vec<Value>, BlobError> {
     array_at(buf, 0)
 }
@@ -443,6 +435,7 @@ pub fn decode_head(
 }
 
 /// 从内存里解一整帧（mock 和测试用）。
+#[cfg(test)]
 pub fn decode_frame(buf: &[u8]) -> Result<Frame, BlobError> {
     let Some(head) = buf.get(..UBUS_MSGHDR_LEN + BLOB_HDR_LEN) else {
         return err("truncated ubus message header");

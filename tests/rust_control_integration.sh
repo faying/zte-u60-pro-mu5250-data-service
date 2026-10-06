@@ -18,7 +18,6 @@ trap cleanup EXIT INT TERM
 export ZWRT_DATAD_UBUS_BIN="$ROOT/tests/mock_ubus.sh"
 export ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh"
 export MOCK_CALL_LOG="$TMP/calls.log"
-export ZWRT_DATAD_OTA_DISABLE_AUTO=1
 export ZWRT_DATAD_OPS_DIR="$TMP/ops"
 export ZWRT_DATAD_WRITE_LOCK="$TMP/write.lock" ZWRT_DATAD_PID_FILE="$TMP/zwrt-datad.pid"
 export ZWRT_DATAD_MWAN3_INIT=/usr/bin/true

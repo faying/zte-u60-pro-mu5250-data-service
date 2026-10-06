@@ -72,17 +72,6 @@ impl UbusError {
     pub fn is_timeout(&self) -> bool {
         matches!(self, Self::Timeout { .. } | Self::Skipped { .. })
     }
-
-    pub fn object(&self) -> Option<&str> {
-        match self {
-            Self::Timeout { object, .. }
-            | Self::Skipped { object }
-            | Self::NotFound { object }
-            | Self::Status { object, .. }
-            | Self::NoData { object, .. } => Some(object),
-            _ => None,
-        }
-    }
 }
 
 impl fmt::Display for UbusError {
@@ -131,6 +120,7 @@ pub struct RoundSkips {
 }
 
 impl RoundSkips {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -150,15 +140,10 @@ impl RoundSkips {
     pub fn timed_out(&self) -> usize {
         self.timed_out.len()
     }
-    pub fn skipped(&self) -> impl Iterator<Item = &str> {
-        self.timed_out.iter().map(String::as_str)
-    }
 }
 
 struct Conn {
     stream: UnixStream,
-    #[allow(dead_code)] // HELLO 分配的 client id，调试用
-    local_id: u32,
 }
 
 /// 一个请求收齐的回复：每帧 DATA 的属性区，加最终状态。
@@ -182,6 +167,7 @@ pub struct UbusClient {
 }
 
 impl UbusClient {
+    #[cfg(test)]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self::with_timeout(path, DEFAULT_TIMEOUT)
     }
@@ -211,20 +197,13 @@ impl UbusClient {
     pub fn stats(&self) -> ClientStats {
         self.stats
     }
+    #[cfg(test)]
     pub fn is_connected(&self) -> bool {
         self.conn.is_some()
     }
     /// 缓存里的对象 id（测试用）。
     pub fn cached_id(&self, object: &str) -> Option<u32> {
         self.ids.get(object).copied()
-    }
-    /// 作废一个对象的 ID 缓存，下次调用重新 LOOKUP。
-    pub fn invalidate(&mut self, object: &str) {
-        self.ids.remove(object);
-    }
-    /// 关掉连接（LOOKUP 缓存保留）。
-    pub fn disconnect(&mut self) {
-        self.conn = None;
     }
 
     /// 上一次 `call` 失败时请求肯定没到对象那里：连不上、没收到 HELLO、LOOKUP 失败（没有副作用），
@@ -235,6 +214,8 @@ impl UbusClient {
     }
 
     /// 本轮已超时的对象直接返回 `Skipped`，不发请求；这次超时就记进 `skips`。
+    /// 测试用：程序里的跳过由执行者做（`executor.rs`，同样用 `RoundSkips`）。
+    #[cfg(test)]
     pub async fn call_in_round(
         &mut self,
         skips: &mut RoundSkips,
@@ -448,10 +429,8 @@ impl UbusClient {
                 hello.hdr.msg_type
             )));
         }
-        self.conn = Some(Conn {
-            stream,
-            local_id: hello.hdr.peer,
-        });
+        // HELLO 头里的 peer 是分给本连接的 client id；客户端用不到，只要这一帧已经读走。
+        self.conn = Some(Conn { stream });
         self.stats.connects += 1;
         Ok(())
     }

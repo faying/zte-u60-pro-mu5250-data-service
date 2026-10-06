@@ -2,25 +2,15 @@
 
 `zwrt-datad` 读取设备 `ubus/uci/sysfs` 与 QoS 日志，并在本机 `127.0.0.1:9460` 提供 HTTP/SSE 和白名单控制接口。上游的云端、自更新（OTA）、WebShell 和 `/ubus` 透传已删除。
 
-> U60 Pro（MU5250）装机包不用下面的 `service.sh`，而是 `/data/plugins/zwrt-datad/` + procd（`/etc/init.d/zwrt-datad`），见 manager 仓库。本页是上游的通用运行说明。
+## 启动方式
 
-## 推荐启动方式
-
-正式启动脚本是项目内的 [`scripts/service.sh`](../scripts/service.sh)，部署后固定放在 `/data/zwrt-datad/service.sh`：
-
-```sh
-sh /data/zwrt-datad/service.sh start
-sh /data/zwrt-datad/service.sh status
-```
-
-开机自启只允许在 `/etc/rc.local` 的 `exit 0` 之前调用 `sh /data/zwrt-datad/service.sh start`，不向 `/etc/init.d` 安装 datad 脚本。除 `rc.local` 外，二进制、脚本、PID、日志、Token 与配置全部留在 `/data/zwrt-datad`。
-
-临时调试若确实需要绕过正式脚本，可用：
+U60 Pro（MU5250）上由 procd 管：`/etc/init.d/zwrt-datad`（脚本在 touch-ui 仓库的 `scripts/zwrt-datad.init`），
+程序在 `/data/plugins/zwrt-datad/`，开机只走 `/etc/rc.local` 里的 `/etc/init.d/zwrt-datad start`。init 脚本负责生成 Token、
+带上运行参数：
 
 ```sh
-nohup /data/zwrt-datad/zwrt-datad -i 1000 \
-  --auth-token-file /data/zwrt-datad/auth.token \
-  >/dev/null 2>&1 </dev/null &
+/data/plugins/zwrt-datad/zwrt-datad -i 1000 --lan-bind 0.0.0.0 --lan-port 9461 \
+  --auth-token-file /data/plugins/zwrt-datad/auth.token
 ```
 
 `--auth-token-file` 现在是有效运行参数。文件首行去除首尾空白后作为 Bearer Token；指定了该参数但文件不存在或为空时，进程拒绝启动。回环主监听（9460）不要求 Token；`--lan-bind` 的 LAN 监听上，`/healthz` 保持公开，其余数据和控制接口要求：
@@ -33,9 +23,8 @@ Authorization: Bearer <token>
 
 也兼容仅供本机服务间调用的 `X-Auth-Token` 请求头。不要把 Token 写入前端静态文件。
 
-`service.sh` 首次启动会从 `/dev/urandom` 生成 32 字节随机 Token，以 `0600`
-原子保存；异常 Token 文件会令启动失败。它仍带着 `--webshell`：WebShell 已删除，
-这个参数只为兼容旧启动脚本保留为隐藏的空开关，不起任何作用。
+Token 文件由 init 脚本首次启动时从 `/dev/urandom` 生成，权限 `0600`。`--webshell` 是已删除的 WebShell 的旧开关，
+只为不让还带着它的旧启动脚本起不来，保留为隐藏的空开关，不起任何作用。
 
 不要把长期、无轮转的输出重定向到 `/tmp/*.log`。在常见 OpenWrt 设备中，`/tmp` 位于 tmpfs；如果某个扩展构建或诊断后端输出高频调试信息，日志文件会直接占用 RAM，表现为“可用内存持续下降”，并不等同于进程 RSS 泄漏。
 
@@ -45,8 +34,7 @@ Authorization: Bearer <token>
 
 ```sh
 curl -fsS http://127.0.0.1:9460/healthz
-curl -fsS -H "Authorization: Bearer $(cat /data/zwrt-datad/auth.token)" \
-  http://127.0.0.1:9460/state
+curl -fsS http://127.0.0.1:9460/state
 ```
 
 `/healthz` 返回 200（`{"ok":true,"status":"ok","exec_age_ms":…}`）表示第一轮采集已完成、采集执行者在前进；

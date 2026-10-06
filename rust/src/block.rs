@@ -138,8 +138,6 @@ pub struct PolicyInput<'a> {
     pub current: Option<&'a Value>,
     /// 距上次发布多久（从没发布过是 None）。
     pub since_publish: Option<Duration>,
-    #[allow(dead_code)] // 扩展点：现有策略只看 since_publish
-    pub now: Instant,
 }
 
 /// 发布策略（扩展点）。只管「什么时候考虑发」；revision 和 stale 的规则由 `Hub` 统一执行。
@@ -511,7 +509,6 @@ impl Hub {
                     published: b.published.as_ref(),
                     current: b.data.as_ref(),
                     since_publish: b.published_at.map(|t| now.saturating_duration_since(t)),
-                    now,
                 };
                 let decision = b.spec.policy.on_read(&input);
                 Self::publish(&mut g.seq, b, &*self.sink, decision, was_stale, now);
@@ -563,7 +560,6 @@ impl Hub {
                 published: b.published.as_ref(),
                 current: b.data.as_ref(),
                 since_publish: b.published_at.map(|t| now.saturating_duration_since(t)),
-                now,
             };
             let decision = b.spec.policy.on_read(&input);
             Self::publish(&mut g.seq, b, sink, decision, false, now);
@@ -636,7 +632,6 @@ impl Hub {
                 published: b.published.as_ref(),
                 current: b.data.as_ref(),
                 since_publish: b.published_at.map(|t| now.saturating_duration_since(t)),
-                now,
             };
             let decision = b.spec.policy.on_round_end(&input);
             if decision != Publish::No {

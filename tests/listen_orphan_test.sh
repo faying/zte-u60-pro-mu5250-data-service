@@ -26,7 +26,6 @@ MOCK
 chmod +x "$TMP/ubus"
 export ZWRT_DATAD_UBUS_BIN="$TMP/ubus"
 export ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh"
-export ZWRT_DATAD_OTA_DISABLE_AUTO=1
 export ZWRT_DATAD_MWAN3_INIT=/usr/bin/true
 export ZWRT_DATAD_IW_BIN="$ROOT/tests/mock_iw.sh"
 export ZWRT_DATAD_HOSTAPD_CLI_BIN="$ROOT/tests/mock_hostapd_cli.sh"
