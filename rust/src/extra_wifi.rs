@@ -374,11 +374,6 @@ pub async fn apply(config: &Config) -> Result<bool, String> {
     Ok(true)
 }
 
-pub async fn reset_attempts(section: &str) {
-    let slot = usize::from(section == "datad_ssid_2");
-    RECONCILE.lock().await[slot] = Reconcile::default();
-}
-
 async fn read(section: &str) -> Option<Config> {
     if state::uci_read(&format!("datad_wifi.{section}"))
         .await

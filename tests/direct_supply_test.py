@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the actual HTTP/control/state path with a stateful charger fixture."""
+"""Exercise the actual HTTP/control and /v2 charger block path with a stateful charger fixture."""
 import json, os, pathlib, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
 BIN=pathlib.Path(sys.argv[1]).resolve()
 # Contract: docs/CONTROL_API.md "Charger direct supply".
@@ -53,17 +53,18 @@ print('{}')
             except ValueError: data={}
             return e.code,data
     def action(which,params=None): return req('/control',{'action':'power.direct_supply.'+which,'params':params or {}})
+    def supply(v2): return ((v2.get('blocks') or {}).get('charger') or {}).get('data',{}).get('direct_supply')
     def count(): return len(calls.read_text().splitlines()) if calls.exists() else 0
     try:
         for i in range(60):
             try:
-                status,state=req('/state'); break
+                status,state=req('/v2/state'); break
             except (OSError,urllib.error.URLError): time.sleep(.1)
         else: raise AssertionError('startup')
-        assert state['power']['direct_supply']['enabled'] is False
-        assert req('/state',auth=False)[0]==401
-        caps=req('/capabilities')[1]['control']; assert 'power.direct_supply.set' in caps and 'power.direct_supply.status' in caps
-        assert action('status')[1]['result']=={'supported':True,'enabled':False,'mode':'disable'}
+        assert supply(state)=={'supported':True,'enabled':False,'mode':'disable'}
+        assert req('/v2/state',auth=False)[0]==401
+        caps=req('/capabilities')[1]['control']; assert 'power.direct_supply.set' in caps and 'power.direct_supply.status' not in caps
+        assert action('status')[0]==404
         code,data=action('set',{'enabled':True}); assert code==200 and data['result']['verified'] and data['result']['changed'] and data['result']['enabled']
         before=count(); assert action('set',{'enabled':True})[1]['result']['changed'] is False; assert count()==before
         before=count(); assert action('set',{'enabled':1})[1]['result']['changed'] is False; assert count()==before
@@ -72,12 +73,12 @@ print('{}')
         assert action('set',{'enabled':False})[1]['result']['mode']=='disable'
         for value in (None,2,'enable','true; touch /tmp/not-allowed',[],{}):
             before=count(); code,_=action('set',{} if value is None else {'enabled':value}); assert code==400,(value,code); assert count()==before
-        setup(missing=True); assert action('status')[1]['result']['supported'] is False
+        setup(missing=True)
         before=count(); assert action('set',{'enabled':True})[0]==502; assert count()==before
-        setup(mode='unexpected'); result=action('status')[1]['result']; assert result['supported'] and result['enabled'] is None
+        setup(mode='unexpected')
         before=count(); assert action('set',{'enabled':True})[0]==502; assert count()==before
         for key in ('read_fail','malformed'):
-            setup(**{key:True}); assert action('status')[0]==502; assert action('set',{'enabled':True})[0]==502
+            setup(**{key:True}); assert action('set',{'enabled':True})[0]==502
         for reply in ('empty_reply','whitespace_reply'):
             setup(mode='disable',**{reply:True}); code,data=action('set',{'enabled':True}); assert code==200 and data['result']['verified'],(reply,code,data)
         # Nonempty reply carrying an error fails even though readback would confirm.
@@ -87,11 +88,10 @@ print('{}')
         setup(mode='disable',ignore=True,empty_reply=True); code,data=action('set',{'enabled':True}); assert code==502 and 'readback' in data['error']['message']
         setup(mode='disable'); assert action('set',{'enabled':True})[0]==200
         for i in range(30):
-            state=req('/state')[1]
-            if state.get('power',{}).get('direct_supply',{}).get('enabled') is True: break
+            if (supply(req('/v2/state')[1]) or {}).get('enabled') is True: break
             time.sleep(.1)
         else: raise AssertionError('state not refreshed')
-        print('direct supply: status, capabilities, authentication, state refresh, set/readback, repeat no-write, invalid/unsupported/unknown/read/write errors PASS')
+        print('direct supply: /v2 charger block, capabilities, authentication, state refresh, set/readback, repeat no-write, invalid/unsupported/unknown/read/write errors PASS')
     finally:
         proc.terminate()
         try: proc.wait(timeout=8)

@@ -13,7 +13,7 @@ The documents linked under `docs/` are in Chinese.
 |---|---|
 | [manager](https://github.com/faying/zte-u60-pro-mu5250-manager) | `zte-agent` (:9090) + admin web + install kit |
 | [touch-ui](https://github.com/faying/zte-u60-pro-mu5250-touch-ui) | Front-panel touch UI, screen daemon, process supervision and Wi-Fi fallback scripts |
-| **[data-service](https://github.com/faying/zte-u60-pro-mu5250-data-service)** (this repo) | `zwrt-datad`: local data service (`/state` + SSE on `127.0.0.1:9460`) |
+| **[data-service](https://github.com/faying/zte-u60-pro-mu5250-data-service)** (this repo) | `zwrt-datad`: local data service (`/v2/state` + SSE on `127.0.0.1:9460`) |
 
 ```
 zwrt-datad :9460 ──▶ touch UI ──(eSIM page)──▶ zte-agent :9090 ──▶ lpac ──▶ eUICC card
@@ -23,7 +23,7 @@ browser ──▶ zte-agent :9090 (API + admin web)
 ## Features
 
 - Aggregates device, CPU, memory, temperature, battery, SIM, mobile network, signal, bands, traffic, Wi-Fi, clients, SMS and other data
-- `GET /state` returns a full JSON snapshot; `GET /events` pushes changes over SSE, once per second by default
+- `GET /v2/state` returns the current state blocks; `GET /v2/events` sends a snapshot on connect, then only the blocks that changed, over SSE (the old `/state` and `/events` were removed on 2026-10-06 and return 410)
 - Normalizes fields per model template; `/capabilities` reports the current capabilities (MU5250 / U60 Pro and others supported, see [docs/models/](docs/models/))
 - `POST /control` performs constrained cellular, Wi-Fi, APN, SMS, power and other controls
 - A single static ARM64 Rust binary
@@ -37,8 +37,8 @@ The install kit puts it at `/data/plugins/zwrt-datad/zwrt-datad`, supervised by 
 /etc/init.d/zwrt-datad restart            # restart
 cat /tmp/zwrt-datad.log                   # log
 curl -fsS http://127.0.0.1:9460/healthz   # check on the device
-curl -fsS http://127.0.0.1:9460/state
-curl -N  http://127.0.0.1:9460/events
+curl -fsS http://127.0.0.1:9460/v2/state
+curl -N  http://127.0.0.1:9460/v2/events
 ```
 
 The binary has no self-updater (the original's OTA, cloud client, WebShell and `/ubus` passthrough are all removed) and no hard-coded Internet addresses. To update, build it yourself and install it with the install kit's `./install.sh devui`.
@@ -62,7 +62,8 @@ When building the install kit, point to it with `DATAD_BIN=…/zwrt-datad-aarch6
 ## Docs
 
 - [docs/API.md](docs/API.md): HTTP, SSE, authentication and command-line options
-- [docs/STATE_SCHEMA.md](docs/STATE_SCHEMA.md): state field conventions
+- [docs/STATE_V2.md](docs/STATE_V2.md): `/v2` state stream (blocks, events, collection rules)
+- [docs/STATE_SCHEMA.md](docs/STATE_SCHEMA.md): fields of the internal snapshot the `/v2` blocks are cut from
 - [docs/CONTROL_API.md](docs/CONTROL_API.md): control actions and safety boundaries
 - [docs/models/](docs/models/): model templates
 - [docs/RUNTIME.md](docs/RUNTIME.md), [docs/NEIGHBOR.md](docs/NEIGHBOR.md): runtime notes and optional features from the original (the U60 Pro install kit uses its own startup method)

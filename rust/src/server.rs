@@ -13,16 +13,15 @@ use axum::{
     extract::{ConnectInfo, Request, State},
     http::{HeaderMap, Method, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response, Sse, sse::Event},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Map, Value, json};
-use std::{convert::Infallible, future::IntoFuture, path::PathBuf, sync::Arc, time::Duration};
+use std::{future::IntoFuture, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{Mutex, RwLock, Semaphore, watch},
 };
-use tokio_stream::{StreamExt, wrappers::WatchStream};
 use tower_http::limit::RequestBodyLimitLayer;
 
 #[derive(Clone)]
@@ -37,8 +36,7 @@ struct Inner {
     _data_dir: PathBuf,
     token: Option<String>,
     sessions: Mutex<Sessions>,
-    device_session: Mutex<Option<DeviceSession>>,
-    /// `/events` 和 `/v2/events` 共用的 SSE 连接名额。
+    /// `/v2/events` 的 SSE 连接名额。
     sse_slots: Arc<Semaphore>,
     /// `/v2` 的流（epoch + broadcast），事件由 `Hub` 在锁里发进来。
     feed: Arc<v2::Feed>,
@@ -93,11 +91,6 @@ pub fn write_pid_file() {
     if let Err(e) = r {
         eprintln!("cannot write pid file {}: {e}", path.display());
     }
-}
-
-struct DeviceSession {
-    _token: String,
-    _password_hash: String,
 }
 
 impl App {
@@ -155,7 +148,6 @@ impl App {
                 _data_dir: data_dir,
                 token,
                 sessions: Mutex::new(Sessions::default()),
-                device_session: Mutex::new(None),
                 sse_slots: Arc::new(Semaphore::new(16)),
                 feed,
                 ops,
@@ -294,8 +286,8 @@ impl App {
             .route("/", get(index))
             .route("/healthz", get(health))
             .route("/version", get(version))
-            .route("/state", get(snapshot))
-            .route("/events", get(events))
+            .route("/state", get(gone))
+            .route("/events", get(gone))
             .route("/v2/events", get(v2_events))
             .route("/v2/state", get(v2_state))
             .route("/v2/screen", get(v2_screen))
@@ -354,6 +346,8 @@ async fn starting_gate(State(app): State<App>, request: Request, next: Next) -> 
             | "/capabilities"
             | "/control"
             | "/debug/legacy-hits"
+            | "/state"
+            | "/events"
             | "/auth/login"
             | "/auth/exchange"
     );
@@ -583,32 +577,17 @@ async fn health(State(app): State<App>) -> Response {
 async fn version() -> Json<DatadVersion> {
     Json(Default::default())
 }
-async fn snapshot(State(app): State<App>) -> Json<Snapshot> {
-    Json(app.snapshot().await)
+/// 旧的 `/state`、`/events`（2026-10 删，legacy-api-removal.md）：回 410，访问照样记进 legacy-hits，
+/// 漏改的调用者看计数和这条错误就知道该换 `/v2/state`、`/v2/events`。
+async fn gone() -> Response {
+    (
+        StatusCode::GONE,
+        Json(json!({"ok":false,"error":{"code":"gone","message":"removed; use /v2/state and /v2/events"}})),
+    )
+        .into_response()
 }
 fn capability_controls() -> Vec<&'static str> {
-    let mut controls = vec![
-        "device.login_info",
-        "device.login",
-        "device.logout",
-        "device.session_status",
-        "device.change_password",
-        "wifi.status",
-        "wifi.dual_band_status",
-        "wifi.txpower.status",
-        "wifi.advanced.status",
-        "wireless.config",
-        "sleep.status",
-        "usb.status",
-        "power.direct_supply.status",
-        "apn.list",
-        "client.access",
-        "neighbor.status",
-        "neighbor.set",
-        "state.refresh",
-        "state.set_interval",
-        "qos.reload",
-    ];
+    let mut controls = vec!["state.set_interval"];
     controls.extend_from_slice(crate::control::ACTIONS);
     controls
 }
@@ -618,7 +597,7 @@ async fn capabilities() -> Json<Value> {
     Json(json!({
         "schema_version":1,
         "protocol":1,
-        "events":["state"],
+        "events":["snapshot","block"],
         "transport":["http","sse"],
         "control":controls,
         "controls":controls,
@@ -634,23 +613,7 @@ fn sse_limit() -> Response {
         .into_response()
 }
 
-async fn events(State(app): State<App>) -> Response {
-    let Ok(permit) = app.inner.sse_slots.clone().try_acquire_owned() else {
-        return sse_limit();
-    };
-    let open = crate::legacy_hits::OpenEvents::new();
-    let stream = WatchStream::new(app.inner.tx.subscribe()).map(move |v| {
-        let _keep_permit_alive = &permit;
-        let _keep_open_count = &open;
-        Ok::<_, Infallible>(Event::default().event("state").json_data(v).unwrap())
-    });
-    // 退出时流结束，连接才能收尾（P2-4）。
-    let stream = futures_util::StreamExt::take_until(stream, app.stopped());
-    Sse::new(stream)
-        .keep_alive(axum::response::sse::KeepAlive::new())
-        .into_response()
-}
-/// `/v2/events`（STATE_V2.md 第 2–4 节）：和 `/events` 共用连接名额，满了同样 503。
+/// `/v2/events`（STATE_V2.md 第 2–4 节）：SSE 连接名额满了回 503。
 async fn v2_events(State(app): State<App>) -> Response {
     let Ok(permit) = app.inner.sse_slots.clone().try_acquire_owned() else {
         return sse_limit();
@@ -1212,7 +1175,7 @@ fn read_only(action: &str) -> bool {
 /// `/control` 动作 → 它会改变的块。没列出的动作算「没有映射」，成功后全部块立即读（R12）。
 fn blocks_for_action(action: &str) -> Option<&'static [&'static str]> {
     match action {
-        "power.direct_supply.set" | "power.direct_supply.status" => Some(&["charger"]),
+        "power.direct_supply.set" => Some(&["charger"]),
         "sms.list_after" => Some(&[]),
         _ => None,
     }
@@ -1235,251 +1198,6 @@ async fn control_task(app: App, action: &str, body: Value) -> Response {
     if !read_only(action) {
         crate::state::invalidate_cache();
     }
-    if action == "neighbor.status" {
-        return (StatusCode::OK,Json(json!({"ok":true,"action":action,"result":app.inner.neighbor.lock().await.status()}))).into_response();
-    }
-    if action == "neighbor.set" {
-        let Some(enabled) = neighbor_enabled(&body) else {
-            return (StatusCode::BAD_REQUEST,Json(json!({"ok":false,"action":action,"error":{"code":"invalid_parameter","message":"enabled must be boolean"}}))).into_response();
-        };
-        return match app.inner.neighbor.lock().await.set_enabled(enabled).await {Ok(value)=>(StatusCode::OK,Json(json!({"ok":true,"action":action,"result":value}))).into_response(),Err(error)=>(StatusCode::BAD_GATEWAY,Json(json!({"ok":false,"action":action,"error":{"code":"device_call_failed","message":error}}))).into_response()};
-    }
-    if action == "device.login_info" {
-        return readonly_ubus(action, "zwrt_web", "web_login_info", json!({})).await;
-    }
-    if action == "device.login" {
-        let password_hash = body
-            .get("params")
-            .and_then(|value| value.get("password_hash"))
-            .and_then(Value::as_str)
-            .filter(|value| {
-                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-            });
-        let Some(password_hash) = password_hash else {
-            return invalid_parameter(
-                action,
-                "password_hash must be a 64 character SHA-256 hex value",
-            );
-        };
-        let password_hash = password_hash.to_ascii_uppercase();
-        return match state::ubus("zwrt_web", "web_login", json!({"password":password_hash})).await {
-            Ok(value)
-                if value.get("result").and_then(Value::as_i64) == Some(0)
-                    && value
-                        .get("ubus_rpc_session")
-                        .and_then(Value::as_str)
-                        .is_some_and(|token| !token.is_empty()) =>
-            {
-                let token = value["ubus_rpc_session"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned();
-                *app.inner.device_session.lock().await = Some(DeviceSession {
-                    _token: token,
-                    _password_hash: password_hash,
-                });
-                control_ok(action, value)
-            }
-            Ok(_) => control_failed(action, "device login rejected".into()),
-            Err(error) => control_failed(action, error),
-        };
-    }
-    if action == "device.logout" {
-        *app.inner.device_session.lock().await = None;
-        return control_ok(action, json!({"logged_in":false}));
-    }
-    if action == "device.session_status" {
-        return control_ok(
-            action,
-            json!({"logged_in":app.inner.device_session.lock().await.is_some()}),
-        );
-    }
-    if action == "device.change_password" {
-        let valid_hash = |name: &str| {
-            body.get("params")
-                .and_then(|v| v.get(name))
-                .and_then(Value::as_str)
-                .filter(|v| v.len() == 64 && v.bytes().all(|byte| byte.is_ascii_hexdigit()))
-                .map(|v| v.to_ascii_uppercase())
-        };
-        let (Some(old_hash), Some(new_hash)) = (valid_hash("old_hash"), valid_hash("new_hash"))
-        else {
-            return invalid_parameter(action, "old_hash and new_hash must be SHA-256 hex values");
-        };
-        return match state::ubus(
-            "zwrt_web",
-            "web_change_password",
-            json!({"password_old":old_hash,"password_new":new_hash}),
-        )
-        .await
-        {
-            Ok(value) => {
-                *app.inner.device_session.lock().await = None;
-                control_ok(action, value)
-            }
-            Err(error) => control_failed(action, error),
-        };
-    }
-    if action == "wifi.dual_band_status" {
-        return match state::ubus("zwrt_router.api", "router_get_wifi_isolate", json!({})).await {
-            Ok(value) => {
-                let enabled = value
-                    .get("wifimain24_wifimain5_enable")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default()
-                    != 0;
-                control_ok(
-                    action,
-                    json!({
-                        "WiFiDualBandSupported":"1",
-                        "WiFiDualBandEnabled":if enabled { "1" } else { "0" },
-                        "BandSteeringSwitch":if enabled { "1" } else { "0" }
-                    }),
-                )
-            }
-            Err(error) => control_failed(action, error),
-        };
-    }
-    if action == "wifi.status" {
-        let mut result = serde_json::Map::new();
-        for section in ["main_2g", "main_5g"] {
-            let mut item = serde_json::Map::new();
-            for field in ["ssid", "key", "encryption", "disabled"] {
-                item.insert(
-                    field.into(),
-                    json!(state::uci_read(&format!("wireless.{section}.{field}")).await),
-                );
-            }
-            result.insert(section.into(), Value::Object(item));
-        }
-        return control_ok(action, Value::Object(result));
-    }
-    if action == "wifi.txpower.status" {
-        let model = state::uci_read("zwrt_common_info.common_config.model_name").await;
-        let hardware = state::uci_read("zwrt_common_info.common_config.hardware_version").await;
-        if model != "MU5252" && !hardware.starts_with("MU5252_") {
-            return (StatusCode::BAD_REQUEST,Json(json!({"ok":false,"action":action,"error":{"code":"invalid_parameter","message":"wifi power control is only supported on MU5252"}}))).into_response();
-        }
-        let mut result = Map::new();
-        let [radio_2g, radio_5g] = crate::wifi::radio_sections().await;
-        for (band, section, factory_limit) in [("2g", radio_2g, 19), ("5g", radio_5g, 18)] {
-            let mut values = Vec::new();
-            for option in ["disabled", "txpowerpercent", "txpower", "max_power"] {
-                let raw = state::uci_read(&format!("wireless.{section}.{option}")).await;
-                let Ok(value) = raw.parse::<i64>() else {
-                    return control_failed(
-                        action,
-                        format!("failed to read {band} wifi power configuration"),
-                    );
-                };
-                values.push(value);
-            }
-            result.insert(band.into(), json!({"enabled":values[0]==0,"percent":values[1],"txpower_dbm":values[2],"limit_dbm":values[3],"factory_limit_dbm":factory_limit}));
-        }
-        return control_ok(action, Value::Object(result));
-    }
-    if action == "wifi.advanced.status" {
-        return match crate::wifi::advanced_status().await {
-            Ok(value) => control_ok(action, value),
-            Err(error) => control_failed(action, error),
-        };
-    }
-    if action == "wireless.config" {
-        let mutating = body.get("params").is_some_and(|params| {
-            params.get("country").is_some() || params.get("channel").is_some()
-        });
-        if !mutating {
-            return match crate::wifi::wireless_config_status().await {
-                Ok(value) => control_ok(action, value),
-                Err(error) => control_failed(action, error),
-            };
-        }
-    }
-    if action == "sleep.status" {
-        return control_ok(
-            action,
-            json!({
-                "idle_seconds":state::uci_read("zwrt_sleep.ztmp_time.SysIdTime").await,
-                "enabled":state::uci_read("zwrt_sleep.ztmp_switch.sleepSwitch").await,
-                "wakeup":state::uci_read("zwrt_sleep.ztmp_switch.wakeupSwitch").await,
-                "status":state::uci_read("zwrt_sleep.ztmp_status.sleepStatus").await,
-            }),
-        );
-    }
-    if action == "usb.status" {
-        let typec = state::ubus("zwrt_bsp.typec", "list", json!({})).await;
-        let usb = state::ubus("zwrt_bsp.usb", "list", json!({})).await;
-        return match (typec, usb) {
-            (Ok(typec), Ok(usb)) => control_ok(action, json!({"typec":typec,"usb":usb})),
-            (Err(error), _) | (_, Err(error)) => control_failed(action, error),
-        };
-    }
-    if action == "power.direct_supply.status" {
-        return match state::ubus("zwrt_bsp.charger", "list", json!({})).await {
-            Ok(value) => {
-                let result = match value
-                    .get("direct_power_supply_mode")
-                    .and_then(Value::as_str)
-                {
-                    Some("enable") => json!({"supported":true,"enabled":true,"mode":"enable"}),
-                    Some("disable") => json!({"supported":true,"enabled":false,"mode":"disable"}),
-                    Some(_) => json!({"supported":true,"enabled":Value::Null,"mode":Value::Null}),
-                    None => json!({"supported":false,"enabled":Value::Null,"mode":Value::Null}),
-                };
-                control_ok(action, result)
-            }
-            Err(error) => control_failed(action, error),
-        };
-    }
-    if action == "apn.list" {
-        // 同一个控制任务里依次调完（V2-26）；四个都调，错误取第一个，和原来的 join 一样。
-        let values = (
-            state::ubus("zwrt_apn_object", "get_apn_mode", json!({})).await,
-            state::ubus("zwrt_apn_object", "getAutoApnList", json!({})).await,
-            state::ubus("zwrt_apn_object", "getManuApnList", json!({})).await,
-            state::ubus("zwrt_apn_object", "get_enabled_manu_apn_id", json!({})).await,
-        );
-        return match values {
-            (Ok(mode), Ok(automatic), Ok(manual), Ok(enabled)) => control_ok(
-                action,
-                json!({"mode":mode,"automatic":automatic,"manual":manual,"enabled":enabled}),
-            ),
-            (Err(error), _, _, _)
-            | (_, Err(error), _, _)
-            | (_, _, Err(error), _)
-            | (_, _, _, Err(error)) => control_failed(action, error),
-        };
-    }
-    if action == "client.access" {
-        let values = (
-            state::ubus(
-                "uci",
-                "get",
-                json!({"config":"wireless","section":"main_2g"}),
-            )
-            .await,
-            state::ubus(
-                "zwrt_router.api",
-                "router_lan_access_list",
-                json!({"start_id":1,"end_id":64}),
-            )
-            .await,
-            state::ubus(
-                "zwrt_router.api",
-                "router_wireless_access_list",
-                json!({"start_id":1,"end_id":64}),
-            )
-            .await,
-        );
-        return match values {
-            (Ok(policy), Ok(lan), Ok(wifi)) => {
-                control_ok(action, json!({"policy":policy,"lan":lan,"wifi":wifi}))
-            }
-            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                control_failed(action, error)
-            }
-        };
-    }
     match crate::control::execute(action, body.get("params").unwrap_or(&json!({}))).await {
         crate::control::Outcome::Ok(value) => {
             return control_ok(action, value);
@@ -1487,9 +1205,6 @@ async fn control_task(app: App, action: &str, body: Value) -> Response {
         crate::control::Outcome::Invalid(error) => return invalid_parameter(action, &error),
         crate::control::Outcome::Failed(error) => return control_failed(action, error),
         crate::control::Outcome::NotHandled => {}
-    }
-    if action == "state.refresh" {
-        return control_ok(action, json!({"queued":true}));
     }
     if action == "state.set_interval" {
         let milliseconds = body
@@ -1502,24 +1217,11 @@ async fn control_task(app: App, action: &str, body: Value) -> Response {
         app.inner.exec.set_interval_ms(milliseconds);
         return control_ok(action, json!({"sample_interval_ms":milliseconds}));
     }
-    if action == "qos.reload" {
-        return control_ok(action, json!({"queued":true}));
-    }
     (
         StatusCode::NOT_FOUND,
         Json(json!({"ok":false,"action":action,"error":{"code":"unknown_action","message":"unsupported control action"}})),
     )
         .into_response()
-}
-
-/// `neighbor.set` 的 `enabled`：布尔或 0/1（CONTROL_API.md），和其他动作同一个 `boolean()`。
-fn neighbor_enabled(body: &Value) -> Option<bool> {
-    let empty = json!({});
-    let params = body
-        .get("params")
-        .filter(|p| p.is_object())
-        .unwrap_or(&empty);
-    crate::control::boolean(params, "enabled").ok()
 }
 
 fn control_ok(action: &str, value: Value) -> Response {
@@ -1546,12 +1248,6 @@ fn invalid_parameter(action: &str, message: &str) -> Response {
         .into_response()
 }
 
-async fn readonly_ubus(action: &str, service: &str, method: &str, args: Value) -> Response {
-    match state::ubus(service, method, args).await {
-        Ok(value) => control_ok(action, value),
-        Err(error) => control_failed(action, error),
-    }
-}
 async fn shutdown(app: App) {
     #[cfg(unix)]
     {
@@ -1598,30 +1294,10 @@ mod tests {
     }
 
     #[test]
-    fn capability_controls_match_complete_legacy_count() {
+    fn capability_controls_are_the_kept_actions() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 81);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 81);
-    }
-
-    #[test]
-    fn neighbor_set_enabled_accepts_bool_and_01() {
-        for (v, want) in [
-            (json!(true), Some(true)),
-            (json!(false), Some(false)),
-            (json!(1), Some(true)),
-            (json!(0), Some(false)),
-            (json!(2), None),
-            (json!("1"), None),
-            (json!(null), None),
-        ] {
-            assert_eq!(
-                neighbor_enabled(&json!({"params":{"enabled":v}})),
-                want,
-                "{v}"
-            );
-        }
-        assert_eq!(neighbor_enabled(&json!({})), None);
+        assert_eq!(controls.len(), 25);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 25);
     }
 
     #[test]

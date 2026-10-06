@@ -24,7 +24,7 @@ fn merge(base: &mut Value, patch: &Value) {
 fn matches_the_screens_c_on_the_corpus() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let template: Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join("../tests/golden/normal.state.json")).unwrap(),
+        &std::fs::read_to_string(root.join("../tests/fixtures/snapshot-normal.json")).unwrap(),
     )
     .unwrap();
     let corpus =
@@ -912,7 +912,8 @@ fn radio_mode_words() {
     );
     let mut state: Value = serde_json::from_str(
         &std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/golden/normal.state.json"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../tests/fixtures/snapshot-normal.json"),
         )
         .unwrap(),
     )
@@ -925,7 +926,7 @@ fn radio_mode_words() {
 fn corpus_cases() -> (Value, Vec<String>) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let template: Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join("../tests/golden/normal.state.json")).unwrap(),
+        &std::fs::read_to_string(root.join("../tests/fixtures/snapshot-normal.json")).unwrap(),
     )
     .unwrap();
     let corpus =
@@ -1819,7 +1820,7 @@ fn stall_sits_after_nodata_and_before_the_slow_ones() {
 fn stall_through_net_view_with() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let state: Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join("../tests/golden/normal.state.json")).unwrap(),
+        &std::fs::read_to_string(root.join("../tests/fixtures/snapshot-normal.json")).unwrap(),
     )
     .unwrap();
     let mut state = state;
@@ -2110,7 +2111,7 @@ fn hot_sits_after_stall_and_before_the_slow_ones() {
 fn hot_through_net_view_reads_thermal_hightemp_limit() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut state: Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join("../tests/golden/normal.state.json")).unwrap(),
+        &std::fs::read_to_string(root.join("../tests/fixtures/snapshot-normal.json")).unwrap(),
     )
     .unwrap();
     let base = state_name(net_view(&state).story.state);

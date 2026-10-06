@@ -65,39 +65,33 @@ curl -s -X POST \
 
 版本由构建时的 `version.json` 写入二进制，不依赖设备状态和运行目录中的文件。
 本机 9460 默认免鉴权；内网 9461 必须带 Bearer Token，非 GET 请求返回 405。
-`/state` 和 `/events` 的 `datad` 块包含相同对象；`system.sw_version` 是设备固件版本。
+内部快照（[`STATE_SCHEMA.md`](STATE_SCHEMA.md)）的 `datad` 块包含相同对象；`system.sw_version` 是设备固件版本。
 旧 datad 没有此接口/字段时，应显示自身版本未知，不能用固件版本代替。
 
-### `GET /state`
+### `GET /v2/state`、`GET /v2/events`
 
-返回当前完整 JSON 快照。字段结构见 [`STATE_SCHEMA.md`](STATE_SCHEMA.md)。
+状态读取和 SSE 推送：`/v2/state` 返回当前所有块，`/v2/events` 连上先推一份 `snapshot`，之后只推变了的 `block`（另有 `heartbeat`）。
+格式和规则见 [`STATE_V2.md`](STATE_V2.md)。SSE 连接最多 16 个，满了回 `503`（`sse_client_limit`）。
 
-### `GET /events`
+### 已删除：`GET /state`、`GET /events`
 
-建立 SSE 长连接：
+旧的完整快照和它的 SSE 流 2026-10-06 删除（设备上计数约 15.5 小时没有调用，各客户端也没有引用）。现在两个路径都回 `410`：
 
-1. 连接建立后立即推送当前快照
-2. 只有状态内容变化时才推送下一份完整快照
-3. `ts` 单独变化不会产生事件
-4. 控制成功会触发立即重采样，变化后的状态通过此连接推送
-
-```text
-retry: 1000
-
-event: state
-data: {"ts":1782396733,...}
-
+```json
+{"ok":false,"error":{"code":"gone","message":"removed; use /v2/state and /v2/events"}}
 ```
+
+访问照样记进 `/debug/legacy-hits`。快照本身还在 datad 内部（字段见 [`STATE_SCHEMA.md`](STATE_SCHEMA.md)）：`/v2` 的块从它切出来，`/v2/screen` 由它算出，只是不再整份对外提供。
 
 ### `GET /v2/screen`
 
-触屏首页信号卡和状态栏要显示的结论，由当前这份 `/state` 快照算出（`rust/src/screen.rs`）。
+触屏首页信号卡和状态栏要显示的结论，由当前这份内部快照算出（`rust/src/screen.rs`）。
 这些规则原来在触屏的 C 里，2026-09-26 搬到这里，屏幕只负责画；为了一条规则都不变，
 `rust/tests/fixtures/screen_net_corpus.jsonl` 最初是 C 对 1700 多份快照算出的结果，测试要求逐字段相同（C 的规则随后删除，生成工具在 touch-ui tag `parity-net-v1`）；之后改规则时由 `screen/tests.rs` 的 bless 测试按 Rust 重录，patch 不动。
 「信号弱」只按格数判（`sig` = 状态栏格数），RSRP 只出现在说明里；NR 载波只在现在用着 5G（SA/NSA）时列出，不在 5G 时残留的 `nr_*` 读数不算；3G/2G 上也不列 `lteca` 里残留的 LTE 载波。
 
 不是旧接口，不冻结；靠 `v` 区分版本。`ts` 是算它用的那份快照的 `ts`。
-内容只随快照变化，订阅 `/events` 的客户端在收到新快照后读一次即可。
+内容只随快照变化，订阅 `/v2/events` 的客户端在收到新事件后读一次即可。
 
 ```jsonc
 { "v": 1, "ts": 1782396733,
@@ -115,14 +109,14 @@ data: {"ts":1782396733,...}
 ```
 
 英文（2026-10-01 起，界面语言 L2）：原有字段一个不改，只在后面加。
-- `story.state`：结论码，每个结论一个，互不相同：`nosim airplane sos nosvc nodata stall hot limit weak noise crowd only2g only3g narrow ok`（`/v2/screen` 的 `net.home` 另有写操作叠上去的 `changing revert_fail`）。`hot` = 固件在过热限速（`/state` 的 `thermal.hightemp_limit` 为 1；它读 uci `zwrt_zte_mc_tmp.cpe.hightemp_datalimit_status`，0 为 0，非 0 为 1，读不到为 null）。客户端判断状态看它，不比对中文。同一结论下的不同情况由 `hint` 区分。
+- `story.state`：结论码，每个结论一个，互不相同：`nosim airplane sos nosvc nodata stall hot limit weak noise crowd only2g only3g narrow ok`（`/v2/screen` 的 `net.home` 另有写操作叠上去的 `changing revert_fail`）。`hot` = 固件在过热限速（内部快照的 `thermal.hightemp_limit` 为 1；它读 uci `zwrt_zte_mc_tmp.cpe.hightemp_datalimit_status`，0 为 0，非 0 为 1，读不到为 null）。客户端判断状态看它，不比对中文。同一结论下的不同情况由 `hint` 区分。
 - 中文里有非 ASCII 字符的文字字段，旁边多一个 `<字段>_en`：story 的 `headline hint rat link sig noise load limit`，net 的 `fine name where ca_val ca_sub mode_word`。中文为空时没有 `_en`。英文大字只写状态词（≤10 字符，如 `Slow`），原因放在 `hint_en`。
 - 措辞以 manager `docs/ui-glossary.md` 为准；4 家内地运营商的 `name_en` 是 China Mobile / China Unicom / China Telecom / China Broadnet，其余运营商的广播名原样。
 - 老客户端只读原字段，多出来的字段不影响它；`screen/tests.rs` 断言整个响应仍在老触屏的解析缓冲内。
 
 ### `GET /capabilities`
 
-返回内部协议版本、支持的控制动作和事件类型。
+返回内部协议版本、支持的控制动作和事件类型。2026-10-06 起 `control` 列 25 个动作（`rust/src/control.rs` 的 `ACTIONS` 加 `state.set_interval`），`events` 为 `["snapshot","block"]`。
 
 `/ubus`、`/ubus/list`、`/ubus/call` 透传已删除（返回 404），`/capabilities` 也不再有 `discovery`、`passthrough`。设备操作只走下面的 `/control` 白名单。
 
@@ -180,21 +174,21 @@ data: {"ts":1782396733,...}
 
 `curl -f` / `wget` 只看状态码即可。它不代表每个设备子模块都可用。
 
-启动中（`starting`）其余接口：`/state`、`/events`、`/v2/*` 先等第一轮采完（最多 10 秒），还没好回 `503 {"ok":false,"error":{"code":"starting",…}}`，客户端按连不上处理、稍后重试；
-`/control` 先等第一轮和事务恢复做完（最多 20 秒），还没好就回 `503 busy`（同控制队列满）；`/`、`/version`、`/capabilities` 照常。
+启动中（`starting`）其余接口：`/v2/*` 先等第一轮采完（最多 10 秒），还没好回 `503 {"ok":false,"error":{"code":"starting",…}}`，客户端按连不上处理、稍后重试；
+`/control` 先等第一轮和事务恢复做完（最多 20 秒），还没好就回 `503 busy`（同控制队列满）；`/`、`/version`、`/capabilities` 照常，已删的 `/state`、`/events` 直接回 `410`。
 
 ### `GET /debug/legacy-hits`
 
-旧接口访问计数，准备删 `/state`、`/events` 和没人调用的 `/control` 动作时用：先看一段时间是零再删。
+旧接口访问计数。删 `/state`、`/events` 和没人调用的 `/control` 动作（2026-10-06）之前用它确认一段时间是零；删了以后照样数，漏改的调用者在这里能看到。
 `/v2/*` 不算。计数存在数据目录的 `legacy-hits.json`，datad 重启、换版本、整机重启都接着数。
 
 ```json
-{"ok": true, "since": 1791200000, "now": 1791286400, "open_events": 0,
+{"ok": true, "since": 1791200000, "now": 1791286400,
  "hits": {"/state": {"count": 3, "first": 1791201000, "last": 1791280000,
                      "callers": ["wget pid 1234 parent: sh /data/foo.sh"]}}}
 ```
 
-- `since`：开始数的时间（秒）；`open_events`：此刻开着的 `/events` 连接数（不存盘），大于 0 时调用者就在线上。
+- `since`：开始数的时间（秒）。
 - 键：`/state`、`/events`、`control:<动作>`；带 `source` 的控制请求记在 `control:<动作>+source`；不同的键最多 256 个，多出来的记在 `control:(other)`。
   没登录、启动中被 503 的请求也数。
 - `callers`：最近 4 个不同的调用者。本机连接按对端端口在 `/proc` 里找进程（`comm`、pid、父进程命令行），局域网连接只记 IP，找不到写 `?`。同一个键 5 秒内只找一次。
@@ -204,15 +198,16 @@ data: {"ts":1782396733,...}
 - `200`：读取或控制成功
 - `400`：请求体或参数错误
 - `401`：Token 缺失或错误
-- `404`：路径或控制动作不存在
+- `404`：路径或控制动作不存在（含 2026-10-06 删掉的控制动作，`unknown_action`）
 - `405`：请求方法错误
+- `410`：已删除的 `/state`、`/events`
 - `413`：请求体超过限制
 - `502`：设备侧 `ubus/uci` 调用失败
 - `503`：SSE 客户端达到上限；控制队列满（`busy`）；刚启动、第一轮采集还没完成（`starting`）；`/healthz` 判执行者卡住
 
 ## Command Line
 
-- `--once`：采样一次并把 JSON 输出到标准输出
+- `--once`：采样一次并把内部快照 JSON 输出到标准输出
 - `-i <ms>`：采样间隔，默认 `1000`
 - `-b <addr>` / `--bind <addr>`：监听地址，默认 `127.0.0.1`
 - `-p <port>` / `--port <port>`：监听端口，默认 `9460`
@@ -235,6 +230,6 @@ data: {"ts":1782396733,...}
 内网读取与 SSE 示例：
 
 ```sh
-curl -H 'Authorization: Bearer <token>' http://<device-lan-ip>:9461/state
-curl -N 'http://<device-lan-ip>:9461/events?access_token=<token>'
+curl -H 'Authorization: Bearer <token>' http://<device-lan-ip>:9461/v2/state
+curl -N 'http://<device-lan-ip>:9461/v2/events?access_token=<token>'
 ```

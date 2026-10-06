@@ -11,7 +11,7 @@
 |---|---|
 | [manager](https://github.com/faying/zte-u60-pro-mu5250-manager) | `zte-agent`（:9090）+ 管理网页 + 装机包 |
 | [touch-ui](https://github.com/faying/zte-u60-pro-mu5250-touch-ui) | 前面板触屏界面、屏幕守护进程、进程监督与 Wi-Fi 兜底脚本 |
-| **[data-service](https://github.com/faying/zte-u60-pro-mu5250-data-service)**（本仓库） | `zwrt-datad`：本机数据服务（`127.0.0.1:9460` 的 `/state` + SSE） |
+| **[data-service](https://github.com/faying/zte-u60-pro-mu5250-data-service)**（本仓库） | `zwrt-datad`：本机数据服务（`127.0.0.1:9460` 的 `/v2/state` + SSE） |
 
 ```
 zwrt-datad :9460 ──▶ 触屏界面 ──(eSIM 页)──▶ zte-agent :9090 ──▶ lpac ──▶ eUICC 卡
@@ -21,7 +21,7 @@ zwrt-datad :9460 ──▶ 触屏界面 ──(eSIM 页)──▶ zte-agent :909
 ## 功能
 
 - 聚合设备、CPU、内存、温度、电池，SIM、移动网络、信号、频段、流量、Wi-Fi、客户端、短信等数据
-- `GET /state` 返回完整 JSON 快照，`GET /events` 用 SSE 推送变化，默认每秒一次
+- `GET /v2/state` 返回当前各状态块，`GET /v2/events` 用 SSE 连上先推一份快照、之后只推变了的块（旧的 `/state`、`/events` 2026-10-06 已删，回 410）
 - 按机型模板规范化字段，`/capabilities` 报告当前能力（已适配 MU5250 / U60 Pro 等，见 [docs/models/](docs/models/)）
 - `POST /control` 执行受约束的蜂窝、Wi-Fi、APN、短信、电源等控制
 - 单个静态 ARM64 Rust 程序
@@ -35,8 +35,8 @@ zwrt-datad :9460 ──▶ 触屏界面 ──(eSIM 页)──▶ zte-agent :909
 /etc/init.d/zwrt-datad restart            # 重启
 cat /tmp/zwrt-datad.log                   # 日志
 curl -fsS http://127.0.0.1:9460/healthz   # 在设备上检查
-curl -fsS http://127.0.0.1:9460/state
-curl -N  http://127.0.0.1:9460/events
+curl -fsS http://127.0.0.1:9460/v2/state
+curl -N  http://127.0.0.1:9460/v2/events
 ```
 
 程序里没有自更新（原版的 OTA、云端、WebShell 和 `/ubus` 透传都已删掉），也没有写死的外网地址。要更新就自己编译，再用装机包 `./install.sh devui` 装上。
@@ -60,7 +60,8 @@ bash scripts/build.sh     # → zwrt-datad-aarch64（静态、已 strip）
 ## 文档
 
 - [docs/API.md](docs/API.md)：HTTP、SSE、鉴权与命令行参数
-- [docs/STATE_SCHEMA.md](docs/STATE_SCHEMA.md)：状态字段约定
+- [docs/STATE_V2.md](docs/STATE_V2.md)：`/v2` 状态流（块、事件、采集规则）
+- [docs/STATE_SCHEMA.md](docs/STATE_SCHEMA.md)：内部快照的字段约定（`/v2` 的块从它切出来）
 - [docs/CONTROL_API.md](docs/CONTROL_API.md)：控制动作与安全边界
 - [docs/models/](docs/models/)：各机型模板
 - [docs/RUNTIME.md](docs/RUNTIME.md)、[docs/NEIGHBOR.md](docs/NEIGHBOR.md)：原版留下的运行说明和可选功能（U60 Pro 装机包用自己的启动方式）

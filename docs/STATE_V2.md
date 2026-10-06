@@ -9,6 +9,8 @@
 - 旧接口 `/state`、`/events`、`/control` 的输出冻结，不因为这里的任何规则而改变，见第 9 节。
   例外（2026-09-26，用户批准）：`/state` 的 `sim` 加了只读字段 `spn`（卡里的服务商名，厂商存的 UCS-2 hex 解码后的文字，
   读不到是 `""`），给触屏区分 CMLink 和中国移动香港（IMSI 都是 454-12）。只加不改，旧字段一个字节都没变，golden 已重录。
+- 2026-10-06：旧 `/state`、`/events` 已删除（回 `410`，见 API.md），`/control` 也删了 57 个没人调用的动作（见 CONTROL_API.md）；
+  其余 `/control` 动作的回复照旧冻结。下文的「旧 `/state`」指 datad 内部快照的形状（STATE_SCHEMA.md），快照还在，只是不再整份对外提供。
 
 ## 1. 流的标识：epoch 和 seq
 
@@ -50,12 +52,13 @@
 它重连后先收到新的 snapshot。其他订阅者不受影响，`seq` 照样连续。
 测试（T5）：`v2_slow_subscriber_lagged_is_closed`、`v2_lagged_reconnect_gets_new_snapshot`、`v2_other_subscriber_contiguous_during_lag`
 
-`/v2/events` 和旧 `/events` 共用同一个 SSE 连接上限（现在 16 个），满了同样回 `503`（`sse_client_limit`）。
+`/v2/events` 和旧 `/events` 共用同一个 SSE 连接上限（现在 16 个），满了同样回 `503`（`sse_client_limit`）。（2026-10-06：旧 `/events` 已删，上限只管 `/v2/events`。）
 不读的客户端（写连续卡住 30 秒）会被断开、名额收回；对端已经不在的连接由 TCP keepalive / `TCP_USER_TIMEOUT`（约 60 秒）断开。
 datad 收到 SIGTERM 时主动结束所有 SSE 流（客户端看到流正常结束，按断线重连处理），3 秒内退出。
 
 **V2-9** 旧 `/events` 仍然用现有的 `watch` 通道，推完整快照，行为不变。
-测试（T1）：`legacy_events_golden_unchanged`
+（2026-10-06：旧 `/events` 已删；golden 改录 `/v2/state` 和 `/v2/events` 首条，测试随之改名。）
+测试（T1）：`v2_state_golden_unchanged`
 
 ## 4. 事件格式
 
@@ -221,7 +224,7 @@ ubusd 整个不回时，一轮从十几个对象挨个超时（socket 约 26 秒
 例：采集进行中连续发 10 个 `/control`，前 8 个按顺序执行并回复，后 2 个立即收到 503。
 测试（T4）：`control_queue_ten_requests_eight_ordered_two_busy`
 
-**V2-26** 一个动作要连着调几次 ubus 的（比如 `apn.list`），在同一个任务里依次调完，中间不插入采集。
+**V2-26** 一个动作要连着调几次 ubus 的（比如 `apn.list`，2026-10-06 已删），在同一个任务里依次调完，中间不插入采集。
 测试（T4）：`control_multi_call_runs_as_one_task`
 
 **V2-27** `/control` 成功后只把相关的块标成「立即读」（V2-21）：下一轮立即读它们，动作没有对应的块时全部块都读；**不**另起一轮采集。
@@ -234,6 +237,7 @@ ubusd 整个不回时，一轮从十几个对象挨个超时（socket 约 26 秒
 
 **V2-29** 旧的 `/state`、`/events` 和 `/v2` 从同一份状态生成。遇到 stale 的块，按今天读失败时的样子输出（字段缺失或为 `-1`），
 不输出保留的旧值。只有 `/v2` 才看得到 `stale` 和保留的旧值。
+（2026-10-06：旧 `/state`、`/events` 已删；这条现在管的是内部快照，`/v2/screen` 和 `--once` 读到的就是它。）
 测试（T4）：`legacy_state_stale_block_renders_as_failure`
 
 ## 10. 短信
@@ -277,8 +281,8 @@ datad 自己有看门狗（独立系统线程，每秒看一次）：超过 **30
 datad 启动时把 pid 写进 `ZWRT_DATAD_PID_FILE`（默认 `/var/run/zwrt-datad.pid`），应急直写脚本据此判断 datad 在不在（D18）。
 datad 先监听再采第一轮，心跳定时器和看门狗也在第一轮之前起（第一轮里每次调用都记前进）。`/healthz` 回执行者的健康：
 200 `{"ok":true,"status":"ok","exec_age_ms":…}`；第一轮还没采完回 503 `status:"starting"`，`exec_age_ms` 超过 20 秒回 503 `status:"stalled"`。
-第一轮采完之前，`/state`、`/events`、`/v2/*` 先等第一轮（最多 10 秒），还没好回 503 `{"ok":false,"error":{"code":"starting",…}}`；`/control` 先等就绪（第一轮和事务恢复做完），
-最多 20 秒，还没好就回 503 `busy`（同 V2-25）。
+第一轮采完之前，`/v2/*` 先等第一轮（最多 10 秒），还没好回 503 `{"ok":false,"error":{"code":"starting",…}}`；`/control` 先等就绪（第一轮和事务恢复做完），
+最多 20 秒，还没好就回 503 `busy`（同 V2-25）。（2026-10-06 起已删的 `/state`、`/events` 不等，直接回 410。）
 测试（E4 T3）：`stuck_call_is_reported_and_stalls_after_limit`
 测试（P1-1）：`lock_and_at_waits_count_as_progress`、`a_wait_that_never_ends_still_stalls`
 
@@ -351,7 +355,7 @@ cancelled 里 sim_changed 不能（「换过卡」）、superseded 不能（「�
 测试：`every_entry_kind_reads_as_a_sentence`、`only_the_latest_change_of_an_item_can_be_undone`
 
 **V2-42** 确认中的其他写（D40）：事务进行中（含退回中）来了影响上网的写（会话期间收 409 的那些，描述表里的动作除外；加上回自动、重拨、
-`cellular.connect/disconnect`、`vendor.call` 的 STC 小区锁和 SIM PIN/PUK/NCK），按来源：用户的（screen、web、没有 source 的旧请求）照做，
+`cellular.connect/disconnect`（2026-10-06 已删）、`vendor.call` 的 STC 小区锁和 SIM PIN/PUK/NCK），按来源：用户的（screen、web、没有 source 的旧请求）照做，
 同时取消自动退回，终态 `cancelled/other_change`（`stay` 为 `sticky`，`say_zh`「改了别的设置，不再自动退回」/ `say_en`「Other change; no auto revert」，
 英文比别的结果长，客户端按两行或截断显示；撤销规则同其他 cancelled）；自动来源（guard、scenario、scheduler、auto）回 409
 `{"ok":false,"action":…,"error":{"code":"op_busy","message":…,"op":{"op_id","item","phase"}}}`，不做、不记账。关数据/关漫游照旧插队（preempted）。
@@ -377,12 +381,12 @@ cancelled 里 sim_changed 不能（「换过卡」）、superseded 不能（「�
 `true_roaming` = 两者不是同一个国家，任一为 null 就是 null。同一国家的几个 MCC 算一个（美国 310–316、印度 404–406、日本 440/441、英国 234/235）；
 港 454、澳 455、台 466 和 460 是不同的国家；901（国际共享）、999 和不在 200–799 的值没有国家，按读不到算（null）。
 原厂 `net.roaming`（`simcard_roam`）在国外插当地卡时说「不漫游」，这里不用它。「在国内」= `serving_mcc == 460`。
-只进 `/v2`：旧 `/state` 的 `net` 冻结（第 9 节），不加这三个字段。
+只进 `/v2`：旧 `/state` 的 `net` 冻结（第 9 节），不加这三个字段。（2026-10-06：旧 `/state` 已删。）
 测试：`roaming_fields_compare_countries`
 
 ## 14. 旧 /state 读者迁到 /v2 用的块（2026-10-05）
 
-**V2-46** 为了让旧 `/state`、`/events` 的读者迁走（manager `docs/designs/u60-features.md` §0.1），`/v2` 加 7 块，`data` 和旧 `/state` 的同名对象同形，发布按 V2-17（变了才发）：
+**V2-46** 为了让旧 `/state`、`/events` 的读者迁走（2026-10-06 迁完、两个接口已删）（manager `docs/designs/u60-features.md` §0.1），`/v2` 加 7 块，`data` 和旧 `/state` 的同名对象同形，发布按 V2-17（变了才发）：
 
 | 块 | 谁要 | 什么时候算读失败（stale） |
 |---|---|---|

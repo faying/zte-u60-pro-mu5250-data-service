@@ -78,17 +78,14 @@ const NETWORK_VENDOR_CALLS: &[(&str, &str)] = &[
 ];
 
 /// D40：事务在确认或退回中时要按来源处理的「影响上网的写」：会话期间收 409 的那些（描述表里的动作除外，
-/// 同一项由引擎按覆盖处理）、回自动和重拨、连接/断开数据、`vendor.call` 的 STC 小区锁和 SIM PIN 类。
+/// 同一项由引擎按覆盖处理）、回自动和重拨、`vendor.call` 的 STC 小区锁和 SIM PIN 类。
 /// 搜网会话的步骤照会话规则；安全类写（[`is_safety`]）由调用方先排除，照旧插队。
 pub fn affects_network(action: &str, params: &Value) -> bool {
     use super::engine::{SESSION_BLOCKS, SESSION_OPTIONAL};
     if find(action).is_some() {
         return false;
     }
-    if SESSION_BLOCKS.contains(&action)
-        || SESSION_OPTIONAL.contains(&action)
-        || matches!(action, "cellular.connect" | "cellular.disconnect")
-    {
+    if SESSION_BLOCKS.contains(&action) || SESSION_OPTIONAL.contains(&action) {
         return true;
     }
     action == "vendor.call"
@@ -111,14 +108,10 @@ mod tests {
             "band.reset",
             "cell.lock_nr",
             "apn.modify",
-            "sim.set_slot",
-            "modem.airplane",
             "modem.online",
             "apn.set_pdp_type",
             "netselect.auto",
             "cellular.redial",
-            "cellular.connect",
-            "cellular.disconnect",
         ] {
             assert!(affects_network(a, &json!({})), "{a}");
         }

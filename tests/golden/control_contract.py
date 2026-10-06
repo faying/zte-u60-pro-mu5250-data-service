@@ -6,7 +6,7 @@
 请求按触屏 data.c control_send 的原样发（HTTP/1.1 + Connection: close，写完不关，等回复）：
 1. 挂起到回复：动作做完之前一个字节都不回，做完回 200 和结果。
 2. 队列满：不在事务描述表里的动作多出来的请求立即回 503，回复体逐字节固定（触屏 ui_control_should_fallback 只认 503）。
-3. state.set_interval：回复之后采样间隔真的变了（/state 的 ts 在新间隔内前进）。
+3. state.set_interval：回复之后采样间隔真的变了（快照的 ts 在新间隔内前进，从 /v2/screen 读）。
 
 E4 有意改变的行为（write-op-layer.md「旧客户端」、D14，T2），各一条：
 4. 描述表里的动作（network.set_mode）的旧请求在执行者队列满时不回 503：回和今天一样的成功、排队执行。
@@ -251,7 +251,8 @@ def write_lock_is_shared() -> None:
 
 
 def state_ts() -> float:
-    with urllib.request.urlopen("http://127.0.0.1:%d/state" % PORT, timeout=5) as r:
+    # /v2/screen 的 ts 就是当前快照的 ts（旧 /state 2026-10 已删）
+    with urllib.request.urlopen("http://127.0.0.1:%d/v2/screen" % PORT, timeout=5) as r:
         return json.load(r)["ts"]
 
 
@@ -264,7 +265,7 @@ def set_interval_applies() -> None:
     deadline = time.monotonic() + 3.0
     while state_ts() == start:
         if time.monotonic() > deadline:
-            fail("state.set_interval 500 之后 3 秒 /state 没更新")
+            fail("state.set_interval 500 之后 3 秒快照没更新")
         time.sleep(0.1)
     read_all(send('{"action":"state.set_interval","params":{"milliseconds":5000}}'), 10)
 
@@ -275,9 +276,9 @@ def journal() -> None:
     if s and s.get("phase") in ("accepted", "applying", "verifying", "rolling_back"):
         wait_final(s["op_id"])
     secret = "Contract-Secret-9917"
-    status, _ = post({"action": "wifi.configure", "params": {"section": "main_2g", "ssid": "Golden", "key": secret}})
+    status, _ = post({"action": "apn.add", "params": {"name": "golden", "apn": "internet", "password": secret}})
     if status != b"HTTP/1.1 200 OK":
-        fail("wifi.configure 没成功：%r" % status)
+        fail("apn.add 没成功：%r" % status)
     for _ in range(100):
         status, raw = post({"action": "journal.append", "source": "scenario",
                             "params": {"item": "network.mode", "result": "skipped", "reason": "user_hold"}})
@@ -293,7 +294,7 @@ def journal() -> None:
     got = [(e.get("source"), e.get("action") or e.get("item"), e.get("result"), e.get("skip")) for e in entries]
     want = [("web", "esim.switch", "ok", None),
             ("scenario", "network.mode", "skipped", "start"),
-            ("legacy", "wifi.configure", "ok", None)]
+            ("legacy", "apn.add", "ok", None)]
     if got != want:
         fail("journal.list 不对：%r" % entries)
     with open(os.path.join(OPS_DIR, "journal.jsonl"), encoding="utf-8") as f:

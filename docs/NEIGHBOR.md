@@ -1,5 +1,8 @@
 # Neighbor cell adapter
 
+> 2026-10-06：`neighbor.status`、`neighbor.set` 动作和 `/state` 的 `neighbor` 字段已删除（`/state` 整个删了，`/v2` 没有这一块）；
+> 采集器本身还在（只能用启动参数 `--neighbor` 打开），之后会一起删。下文是删除前的说明。
+
 `neighbor` 是可选的邻区采集模块，默认关闭。启用后，状态会出现在 `/state`
 及其 SSE 快照中；`--once` 不会启动诊断采集器。
 

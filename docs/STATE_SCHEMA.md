@@ -1,11 +1,9 @@
 # zwrt-datad state schema
 
-服务通过 HTTP / SSE 暴露统一状态快照：
-
-```text
-GET  /state
-SSE  /events
-```
+这份文档描述 datad 内部的统一状态快照。它原来整份由 `GET /state`、SSE `/events` 对外提供，
+2026-10-06 这两个接口删除（回 `410`，见 [`API.md`](API.md)）；快照本身还在：`/v2/state`、`/v2/events`
+的块从它切出来（块和字段的对应见 [`STATE_V2.md`](STATE_V2.md) 第 4 节、第 14 节），`/v2/screen` 由它算出。
+`zwrt-datad --once`（采一次就退出）输出的就是整份快照。
 
 消费者不应直接打 `ubus`，也不应自己扫 `key.log`。
 
@@ -246,13 +244,12 @@ SSE  /events
 
 ## Notes
 
-- `GET /state` 返回的是完整 JSON 快照。
-- `GET /events` 通过 `event: state` 推送完整 JSON；只有内容变化时才推送新快照。
+- 快照不再整份对外提供（`/state`、`/events` 2026-10-06 删除）；客户端读 `/v2` 的块，块的 `data` 和这里的同名对象同形。
 - 后端会优先根据 `device.model_name` 选择 `device.api_template`；设备侧接口选择已经由后端完成，不需要前端再猜设备应该打哪套 `ubus/uci/sysfs`。
 - `device.api_template_supported = 1` 表示当前机型已有明确模板；`0` 表示只落到了内部兼容模板，不应视为正式适配完成。
 - `battery`、`wlan`、`nfc`、`sms` 等可选块由模板决定是否输出；兼容模板会按实际接口探测结果输出。缺少整个块表示该接口不可用，块存在而字段值为 `0` 表示有效零值。
 - 当模板不输出 `battery` 时，`uci_device_info` 内的 `battery_*` 与 `power_adapter` 厂商占位字段也会同步过滤，避免消费者从兼容缓存重新推断出不存在的电池。
-- `/state.wlan` 不输出 Wi-Fi 密钥；密码只允许通过显式鉴权的 Wi-Fi 管理接口读取。
+- `wlan` 不输出 Wi-Fi 密钥；密码只允许通过显式鉴权的 Wi-Fi 管理接口读取（2026-10-06 起 datad 不再提供读密码的动作）。
 - `device.full_ubus`：旧字段，为兼容保留，恒为 `1`；`/ubus/call` 已删除，它不再表示任何能力。
 - MC8532B 的 `net` 优先读取实时 ubus，失败时回退选定的 `zte_nwinfo` UCI 缓存；`uci_device_info.radio_*` 同步暴露这组只读缓存字段，不提供任意 UCI 透传。
 - 机型适配应优先使用 `device.model_name`；`device.profile` 是基于它生成的规范化键，便于模板映射。
@@ -265,14 +262,15 @@ SSE  /events
 - `net.roaming` 与 `modems[*].net.roaming` 保留厂商当前注册状态字符串（例如 `Home`、`Roaming`）；它不是“允许数据漫游”开关。
 - `modems[*].debug.available` 表示对应 USB ADB interface 已枚举，不会在每轮状态采样中启动或调用 ADB；调试口只用于联调。
 - `runtime.cpu_usage_tenths` 与 `runtime.cpu_cores.*` 单位为百分比的十分之一，例如 `172` 表示 `17.2%`。每核心占用与频率按采样周期实时读取，不缓存计算结果。
-- 顶层 `sample_interval_ms` 是当前 datad 全局采样与 SSE 推送周期。可通过 `state.set_interval` 在 `500..5000` 毫秒范围内运行时切换；所有 SSE 客户端共享同一周期。
+- 顶层 `sample_interval_ms` 是当前 datad 全局采样周期。可通过 `state.set_interval` 在 `500..5000` 毫秒范围内运行时切换。
 - `net.lte_supported_bands`、`net.nr_sa_supported_bands`、`net.nr_nsa_supported_bands` 直接来自本轮 `nwinfo_get_netinfo`，消费者必须用它们生成锁频候选，不得合并其他机型的静态频段目录。
 - `runtime.cpu_freq_mhz` 单位为 MHz；`thermal_zones.temp_milli` 单位为毫摄氏度；`memory_kb` 单位为 KiB；`storage` 固定统计 `/data` 文件系统，`storage` 和 `throughput` 单位分别为字节和字节/秒。
-- `thermal` 是模板规范化后的温度接口，随 `/state` 与 SSE 的 `state` 事件一起发送。`thermal.cpu_celsius` 为模板 CPU 温度；MU5250、MC8532B、MC7523 和 MU5252 的 `thermal.zones` 来自主机 sysfs thermal zones，已过滤无效哨兵值和不可读 zone、按名称排序并转换为摄氏度。新消费者应使用该字段，不再自行解析 `runtime.thermal_zones[].temp_milli`。
+- `thermal` 是模板规范化后的温度接口（`/v2` 没有对应的块，`/v2/screen` 用它的 `hightemp_limit`）。`thermal.cpu_celsius` 为模板 CPU 温度；MU5250、MC8532B、MC7523 和 MU5252 的 `thermal.zones` 来自主机 sysfs thermal zones，已过滤无效哨兵值和不可读 zone、按名称排序并转换为摄氏度。新消费者应使用该字段，不再自行解析 `runtime.thermal_zones[].temp_milli`。
 - MU5252 的 `thermal.modems` 固定包含 `x75`、`v3e1`、`v3e2`。X75 温度来自主机 thermal ubus；V3E1/V3E2 每 30 秒通过固定 ADB serial 读取外挂系统的 `zte_power/adc2_temp` 并缓存。`available=false` 时 `celsius=null`；其他模板当前返回空 `modems`。
 - MU5252 额外输出 `aggregation` 与 `cooling`；其他模板完全省略这两个块。`aggregation.enabled` 仅在 `zwrt_router.network.opms_wan_mode == SMULTIWAN` 时为 `true`，`aggregation.mode` 保留厂商当前模式文本。`aggregation.provisioned` 只表示厂商是否已下发 ICG 设备配置，不输出实际 ICG ID；`state` 为 `disabled` / `unprovisioned` / `waiting` / `online`，`online` 只在 `zte_icg_agg` 进程确实持有出站 `ESTABLISHED` TCP socket 时为真。datad 会从该进程的 `/proc/<pid>/fd` 反查 socket inode，排除其本地监听端口和入站管理连接，所以不依赖可能被云端运行时下发覆盖的 `/home/icg/icg.conf`；有隧道时 `server.source=runtime` 并显示占多数的实际远端，否则回退静态配置且 `source=config`。`controller.icg_process_running` / `mwan3_running` 分别标示两个控制层是否运行。`paths[]` 来自 `mwan3 status`，同时用 `network.interface.* status` 补充底层 `interface_up/available/pending`；按 X75/V3E1/V3E2（以及实际启用时的 Ethernet）分别输出接口、跟踪/在线状态、探测延迟、丢包、时长和探测目标。路径摘要优先采用状态为 `up` 或 `online` 的实际检测目标，忽略 `reliability=1` 产生的 `skipped` 备用目标；没有在线目标时回退第一个非 `skipped` 样本。目标项中的 `up` 与 `online` 均归一化为 `online=true`。mwan3 运行时路径 `online` 表示探测在线；ICG 模式下 mwan3 不运行，`online` 改为表示底层接口已连接，并继续用 `pending/available` 区分待拨号与可用。它描述承载链路状态，不等同于 ICG 内部 TCP 隧道；mwan3 未运行时不会伪造延迟或丢包。`traffic.remaining_bytes` / `today_used_bytes` 来自厂商落盘 UCI 字节值，`remaining_raw` / `today_used_raw` 继续保留同一原始文本以兼容旧消费者。云端接口以短超时每 60 秒低频触发刷新；接口超时或未返回有效字段时继续使用 UCI 真值，不能阻塞高频主采样。
 - MU5252 还输出结构化 `multiwan`：`mode`、`active`、`service_running` 和 `sections[]`。`sections[]` 只包含 mwan3 的安全配置字段，并按 `globals` / `interface` / `member` / `policy` / `rule` 标明类型；list 选项输出为数组。不会输出原始 UCI 文本。固件只在 `mode=MULTIWAN` 时运行 mwan3；`SMULTIWAN` 是 ICG 模式，此时配置可编辑保存但不生效，延迟/丢包为空属于正常状态。
 - `cooling.fan.mode` 为 `automatic` / `custom` / `always_on`。`automatic` 启用 `sys-therm-4` 原厂三档内核曲线；`custom` 禁用该 zone，并由 datad 每秒对保存的 2–8 点曲线线性插值；`always_on` 固定 PWM 128。`cooling.fan.kernel_zone_enabled` 给出 zone 的实际状态，`always_on` 表示常开，`enabled` 是与它同值的兼容别名。`cooling.fan` 还输出当前温度、实际 PWM/百分比、80℃ 满速保护、可选 RPM 和固定 cooling level；`manual_speed_percent` 只用于读取旧配置，不再提供手动调速 action。`cooling.factory_curve` 始终返回原厂 44/48/53℃ 三档，`cooling.custom_curve` 单独返回已保存的自定义曲线；`cooling.curve` 是兼容字段，优先返回自定义曲线，没有时回退原厂曲线。三种模式均保持风扇 `thermal_enable` 开启，用户态模式还会清零 `pwm-fan` 的锁存 state，使 PWM 0 能真正停转且非零值可驱动风扇。`cooling.liquid.mode` 为 `automatic` / `low` / `high`：自动模式交还厂商 thermal；低/高档分别使用设备树实际支持的幅度 60/200，`speed_percent` 只对应这两个硬件档位。`always_on`/`enabled` 在低档或高档时为真。消费者应根据整个块是否存在决定是否显示，不得给其他机型补默认值。
+- 2026-10-06 起 `aggregation.set`、`multiwan.*.set`、`cooling.*` 控制动作已删除，上面三个块只读（`/v2` 也没有对应的块）。
 - `runtime.throughput` 优先使用 `br-lan`，回退到 WiFi 接口，最后才使用 rmnet，并采用最多 16 个样本的滚动窗口平滑 IPA 批量刷新。
 - `qos.ambr_*` 为 Mbps 字符串，保留 3 位小数；空串表示当前还没从日志里读到有效值。
 - `net.nrca` / `net.lteca`：载波聚合描述符，`;` 分隔载波、`,` 分隔字段，每个载波 11 个字段 `idx,PCI,?,band,arfcn,bw,?,rsrp,rsrq,sinr,rssi`。没有载波聚合时为空串。
@@ -286,14 +284,14 @@ SSE  /events
 
 ## Neighbor and charger direct supply
 
-`neighbor` is always present and is `enabled:false,status:disabled` by default.
-It has an independent collection lifecycle and can be enabled through
-`neighbor.set` for the current datad process. Restarting datad restores disabled;
-disabling stops the collector and removes its capture logs before returning.
+`neighbor` is always present in the internal snapshot and is
+`enabled:false,status:disabled` by default. Since 2026-10-06 it is not served
+anywhere (no `/v2` block) and the `neighbor.status` / `neighbor.set` actions are
+removed; the collector can only be started with the `--neighbor` flag.
 See [NEIGHBOR.md](NEIGHBOR.md) for every field, null handling,
 freshness, serving/CA filtering, error reasons and firmware-specific limitations.
 `no_supported_reports` explicitly distinguishes unsupported decoded signatures
-from absence of surrounding cells. The block is sent in regular SSE snapshots.
+from absence of surrounding cells.
 
 `power.direct_supply` is optional and independent of the `battery` block. It is
 included only when the charger response contains `direct_power_supply_mode`:
@@ -303,7 +301,7 @@ included only when the charger response contains `direct_power_supply_mode`:
 ```
 
 `enable` maps to true and `disable` to false. An unrecognized enum yields
-`enabled:null,mode:null`; absence is not a false value. Use
-`power.direct_supply.status` for a fresh capability read and
-`power.direct_supply.set` for verified changes. These fields describe firmware
+`enabled:null,mode:null`; absence is not a false value. The `/v2` `charger`
+block carries this object; use `power.direct_supply.set` for verified changes
+(`power.direct_supply.status` was removed on 2026-10-06). These fields describe firmware
 configuration and do not certify battery isolation or measured power flow.

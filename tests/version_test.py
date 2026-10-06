@@ -108,9 +108,9 @@ else:
             # a read waits for the first round (up to 10 s), then gets its data
             started = time.monotonic()
             threading.Timer(1, hold.unlink).start()
-            status, state = get('/state', timeout=12)
+            status, state = get('/v2/state', timeout=12)
             self.assertEqual(status, 200)
-            self.assertEqual(state['datad'], EXPECTED)
+            self.assertIn('live', state['blocks'])
             self.assertGreaterEqual(time.monotonic() - started, 0.9)
             status, body = get('/healthz')
             self.assertEqual((status, body['status'], body['ok']), (200, 'ok', True))
@@ -169,11 +169,10 @@ else:
             with request(lan_port, '/version', method='POST', auth=True) as response:
                 self.assertEqual(response.status, 405)
             for port, auth in ((local_port, False), (lan_port, True)):
-                with request(port, '/state', auth=auth) as response:
+                with request(port, '/v2/state', auth=auth) as response:
                     state = json.load(response)
-                    self.assertEqual(state['datad'], EXPECTED)
-                    self.assertEqual(state['system']['sw_version'], FIRMWARE)
-                with request(port, '/events', auth=auth) as response:
+                    self.assertEqual(state['blocks']['live']['data']['system']['sw_version'], FIRMWARE)
+                with request(port, '/v2/events', auth=auth) as response:
                     self.assertEqual(response.status, 200)
                     parts = []
                     for _ in range(300):
@@ -183,8 +182,7 @@ else:
                         elif not line.strip() and parts:
                             break
                     state = json.loads(''.join(parts))
-                    self.assertEqual(state['datad'], EXPECTED)
-                    self.assertEqual(state['system']['sw_version'], FIRMWARE)
+                    self.assertEqual(state['blocks']['live']['data']['system']['sw_version'], FIRMWARE)
         finally:
             proc.terminate()
             try:

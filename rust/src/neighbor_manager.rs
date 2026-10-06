@@ -94,23 +94,6 @@ impl Manager {
         }
         out
     }
-    pub async fn set_enabled(&mut self, enabled: bool) -> Result<Value, String> {
-        if enabled == self.enabled {
-            return Ok(self.status());
-        }
-        if enabled {
-            self.enabled = true;
-            self.latest = disabled();
-            self.latest["enabled"] = json!(true);
-            self.latest["status"] = json!("starting");
-            self.latest["reason"] = json!("none");
-            self.start().await?;
-        } else {
-            self.shutdown().await;
-            self.latest = disabled();
-        }
-        Ok(self.status())
-    }
     async fn start(&mut self) -> Result<(), String> {
         if !self.diag.is_file() {
             self.latest["status"] = json!("dependency_missing");

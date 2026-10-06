@@ -48,7 +48,6 @@ struct Book {
     dirty: bool,
     last_save: Option<Instant>,
     last_resolve: BTreeMap<String, Instant>,
-    open_events: u64,
 }
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -76,7 +75,6 @@ fn book() -> &'static Mutex<Book> {
             dirty,
             last_save: None,
             last_resolve: BTreeMap::new(),
-            open_events: 0,
         })
     })
 }
@@ -154,26 +152,6 @@ pub async fn hit(key: &str, peer: Option<SocketAddr>) {
     let _ = tokio::task::spawn_blocking(run).await;
 }
 
-/// `/events` 连接开着的个数（不写盘）：读数时大于 0 说明调用者此刻还在，可以当场找。
-pub struct OpenEvents;
-
-impl OpenEvents {
-    pub fn new() -> Self {
-        if let Ok(mut b) = book().lock() {
-            b.open_events += 1;
-        }
-        OpenEvents
-    }
-}
-
-impl Drop for OpenEvents {
-    fn drop(&mut self) {
-        if let Ok(mut b) = book().lock() {
-            b.open_events = b.open_events.saturating_sub(1);
-        }
-    }
-}
-
 /// 有改动就写盘：`force` 马上写，否则距上次至少一分钟。写失败下次再试。
 pub fn flush(force: bool) {
     let (path, bytes) = {
@@ -216,7 +194,6 @@ pub fn report() -> Value {
         "ok": true,
         "since": b.saved.since,
         "now": now(),
-        "open_events": b.open_events,
         "hits": b.saved.hits.iter().map(|(k, h)| (k.clone(), json!({
             "count": h.count, "first": h.first, "last": h.last, "callers": h.callers,
         }))).collect::<serde_json::Map<_, _>>(),

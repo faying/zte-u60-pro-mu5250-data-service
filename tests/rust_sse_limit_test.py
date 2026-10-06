@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""SSE client limit: 16 concurrent /events streams, the 17th gets 503, and a
-closed stream frees its slot. /v2/events shares the same 16 slots
-(docs/STATE_V2.md section 3) and starts with a snapshot event.
+"""SSE client limit: 16 concurrent /v2/events streams (docs/STATE_V2.md
+section 3), each starting with a snapshot event; the 17th gets 503, and a
+closed stream frees its slot. The old /events is gone (410).
 
 Usage: rust_sse_limit_test.py PATH_TO_ZWRT_DATAD   (starts it against the mocks)
        rust_sse_limit_test.py PORT                 (tests an already running instance)
@@ -18,7 +18,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
-def connect(port, path="/events"):
+def connect(port, path="/v2/events"):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
     connection.request("GET", path)
     return connection, connection.getresponse()
@@ -27,22 +27,23 @@ def connect(port, path="/events"):
 def check(port):
     clients = []
     try:
-        for i in range(16):
-            path = "/events" if i < 8 else "/v2/events"
-            connection, response = connect(port, path)
-            assert response.status == 200, (path, response.status)
-            if path == "/v2/events":
-                assert response.getheader("content-type") == "text/event-stream"
-                assert response.readline() == b"event: snapshot\n"
+        for _ in range(16):
+            connection, response = connect(port)
+            assert response.status == 200, response.status
+            assert response.getheader("content-type") == "text/event-stream"
+            assert response.readline() == b"event: snapshot\n"
             clients.append((connection, response))
-        for path in ("/events", "/v2/events"):
-            rejected, response = connect(port, path)
-            assert response.status == 503, (path, response.status)
-            response.read()
-            rejected.close()
+        rejected, response = connect(port)
+        assert response.status == 503, response.status
+        response.read()
+        rejected.close()
+        gone, response = connect(port, "/events")
+        assert response.status == 410, response.status
+        response.read()
+        gone.close()
 
-        # 关一个 /events、再关一个 /v2/events：两种连接都要把名额还回来。
-        # 新连接一直占着名额，所以第二次必须是刚关掉的那个 /v2 连接腾出来的。
+        # 关最早的、再关最新的：名额都要还回来。
+        # 新连接一直占着名额，所以第二次必须是刚关掉的那个连接腾出来的。
         for closing in (clients.pop(0), clients.pop()):
             closing[0].close()
             clients.append(wait_slot(port))
@@ -71,7 +72,7 @@ def wait_ready(port, proc):
             raise AssertionError(f"zwrt-datad exited early: {proc.returncode}")
         try:
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
-            connection.request("GET", "/state")
+            connection.request("GET", "/v2/state")
             response = connection.getresponse()
             response.read()
             connection.close()
@@ -122,7 +123,7 @@ def main():
         check(int(target))
     else:
         run_binary(pathlib.Path(target).resolve())
-    print("sse limit: 16 streams (/events + /v2/events) accepted, 17th rejected with 503, slot released PASS")
+    print("sse limit: 16 /v2/events streams accepted, 17th rejected with 503, slot released PASS")
 
 
 if __name__ == "__main__":

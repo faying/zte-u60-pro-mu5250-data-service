@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Legacy access counter (u60-platform item 3): /state, /events and each
-/control action are counted at GET /debug/legacy-hits, /events streams are
-also counted while open, and the counts survive a restart (legacy-hits.json
-in the data dir).
+/control action are counted at GET /debug/legacy-hits, and the counts survive
+a restart (legacy-hits.json in the data dir). /state and /events are removed
+(410) and removed /control actions answer 404, but both are still counted so a
+caller that was missed shows up there.
 
 Usage: rust_legacy_hits_test.py PATH_TO_ZWRT_DATAD
 """
@@ -92,14 +93,11 @@ def main():
             # /v2 不算旧接口。
             assert request(port, "GET", "/v2/state")[0] == 200
             for _ in range(2):
-                assert request(port, "GET", "/state")[0] == 200
-            request(port, "POST", "/control", json.dumps({"action": "wifi.status"}))
+                assert request(port, "GET", "/state")[0] == 410
+            assert request(port, "GET", "/events")[0] == 410
+            assert request(port, "POST", "/control", json.dumps({"action": "wifi.status"}))[0] == 404
             request(port, "POST", "/control", json.dumps({"action": "wifi.status", "source": "test"}))
-            stream = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-            stream.request("GET", "/events")
-            assert stream.getresponse().status == 200
             now = hits(port)
-            assert now["open_events"] == 1, now
             got = {k: v["count"] for k, v in now["hits"].items()}
             assert got == {
                 "/state": 2,
@@ -112,13 +110,6 @@ def main():
                 time.sleep(0.5)
                 callers = hits(port)["hits"]["/state"]["callers"]
                 assert callers and callers[0].startswith("python"), callers
-            stream.close()
-            for _ in range(50):
-                if hits(port)["open_events"] == 0:
-                    break
-                time.sleep(0.1)
-            else:
-                raise AssertionError("open_events did not drop after close")
         finally:
             stop(proc)
         # 重启后接着数，since 不变。
@@ -129,7 +120,7 @@ def main():
             assert again["hits"]["/state"]["count"] == 2, again
         finally:
             stop(proc)
-    print("legacy hits: /state, /events, /control per action counted, open streams tracked, kept across restart PASS")
+    print("legacy hits: /state, /events, /control per action counted (removed ones too), kept across restart PASS")
 
 
 if __name__ == "__main__":

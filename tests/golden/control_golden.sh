@@ -49,7 +49,7 @@ openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$TMP/web-priv
 openssl pkey -in "$TMP/web-private.pem" -pubout -out "$TMP/web-public.pem" 2>/dev/null
 export MOCK_WEB_PUBLIC_KEY_FILE="$TMP/web-public.pem"
 
-# -i 5000：用例之间基本不会插进采集轮（插进来也只影响 /state，不影响回复）。
+# -i 5000：用例之间基本不会插进采集轮（插进来也只影响快照，不影响回复）。
 "$BIN" -i 5000 --bind 127.0.0.1 --port "$PORT" --data-dir "$TMP/fx/data" >"$TMP/server.log" 2>&1 &
 PID=$!
 i=0

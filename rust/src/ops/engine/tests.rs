@@ -1024,12 +1024,7 @@ async fn session_holds_the_lock_for_connectivity_writes_only() {
         Submit::Busy(d) => assert_eq!(d["action"], "netselect.session"),
         other => panic!("{other:?}"),
     }
-    for a in [
-        "cellular.set",
-        "band.set_lte",
-        "apn.enable",
-        "modem.airplane",
-    ] {
+    for a in ["cellular.set", "band.set_lte", "apn.enable", "modem.online"] {
         assert!(
             matches!(e.session_gate(a, None), Err(SessionError::Busy(_))),
             "{a}"

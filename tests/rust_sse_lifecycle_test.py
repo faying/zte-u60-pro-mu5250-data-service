@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SSE connection lifecycle (P2-4 of the 2026-10-04 cross-service audit).
 
-1. Shutdown: with /events and /v2/events clients connected and silent (one
+1. Shutdown: with /v2/events clients connected and silent (one
    reading, one not reading), SIGTERM makes zwrt-datad exit cleanly (code 0)
    well inside procd's term_timeout (~5 s), and the reading client sees the
    stream end instead of hanging.
@@ -67,7 +67,7 @@ def start(base, port, extra_env=None):
             raise AssertionError(f"zwrt-datad exited early: {proc.returncode}")
         try:
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
-            connection.request("GET", "/state")
+            connection.request("GET", "/v2/state")
             response = connection.getresponse()
             response.read()
             connection.close()
@@ -144,16 +144,16 @@ def check_shutdown(with_stalled):
         silent = None
         stuck = None
         try:
-            reader = Reader(port, "/events")
+            reader = Reader(port, "/v2/events")
             reader.start()
             # 只连着、不读、不发：/v2/events。
             silent = raw_stream(port, "/v2/events")
             deadline = time.monotonic() + 5
             while reader.bytes == 0 and time.monotonic() < deadline:
                 time.sleep(0.05)
-            assert reader.bytes > 0, "/events sent nothing"
+            assert reader.bytes > 0, "/v2/events sent nothing"
             if with_stalled:
-                stuck = raw_stream(port, "/events", rcvbuf=1024)
+                stuck = raw_stream(port, "/v2/events", rcvbuf=1024)
                 time.sleep(3)  # 让它的发送缓冲写满（默认写超时 30 s，不会先被断）
             time.sleep(0.5)
             started = time.monotonic()
@@ -165,7 +165,7 @@ def check_shutdown(with_stalled):
             took = time.monotonic() - started
             assert code == 0, f"exit code {code} (SIGKILL/crash instead of a clean exit)"
             assert took < limit, f"exit took {took:.2f}s (limit {limit}s)"
-            assert reader.eof.wait(3), "/events client did not see the stream end"
+            assert reader.eof.wait(3), "/v2/events client did not see the stream end"
             what = "3 SSE clients (one stalled, buffer full)" if with_stalled else "2 SSE clients"
             print(f"shutdown: exited 0 in {took:.2f}s with {what} connected")
         finally:
@@ -189,23 +189,21 @@ def check_write_timeout():
         )
         stalled = []
         try:
-            reader = Reader(port, "/events")
+            reader = Reader(port, "/v2/events")
             reader.start()
             # 15 个读到一半就不读的客户端：接收缓冲开到最小，一个字节都不读。
             for i in range(15):
-                path = "/events" if i % 2 else "/v2/events"
-                stalled.append(raw_stream(port, path, rcvbuf=1024))
+                stalled.append(raw_stream(port, "/v2/events", rcvbuf=1024))
             time.sleep(0.5)
-            for path in ("/events", "/v2/events"):
-                connection, response = status_of(port, path)
-                assert response.status == 503, (path, response.status)
-                response.read()
-                connection.close()
+            connection, response = status_of(port, "/v2/events")
+            assert response.status == 503, response.status
+            response.read()
+            connection.close()
 
             started = time.monotonic()
             freed = None
             while time.monotonic() - started < FREE_LIMIT:
-                connection, response = status_of(port, "/events")
+                connection, response = status_of(port, "/v2/events")
                 if response.status == 200:
                     freed = time.monotonic() - started
                     connection.close()
