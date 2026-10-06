@@ -66,7 +66,7 @@ When building the install kit, point to it with `DATAD_BIN=…/zwrt-datad-aarch6
 - [docs/STATE_SCHEMA.md](docs/STATE_SCHEMA.md): fields of the internal snapshot the `/v2` blocks are cut from
 - [docs/CONTROL_API.md](docs/CONTROL_API.md): control actions and safety boundaries
 - [docs/models/](docs/models/): model templates
-- [docs/RUNTIME.md](docs/RUNTIME.md), [docs/NEIGHBOR.md](docs/NEIGHBOR.md): runtime notes and optional features from the original (the U60 Pro install kit uses its own startup method)
+- [docs/RUNTIME.md](docs/RUNTIME.md): runtime notes from the original (the U60 Pro install kit uses its own startup method)
 
 ## Credits
 

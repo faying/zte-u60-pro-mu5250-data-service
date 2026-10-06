@@ -26,13 +26,9 @@ MOCK
 chmod +x "$TMP/ubus"
 export ZWRT_DATAD_UBUS_BIN="$TMP/ubus"
 export ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh"
-export ZWRT_DATAD_MWAN3_INIT=/usr/bin/true
 export ZWRT_DATAD_IW_BIN="$ROOT/tests/mock_iw.sh"
-export ZWRT_DATAD_HOSTAPD_CLI_BIN="$ROOT/tests/mock_hostapd_cli.sh"
-export ZWRT_DATAD_WIFI_RUNTIME_DIR="$TMP/wifi-runtime"
-export ZWRT_DATAD_VENDOR_WIFI_DIR="$TMP/vendor-wifi"
 export MOCK_UCI_STATE_DIR="$TMP/uci-state"
-mkdir -p "$TMP/data" "$ZWRT_DATAD_VENDOR_WIFI_DIR"
+mkdir -p "$TMP/data"
 
 one_round() { # $1 = TERM | KILL
     rm -f "$TMP"/listen.*.pid

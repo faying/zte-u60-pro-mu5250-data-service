@@ -6,8 +6,8 @@
 setup_fixture() {
     F=$1
     rm -rf "$F"
-    mkdir -p "$F/data" "$F/vendor-wifi" "$F/net" "$F/proc" "$F/wifi-runtime" "$F/uci-state"
-    mkdir -p "$F/state-net/rmnet_data0/statistics" "$F/state-thermal/thermal_zone0" "$F/zone"
+    mkdir -p "$F/data" "$F/uci-state"
+    mkdir -p "$F/state-net/rmnet_data0/statistics" "$F/state-thermal/thermal_zone0"
     printf '1000\n' >"$F/state-net/rmnet_data0/statistics/rx_bytes"
     printf '2000\n' >"$F/state-net/rmnet_data0/statistics/tx_bytes"
     printf 'cpuss-0\n' >"$F/state-thermal/thermal_zone0/type"
@@ -15,14 +15,6 @@ setup_fixture() {
     printf 'fixture-boot-id\n' >"$F/boot-id"
     printf '4102444800 00:11:22:33:44:99 192.168.0.99 historical-offline *\n' >"$F/dhcp.leases"
     printf '1\n' >"$F/sim-slot"
-    printf 'fixture\n' >"$F/key.log"
-    for base in wlan0 wlan1; do
-        printf 'driver=nl80211\ninterface=old\nssid=old\n' >"$F/vendor-wifi/hostapd-$base.conf"
-    done
-    for file in pwm1 fan-thermal fan-state liquid-thermal liquid-drive zone/mode zone/temp \
-        zone/trip_point_0_temp zone/trip_point_0_hyst zone/trip_point_1_temp zone/trip_point_1_hyst \
-        zone/trip_point_2_temp zone/trip_point_2_hyst; do : >"$F/$file"; done
-    printf '47000\n' >"$F/zone/temp"
     # 宿主机 /proc、/sys 换成固定内容（ZWRT_DATAD_HOST_ROOT）；host/data 故意不建，存储读数固定为 0
     H=$F/host
     mkdir -p "$H/proc/net" "$H/sys/devices/system/cpu/cpu0/cpufreq" \
@@ -42,24 +34,11 @@ setup_fixture() {
     printf '350000\n' >"$H/sys/class/power_supply/battery/current_now"
     export ZWRT_DATAD_HOST_ROOT="$H" ZWRT_DATAD_PROC_NET_TCP="$H/proc/net/tcp"
     export MOCK_CALL_LOG="$F/calls.log"
-    export ZWRT_DATAD_WIFI_RUNTIME_DIR="$F/wifi-runtime"
-    export ZWRT_DATAD_VENDOR_WIFI_DIR="$F/vendor-wifi"
-    export ZWRT_DATAD_NET_CLASS_DIR="$F/net" MOCK_NET_CLASS_DIR="$F/net"
     export ZWRT_DATAD_NET_CLASS_ROOT="$F/state-net"
     export ZWRT_DATAD_THERMAL_ROOT="$F/state-thermal"
-    export ZWRT_DATAD_PROC_ROOT="$F/proc"
-    export ZWRT_DATAD_QOS_LOG="$F/key.log" ZWRT_DATAD_QOS_LOG_ROTATED="$F/key.log.0"
     export ZWRT_DATAD_DHCP_LEASES_PATH="$F/dhcp.leases"
     export MOCK_UCI_STATE_DIR="$F/uci-state"
     export MOCK_SIM_SLOT_FILE="$F/sim-slot"
-    export ZWRT_DATAD_WIFI_CONFIG="$F/datad_wifi"
-    export ZWRT_DATAD_COOLING_CONFIG="$F/cooling.conf"
-    export ZWRT_DATAD_FAN_PWM_PATH="$F/pwm1"
-    export ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$F/fan-thermal"
-    export ZWRT_DATAD_FAN_COOLING_STATE_PATH="$F/fan-state"
-    export ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$F/liquid-thermal"
-    export ZWRT_DATAD_LIQUID_DRIVE_PATH="$F/liquid-drive"
-    export ZWRT_DATAD_COOLING_ZONE_PATH="$F/zone"
     export ZWRT_DATAD_BOOT_ID_PATH="$F/boot-id"
     # E4 事务落盘目录（pending.json）：每个情形一个干净的
     export ZWRT_DATAD_OPS_DIR="$F/ops"

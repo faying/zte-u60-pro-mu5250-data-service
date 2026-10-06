@@ -14,9 +14,8 @@ and is not used for new releases.
 | `/capabilities` | exact 79-action legacy set (25 actions since 2026-10-06; `events` is `["snapshot","block"]`), legacy transport metadata (discovery/passthrough removed with `/ubus`), duplicate guard and formal 404 unknown-action behavior | complete |
 | `/ubus`, `/ubus/list`, `/ubus/call` | removed in this fork (404) | — |
 | static and dynamic authentication | static token, LAN Basic login, vendor-token exchange, 48-byte-hex sessions and sliding expiry implemented | supported-device login smoke |
-| normalized device state | MC7523 structure complete; battery, NFC, authenticated/normalized SMS, thermal, bounded QoS, TopFlow aggregation/multi-WAN/cooling and slot-aware MU5252 modem state ported | MU5250 and MC8532B device value comparisons remain outside the local-only rewrite gate |
+| normalized device state | MC7523 structure complete; battery, NFC, authenticated/normalized SMS, thermal, bounded QoS, TopFlow aggregation/multi-WAN and slot-aware MU5252 modem state ported | MU5250 and MC8532B device value comparisons remain outside the local-only rewrite gate |
 | allow-listed device controls | all 79 legacy actions implemented (57 unused ones removed on 2026-10-06, now 404 `unknown_action`); local fixtures cover fixed UBus mapping, validation, rollback, SMS RSA/AES and injection rejection | supported-device acceptance remains intentionally deferred |
-| bounded neighbor QTrace parser | parser and lifecycle implemented; original parser suite passes (the `neighbor.*` actions and HTTP suite were removed on 2026-10-06) | final supported-device smoke |
 | cloud config and runtime | removed in this fork (`/cloud/*` 404) | — |
 | signed OTA | removed in this fork (`/ota/*` 404); updates are built and deployed by hand | — |
 

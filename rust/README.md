@@ -11,7 +11,8 @@ The compatibility target is the public behavior documented in `docs/API.md`,
 removed on 2026-10-06 (HTTP 410).
 
 The binary includes normalized state, bounded SSE, authentication, allow-listed
-controls and neighbor parsing. The upstream cloud client, signed OTA self-update,
-WebShell and `/ubus` passthrough were removed in this fork (`--webshell` is kept
-as a hidden no-op flag for old start scripts). CI runs the Rust unit/golden tests,
-the control integration suite, the service-token, version and neighbor parser suites.
+controls. The upstream cloud client, signed OTA self-update,
+WebShell and `/ubus` passthrough were removed in this fork, and on 2026-10-06 the
+neighbor collector, fan/liquid cooling and extra SSIDs (`--webshell` and `--neighbor`
+are kept as hidden no-op flags for old start scripts). CI runs the Rust unit/golden tests,
+the control integration suite, the service-token and version suites.

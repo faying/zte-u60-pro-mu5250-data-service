@@ -3,7 +3,6 @@ use crate::{
     block::{self, Hub},
     executor::{self, Executor, RoundDriver},
     model::{DatadVersion, Snapshot},
-    neighbor_manager::Manager as NeighborManager,
     state, v2,
 };
 use anyhow::Result;
@@ -40,7 +39,6 @@ struct Inner {
     sse_slots: Arc<Semaphore>,
     /// `/v2` 的流（epoch + broadcast），事件由 `Hub` 在锁里发进来。
     feed: Arc<v2::Feed>,
-    neighbor: Mutex<NeighborManager>,
     /// E4 写操作层：事务引擎（`ops/`）。
     ops: crate::ops::Engine<crate::ops::UbusDevice>,
     /// 启动进度（`App::start`）：监听先起来，第一轮采集和事务恢复在后台做。
@@ -94,12 +92,7 @@ pub fn write_pid_file() {
 }
 
 impl App {
-    pub async fn new(
-        data_dir: PathBuf,
-        interval: Duration,
-        token: Option<String>,
-        neighbor_enabled: bool,
-    ) -> Result<Self> {
+    pub async fn new(data_dir: PathBuf, interval: Duration, token: Option<String>) -> Result<Self> {
         let feed = v2::Feed::new(v2::CAPACITY);
         let hub = Arc::new(Hub::new(
             block::phase1_blocks(),
@@ -144,7 +137,6 @@ impl App {
                 snapshot: RwLock::new(placeholder),
                 tx,
                 exec,
-                neighbor: Mutex::new(NeighborManager::new(neighbor_enabled)),
                 _data_dir: data_dir,
                 token,
                 sessions: Mutex::new(Sessions::default()),
@@ -162,23 +154,14 @@ impl App {
     /// 只调一次。
     pub async fn start(&self) {
         let app = self;
-        crate::cooling::tick().await;
-        crate::extra_wifi::tick().await;
         // 第一轮在执行者里立即采（块 + 旧采集），之后执行者自己「睡一个采样间隔 → 一轮」。
         let interval_ms = app.inner.interval.as_millis() as u64;
         let hub = app.inner.exec.hub().clone();
-        let mut initial = app
+        let initial = app
             .inner
             .exec
             .round_now(async move { state::collect(interval_ms, &hub).await })
             .await;
-        {
-            let mut neighbor = app.inner.neighbor.lock().await;
-            neighbor
-                .tick(initial.fields.get("net").unwrap_or(&Value::Null))
-                .await;
-            initial.fields.insert("neighbor".into(), neighbor.status());
-        }
         *app.inner.snapshot.write().await = initial.clone();
         app.inner.tx.send_replace(initial);
         app.inner.stage.send_replace(Stage::Snapshot);
@@ -233,18 +216,10 @@ impl App {
     pub async fn snapshot(&self) -> Snapshot {
         self.inner.snapshot.read().await.clone()
     }
-    /// 一轮里的旧采集（在执行者里跑，块已经读完）。别在持有 neighbor/snapshot 锁时调 ubus：
+    /// 一轮里的旧采集（在执行者里跑，块已经读完）。别在持有 snapshot 锁时调 ubus：
     /// 控制任务只在 `ubus_ttl` 这类安全点插进来，这里的锁段里没有安全点。
     async fn refresh_snapshot(&self) {
-        crate::cooling::tick().await;
-        crate::extra_wifi::tick().await;
-        let mut next = state::collect(self.inner.exec.interval_ms(), self.inner.exec.hub()).await;
-        let mut neighbor = self.inner.neighbor.lock().await;
-        neighbor
-            .tick(next.fields.get("net").unwrap_or(&Value::Null))
-            .await;
-        next.fields.insert("neighbor".into(), neighbor.status());
-        drop(neighbor);
+        let next = state::collect(self.inner.exec.interval_ms(), self.inner.exec.hub()).await;
         // V2-34：op 块每轮交一次（进行中时倒计时跟着走）。
         self.inner.ops.publish_now();
         let mut old = self.inner.snapshot.write().await;
@@ -329,7 +304,6 @@ impl App {
                 Ok(())
             }
         };
-        self.inner.neighbor.lock().await.shutdown().await;
         result?;
         Ok(())
     }
@@ -1260,14 +1234,11 @@ async fn shutdown(app: App) {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
-    // 收到 SIGTERM/SIGINT：先让 SSE 流结束（P2-4），再同时收掉 ubus listen 和邻区扫描的子进程（各最多 2 秒），
+    // 收到 SIGTERM/SIGINT：先让 SSE 流结束（P2-4），再收掉 ubus listen 的子进程（最多 2 秒），
     // 然后 axum 等连接收尾（`serve` 里另有总上限）。
     app.inner.stop.send_replace(true);
     let _ = tokio::task::spawn_blocking(|| crate::legacy_hits::flush(true)).await;
-    tokio::join!(
-        crate::ubus::listen::shutdown(std::time::Duration::from_secs(2)),
-        async { app.inner.neighbor.lock().await.shutdown().await },
-    );
+    crate::ubus::listen::shutdown(std::time::Duration::from_secs(2)).await;
 }
 
 #[cfg(test)]

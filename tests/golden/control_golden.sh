@@ -31,10 +31,7 @@ case "$MODE" in record | check) ;; *) echo "usage: control_golden.sh record|chec
 export TZ=UTC LC_ALL=C
 export ZWRT_DATAD_UBUS_BIN="$HERE/fail_ubus.sh"
 export ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh"
-export ZWRT_DATAD_MWAN3_INIT=/usr/bin/true
 export ZWRT_DATAD_IW_BIN="$ROOT/tests/mock_iw.sh"
-export ZWRT_DATAD_HOSTAPD_BIN="$ROOT/tests/mock_hostapd.py"
-export ZWRT_DATAD_HOSTAPD_CLI_BIN="$ROOT/tests/mock_hostapd_cli.sh"
 export ZWRT_DATAD_SMS_V3E1_URL="http://127.0.0.1:1/goform/goform_set_cmd_process"
 export GOLDEN_FAIL_FILE="$TMP/fail"
 # E4 事务：契约测试里锁被占的那段要够长，但结束得快

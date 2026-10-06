@@ -255,14 +255,7 @@ async fn executor_is_only_ubus_caller() {
         ("sms.rs", include_str!("../sms.rs")),
         ("state.rs", include_str!("../state.rs")),
         ("wifi.rs", include_str!("../wifi.rs")),
-        ("extra_wifi.rs", include_str!("../extra_wifi.rs")),
-        ("cooling.rs", include_str!("../cooling.rs")),
         ("qos.rs", include_str!("../qos.rs")),
-        ("neighbor.rs", include_str!("../neighbor.rs")),
-        (
-            "neighbor_manager.rs",
-            include_str!("../neighbor_manager.rs"),
-        ),
         ("block.rs", include_str!("../block.rs")),
         ("main.rs", include_str!("../main.rs")),
     ];

@@ -64,7 +64,7 @@ bash scripts/build.sh     # → zwrt-datad-aarch64（静态、已 strip）
 - [docs/STATE_SCHEMA.md](docs/STATE_SCHEMA.md)：内部快照的字段约定（`/v2` 的块从它切出来）
 - [docs/CONTROL_API.md](docs/CONTROL_API.md)：控制动作与安全边界
 - [docs/models/](docs/models/)：各机型模板
-- [docs/RUNTIME.md](docs/RUNTIME.md)、[docs/NEIGHBOR.md](docs/NEIGHBOR.md)：原版留下的运行说明和可选功能（U60 Pro 装机包用自己的启动方式）
+- [docs/RUNTIME.md](docs/RUNTIME.md)：原版留下的运行说明（U60 Pro 装机包用自己的启动方式）
 
 ## 致谢
 

@@ -20,38 +20,17 @@ export ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh"
 export MOCK_CALL_LOG="$TMP/calls.log"
 export ZWRT_DATAD_OPS_DIR="$TMP/ops"
 export ZWRT_DATAD_WRITE_LOCK="$TMP/write.lock" ZWRT_DATAD_PID_FILE="$TMP/zwrt-datad.pid"
-export ZWRT_DATAD_MWAN3_INIT=/usr/bin/true
 export ZWRT_DATAD_IW_BIN="$ROOT/tests/mock_iw.sh"
-export ZWRT_DATAD_HOSTAPD_BIN="$ROOT/tests/mock_hostapd.py"
-export ZWRT_DATAD_HOSTAPD_CLI_BIN="$ROOT/tests/mock_hostapd_cli.sh"
-export ZWRT_DATAD_WIFI_RUNTIME_DIR="$TMP/wifi-runtime"
-export ZWRT_DATAD_VENDOR_WIFI_DIR="$TMP/vendor-wifi"
-export ZWRT_DATAD_NET_CLASS_DIR="$TMP/net"
 export ZWRT_DATAD_NET_CLASS_ROOT="$TMP/state-net"
 export ZWRT_DATAD_THERMAL_ROOT="$TMP/state-thermal"
-export ZWRT_DATAD_PROC_ROOT="$TMP/proc"
-export MOCK_NET_CLASS_DIR="$ZWRT_DATAD_NET_CLASS_DIR"
-export ZWRT_DATAD_QOS_LOG="$TMP/key.log"
-export ZWRT_DATAD_QOS_LOG_ROTATED="$TMP/key.log.0"
 export ZWRT_DATAD_DHCP_LEASES_PATH="$TMP/dhcp.leases"
-export MOCK_IWINFO_DELAY_FILE="$TMP/iwinfo-delay.count"
-export MOCK_IWINFO_DELAY_CALLS=3
 export MOCK_UCI_STATE_DIR="$TMP/uci-state"
 export MOCK_SIM_SLOT_FILE="$TMP/sim-slot"
 export MOCK_SMS_COUNT_FILE="$TMP/sms-count"
 export MOCK_LISTEN_EVENTS_FILE="$TMP/listen-events"
 export MOCK_LISTEN_LOG="$TMP/listen.log"
 : >"$MOCK_LISTEN_EVENTS_FILE"
-export ZWRT_DATAD_WIFI_CONFIG="$TMP/datad_wifi"
-export ZWRT_DATAD_COOLING_CONFIG="$TMP/cooling.conf"
-export ZWRT_DATAD_FAN_PWM_PATH="$TMP/pwm1"
-export ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH="$TMP/fan-thermal"
-export ZWRT_DATAD_FAN_COOLING_STATE_PATH="$TMP/fan-state"
-export ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH="$TMP/liquid-thermal"
-export ZWRT_DATAD_LIQUID_DRIVE_PATH="$TMP/liquid-drive"
-export ZWRT_DATAD_COOLING_ZONE_PATH="$TMP/zone"
 mkdir -p "$TMP/data"
-mkdir -p "$ZWRT_DATAD_VENDOR_WIFI_DIR" "$ZWRT_DATAD_NET_CLASS_DIR" "$ZWRT_DATAD_PROC_ROOT"
 mkdir -p "$ZWRT_DATAD_NET_CLASS_ROOT/rmnet_data0/statistics"
 mkdir -p "$ZWRT_DATAD_THERMAL_ROOT/thermal_zone0"
 printf '1000\n' >"$ZWRT_DATAD_NET_CLASS_ROOT/rmnet_data0/statistics/rx_bytes"
@@ -69,27 +48,6 @@ SMS_PORT=$((PORT + 1))
 "$ROOT/tests/mock_sms_server.py" "$SMS_PORT" "$TMP/sms-http.log" &
 SMS_PID=$!
 export ZWRT_DATAD_SMS_V3E1_URL="http://127.0.0.1:$SMS_PORT/goform/goform_set_cmd_process"
-for base in wlan0 wlan1; do
-    cat >"$ZWRT_DATAD_VENDOR_WIFI_DIR/hostapd-$base.conf" <<'EOF'
-driver=nl80211
-interface=old
-ssid=old
-wpa_passphrase=must-not-survive
-wpa_key_mgmt=WPA-PSK
-vendor_element=kept
-EOF
-done
-mkdir -p "$ZWRT_DATAD_COOLING_ZONE_PATH"
-for file in "$ZWRT_DATAD_FAN_PWM_PATH" "$ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH" \
-    "$ZWRT_DATAD_FAN_COOLING_STATE_PATH" "$ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH" \
-    "$ZWRT_DATAD_LIQUID_DRIVE_PATH" "$ZWRT_DATAD_COOLING_ZONE_PATH/mode" \
-    "$ZWRT_DATAD_COOLING_ZONE_PATH/temp" \
-    "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_0_temp" "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_0_hyst" \
-    "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_1_temp" "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_1_hyst" \
-    "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_2_temp" "$ZWRT_DATAD_COOLING_ZONE_PATH/trip_point_2_hyst"; do : >"$file"; done
-printf '47000\n' >"$ZWRT_DATAD_COOLING_ZONE_PATH/temp"
-printf 'fixture\n' >"$ZWRT_DATAD_QOS_LOG"
-printf 'rotated\n' >"$ZWRT_DATAD_QOS_LOG_ROTATED"
 
 "${ZWRT_DATAD_TEST_BIN:-$ROOT/rust/target/debug/zwrt-datad}" --bind 127.0.0.1 --port "$PORT" \
     --data-dir "$TMP/data" >"$TMP/server.log" 2>&1 &
@@ -103,31 +61,6 @@ done
 post() {
     curl -fsS -H 'content-type: application/json' --data-binary "$1" \
         "http://127.0.0.1:$PORT/control"
-}
-file_mode() {
-    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
-}
-process_gone() {
-    pid=$1
-    attempt=0
-    while kill -0 "$pid" 2>/dev/null; do
-        if [ ! -e "$ZWRT_DATAD_PROC_ROOT/$pid/cmdline" ]; then
-            return 0
-        fi
-        attempt=$((attempt + 1))
-        [ "$attempt" -lt 50 ] || return 1
-        sleep 0.02
-    done
-}
-wait_file_value() {
-    path=$1
-    expected=$2
-    attempt=0
-    while [ "$(cat "$path" 2>/dev/null || true)" != "$expected" ]; do
-        attempt=$((attempt + 1))
-        [ "$attempt" -lt 100 ] || return 1
-        sleep 0.01
-    done
 }
 
 post '{"action":"network.set_mode","params":{"mode":"Only_5G"}}' |

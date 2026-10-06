@@ -51,7 +51,6 @@ def start(base, port, extra_env=None):
         ZWRT_DATAD_DIR=str(base / "data"),
         ZWRT_DATAD_UBUS_BIN=str(ROOT / "tests/mock_ubus.sh"),
         ZWRT_DATAD_UCI_BIN=str(ROOT / "tests/mock_uci.sh"),
-        ZWRT_DATAD_MWAN3_INIT="/usr/bin/true",
         MOCK_CALL_LOG=str(base / "calls.log"),
         MOCK_UCI_STATE_DIR=str(base / "uci-state"),
         **(extra_env or {}),
@@ -217,21 +216,28 @@ def check_write_timeout():
             assert not reader.eof.is_set(), "the reading client was dropped"
             assert time.monotonic() - reader.last < 3, "the reading client stopped receiving"
 
-            # 被丢掉的连接对端看得到：读完缓冲里的东西后是 EOF 或 RST。
-            dropped = 0
+            # 被丢掉的连接对端看得到：读完缓冲里的东西后是 EOF 或 RST。/v2/events 的流在广播落后时
+            # 先结束（名额先放），连接要等写超时才关，所以轮着读所有连接，最多等 15 秒。
+            closed = set()
             for sock in stalled:
-                sock.settimeout(0.2)
-                until = time.monotonic() + 2
-                try:
-                    while time.monotonic() < until:
-                        chunk = sock.recv(65536)
-                        if not chunk:
-                            dropped += 1
-                            break
-                except ConnectionResetError:
-                    dropped += 1
-                except (socket.timeout, OSError):
-                    pass
+                sock.setblocking(False)
+            until = time.monotonic() + 15
+            while not closed and time.monotonic() < until:
+                for sock in stalled:
+                    if sock in closed:
+                        continue
+                    try:
+                        while True:
+                            chunk = sock.recv(65536)
+                            if not chunk:
+                                closed.add(sock)
+                                break
+                    except (BlockingIOError, socket.timeout):
+                        pass
+                    except OSError:
+                        closed.add(sock)
+                time.sleep(0.1)
+            dropped = len(closed)
             assert dropped > 0, "no stalled connection was closed by the server"
             print(
                 f"write timeout: first slot freed {freed:.1f}s after filling; "

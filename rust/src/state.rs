@@ -664,82 +664,6 @@ fn topflow_multiwan(sets: &[BTreeMap<String, String>], mode: &str, running: bool
     }
     json!({"mode":mode,"active":mode=="MULTIWAN","service_running":running,"sections":sections})
 }
-fn cooling_state(fan_uci: i64, liquid_uci: i64) -> Value {
-    let zone = std::env::var("ZWRT_DATAD_COOLING_ZONE_PATH").unwrap_or_default();
-    let pwm_path = std::env::var("ZWRT_DATAD_FAN_PWM_PATH")
-        .unwrap_or_else(|_| "/sys/class/hwmon/hwmon0/pwm1".into());
-    let fan_thermal_path = std::env::var("ZWRT_DATAD_FAN_THERMAL_ENABLE_PATH").unwrap_or_default();
-    let liquid_thermal_path =
-        std::env::var("ZWRT_DATAD_LIQUID_THERMAL_ENABLE_PATH").unwrap_or_default();
-    let config_path = std::env::var("ZWRT_DATAD_COOLING_CONFIG")
-        .unwrap_or_else(|_| "/data/zwrt-datad/cooling.conf".into());
-    let config: BTreeMap<String, i64> = fs::read_to_string(config_path)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| {
-            let (k, v) = line.split_once('=')?;
-            Some((k.into(), v.trim().parse().ok()?))
-        })
-        .collect();
-    let fan_always = config
-        .get("fan_always_on")
-        .copied()
-        .or_else(|| config.get("fan_enabled").copied())
-        .unwrap_or(fan_uci)
-        != 0;
-    let liquid_always = config
-        .get("liquid_always_on")
-        .copied()
-        .or_else(|| config.get("liquid_enabled").copied())
-        .unwrap_or(liquid_uci)
-        != 0;
-    let fan_mode = config.get("fan_mode").copied().unwrap_or_default();
-    let zone_enabled = fs::read_to_string(format!("{zone}/mode"))
-        .unwrap_or_default()
-        .trim()
-        == "enabled";
-    let pwm = read_i64(pwm_path);
-    let temp = read_i64(format!("{zone}/temp"));
-    let fan_thermal = fs::read_to_string(fan_thermal_path)
-        .unwrap_or_default()
-        .contains("thermal_enable:1");
-    let liquid_thermal = fs::read_to_string(liquid_thermal_path)
-        .unwrap_or_default()
-        .contains("thermal_enable:1");
-    let mut factory = Vec::new();
-    for (index, fallback_pwm) in [76, 128, 179].into_iter().enumerate() {
-        let temperature = read_i64(format!("{zone}/trip_point_{index}_temp"));
-        let hysteresis = read_i64(format!("{zone}/trip_point_{index}_hyst"));
-        factory.push(json!({"level":index+1,"temperature_celsius":temperature/1000,"hysteresis_celsius":hysteresis/1000,"pwm":fallback_pwm,"speed_percent":((fallback_pwm*100+127)/255)}));
-    }
-    let custom_count = config
-        .get("custom_curve_count")
-        .copied()
-        .unwrap_or_default()
-        .clamp(0, 8);
-    let mut custom = Vec::new();
-    for index in 1..=custom_count {
-        if let (Some(temp), Some(pwm)) = (
-            config.get(&format!("custom_temperature_{index}")),
-            config.get(&format!("custom_pwm_{index}")),
-        ) {
-            custom.push(
-                json!({"temperature_celsius":temp,"pwm":pwm,"speed_percent":((pwm*100+127)/255)}),
-            );
-        }
-    }
-    let curve = if custom.is_empty() {
-        factory.clone()
-    } else {
-        custom.clone()
-    };
-    let liquid_level = config.get("liquid_level").copied().unwrap_or(1).clamp(1, 2);
-    json!({
-        "fan":{"enabled":fan_always,"always_on":fan_always,"mode":if fan_always{"always_on"}else if fan_mode==2{"custom"}else if fan_mode==1||zone_enabled{"automatic"}else{"manual"},"pwm":pwm,"max_pwm":255,"speed_percent":((pwm*100+127)/255),"manual_speed_percent":config.get("fan_speed_percent").copied().unwrap_or_default(),"temperature_celsius":if temp>0{json!(temp/1000)}else{Value::Null},"hard_full_speed_celsius":80,"thermal_enabled":fan_thermal,"kernel_zone_enabled":zone_enabled,"levels_percent":[0,30,50,70]},
-        "liquid":{"enabled":liquid_always,"always_on":liquid_always,"thermal_enabled":liquid_thermal,"mode":if liquid_always{if liquid_level==2{"high"}else{"low"}}else{"automatic"},"level":if liquid_always{liquid_level}else{0},"speed_percent":if liquid_always{if liquid_level==2{100}else{30}}else{0},"amplitude":if liquid_always{if liquid_level==2{200}else{60}}else{0},"levels_percent":[30,100]},
-        "factory_curve":factory,"custom_curve":custom,"curve":curve
-    })
-}
 /// Which `wireless.*` section feeds the `wlan` block. MU5250 always reads
 /// `main_2g` (C: WIFI_SOURCE_U60_MAIN_2G), even while it is disabled, and shows
 /// the block when any of ssid/key/encryption is set. Every other template picks
@@ -1503,7 +1427,6 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
     };
     let mut fields = Map::new();
     fields.insert("net".into(), Value::Object(net));
-    fields.insert("neighbor".into(),json!({"status":"disabled","enabled":false,"collector_running":false,"cells":[],"reason":"disabled_by_default","frames":0,"malformed":0,"partial":false,"discarded":0,"ambiguous_measurements":0,"capture_bytes":0,"generation":0,"sampled_at":Value::Null,"age_ms":Value::Null,"source":""}));
     let (client_list, wifi_count, lan_count) = connected_clients(&lan_clients, &wifi_clients);
     fields.insert(
         "clients".into(),
@@ -1906,15 +1829,6 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
             "multiwan".into(),
             topflow_multiwan(&uci_sets, &mode, mwan_running),
         );
-        let fan_enabled = uci_value("zwrt_deviceui.Device.fan_switch_status")
-            .await
-            .parse()
-            .unwrap_or_default();
-        let liquid_enabled = uci_value("zwrt_deviceui.Device.liquid_cooling_switch_status")
-            .await
-            .parse()
-            .unwrap_or_default();
-        fields.insert("cooling".into(), cooling_state(fan_enabled, liquid_enabled));
     } else {
         fields.insert("modems".into(), json!([]));
     }

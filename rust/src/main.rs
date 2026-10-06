@@ -5,13 +5,9 @@ mod cell_window;
 mod command;
 mod conn;
 mod control;
-mod cooling;
 mod executor;
-mod extra_wifi;
 mod legacy_hits;
 mod model;
-mod neighbor;
-mod neighbor_manager;
 mod ops;
 mod qos;
 mod screen;
@@ -43,11 +39,11 @@ fn validate_listener_security(addr: SocketAddr, require_auth: bool) -> Result<()
 struct Args {
     #[arg(long)]
     once: bool,
-    #[arg(long)]
-    neighbor: bool,
-    /// 已删除的 WebShell 的旧开关，只为不让还带着它的旧启动脚本起不来，不起作用。
+    /// 已删除的 WebShell（和 2026-10 删掉的邻区采集）的旧开关，只为不让还带着它的旧启动脚本起不来，不起作用。
     #[arg(long, hide = true)]
     webshell: bool,
+    #[arg(long, hide = true)]
+    neighbor: bool,
     #[arg(long)]
     auth_token_file: Option<PathBuf>,
     #[arg(long)]
@@ -76,9 +72,6 @@ async fn main() -> Result<()> {
     // reqwest（短信 HTTP 发送）用 rustls，进程里装一次 ring 作为默认加密实现。
     let _ = rustls::crypto::ring::default_provider().install_default();
     let raw: Vec<String> = std::env::args().collect();
-    if raw.get(1).map(String::as_str) == Some("--neighbor-parse") {
-        std::process::exit(neighbor::parse_cli(&raw[2..]));
-    }
     // 只读核对 socket 后端和 `ubus call` 的结果（ubus/compare.rs）；不起服务、不写文件。
     if raw.get(1).map(String::as_str) == Some("--ubus-compare") {
         std::process::exit(ubus::compare::run(&raw[2..]).await);
@@ -113,7 +106,7 @@ async fn main() -> Result<()> {
     };
     let local_requires_auth = args.lan_bind.is_none() && token.is_some();
     legacy_hits::init(&args.data_dir);
-    let app = App::new(args.data_dir, interval, token, args.neighbor).await?;
+    let app = App::new(args.data_dir, interval, token).await?;
     if args.once {
         app.start().await;
         println!("{}", serde_json::to_string(&app.snapshot().await)?);

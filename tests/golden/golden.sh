@@ -31,10 +31,7 @@ trap cleanup EXIT INT TERM
 export TZ=UTC LC_ALL=C
 export ZWRT_DATAD_UBUS_BIN="$HERE/fail_ubus.sh"
 export ZWRT_DATAD_UCI_BIN="$ROOT/tests/mock_uci.sh"
-export ZWRT_DATAD_MWAN3_INIT=/usr/bin/true
 export ZWRT_DATAD_IW_BIN="$ROOT/tests/mock_iw.sh"
-export ZWRT_DATAD_HOSTAPD_BIN="$ROOT/tests/mock_hostapd.py"
-export ZWRT_DATAD_HOSTAPD_CLI_BIN="$ROOT/tests/mock_hostapd_cli.sh"
 export ZWRT_DATAD_SMS_V3E1_URL="http://127.0.0.1:1/goform/goform_set_cmd_process"
 
 # 每个情形都从同一份干净的 fixture 开始（fixture.sh）。

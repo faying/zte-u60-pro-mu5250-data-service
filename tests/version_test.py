@@ -48,9 +48,7 @@ else:
                         ZWRT_DATAD_UCI_BIN='/usr/bin/false',
                         ZWRT_DATAD_DIR=str(self.root / 'cloud'),
                         VERSION_TEST_CALLS=str(self.calls),
-                        VERSION_TEST_HOLD=str(self.root / 'hold'),
-                        ZWRT_DATAD_NEIGHBOR_DIR=str(self.root / 'capture'),
-                        ZWRT_DATAD_NEIGHBOR_CONFIG=str(self.root / 'neighbor.json'))
+                        VERSION_TEST_HOLD=str(self.root / 'hold'))
 
     def test_cli_needs_no_device_or_runtime_files(self):
         for args in (['--version'], ['-V'],
@@ -68,7 +66,7 @@ else:
         state = json.loads(result.stdout)
         self.assertEqual(state['datad'], EXPECTED)
         self.assertEqual(state['system']['sw_version'], FIRMWARE)
-        self.assertFalse(state['neighbor']['collector_running'])
+        self.assertNotIn('neighbor', state)
 
     def test_refuses_unauthenticated_non_loopback_listener(self):
         result = subprocess.run([str(BIN), '--bind', '0.0.0.0', '--port', '0'],

@@ -95,7 +95,6 @@ def run_binary(binary):
             ZWRT_DATAD_DIR=str(base / "data"),
             ZWRT_DATAD_UBUS_BIN=str(ROOT / "tests/mock_ubus.sh"),
             ZWRT_DATAD_UCI_BIN=str(ROOT / "tests/mock_uci.sh"),
-            ZWRT_DATAD_MWAN3_INIT="/usr/bin/true",
             MOCK_CALL_LOG=str(base / "calls.log"),
             MOCK_UCI_STATE_DIR=str(base / "uci-state"),
         )
