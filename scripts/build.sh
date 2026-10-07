@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TC="${DATAD_MUSL_TOOLCHAIN_DIR:-$HOME/aarch64--musl--stable-2025.08-1/bin}"
 TARGET=aarch64-unknown-linux-musl
-RUST_TOOLCHAIN="${DATAD_RUST_TOOLCHAIN:-1.89.0}"
+RUST_TOOLCHAIN="${DATAD_RUST_TOOLCHAIN:-1.93.0}"
 RUSTUP="${RUSTUP:-$HOME/.cargo/bin/rustup}"
 CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
 CC="$TC/aarch64-linux-gcc"

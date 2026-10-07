@@ -51,7 +51,7 @@ The simplest way is Docker (macOS / Linux / WSL all work, no toolchain to instal
 scripts/build-docker.sh   # → zwrt-datad-aarch64 (static, stripped, image pinned by digest)
 ```
 
-Or on x86_64 Linux, you need the Bootlin aarch64 musl toolchain (default `~/aarch64--musl--stable-2025.08-1/bin`, override with `DATAD_MUSL_TOOLCHAIN_DIR`) and rustup (the script installs Rust 1.89.0):
+Or on x86_64 Linux, you need the Bootlin aarch64 musl toolchain (default `~/aarch64--musl--stable-2025.08-1/bin`, override with `DATAD_MUSL_TOOLCHAIN_DIR`) and rustup (the script installs Rust 1.93.0, the same as the Docker build):
 
 ```sh
 bash scripts/build.sh     # → zwrt-datad-aarch64 (static, stripped)

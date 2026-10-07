@@ -443,7 +443,7 @@ fn valid_imsi(value: &str) -> bool {
 /// hex, e.g. "0043004D004C0069006E006B" = "CMLink". Anything else → "".
 fn spn_from_ucs2_hex(value: &str) -> String {
     let v = value.trim();
-    if v.is_empty() || v.len() % 4 != 0 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if v.is_empty() || !v.len().is_multiple_of(4) || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
         return String::new();
     }
     let units: Vec<u16> = (0..v.len())
