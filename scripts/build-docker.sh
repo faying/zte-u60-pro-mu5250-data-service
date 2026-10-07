@@ -4,8 +4,8 @@
 #
 #   scripts/build-docker.sh [输出文件]      # 默认 ./zwrt-datad-aarch64
 #
-# 用 cargo-zigbuild 镜像（按 digest 固定）+ Cargo.lock（--locked）。
-# 2026-09 用这个镜像从 b5e8786 编出的结果和设备上跑的 6bbf6ea6 逐字节相同。
+# 镜像按 scripts/build.Dockerfile 现建（Rust、zig、cargo-zigbuild 都钉死版本；标签取文件哈希，
+# 建过一次就直接用）+ Cargo.lock（--locked）。ZIGBUILD_IMAGE=<镜像> 可以换成别的。
 # 编译缓存放 rust/target-zig（不进 git），依赖下载缓存在 Docker 卷 zwrt-datad-cargo。
 # 打 U60 Pro（MU5250）装机包时：DATAD_BIN=<输出文件> ./onboard/build-kit.sh（manager 仓库）。
 # SPDX-License-Identifier: MIT
@@ -13,7 +13,14 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-$ROOT/zwrt-datad-aarch64}
-IMAGE=${ZIGBUILD_IMAGE:-messense/cargo-zigbuild@sha256:d8313491ec5798de0633fdc1c5753761bff79967bea69076020dc78121b2cca8}
+if [ -n "${ZIGBUILD_IMAGE:-}" ]; then
+  IMAGE=$ZIGBUILD_IMAGE
+else
+  DF=$ROOT/scripts/build.Dockerfile
+  IMAGE=u60-rust-build:$( (shasum -a 256 "$DF" 2>/dev/null || sha256sum "$DF") | cut -c1-12)
+  docker image inspect "$IMAGE" >/dev/null 2>&1 ||
+    docker build -q -t "$IMAGE" -f "$DF" "$ROOT/scripts" >/dev/null
+fi
 TARGET=aarch64-unknown-linux-musl
 
 docker run --rm -v "$ROOT":/src -w /src/rust -e CARGO_TARGET_DIR=/src/rust/target-zig \

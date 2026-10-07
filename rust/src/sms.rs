@@ -128,7 +128,9 @@ fn utf16be_hex(value: &str) -> String {
     let digits: String = value.chars().filter(|ch| ch.is_ascii_hexdigit()).collect();
     let units: Vec<u16> = digits
         .as_bytes()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter_map(|chunk| std::str::from_utf8(chunk).ok())
         .filter_map(|chunk| u16::from_str_radix(chunk, 16).ok())
         .collect();

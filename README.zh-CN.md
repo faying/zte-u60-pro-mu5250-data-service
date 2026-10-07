@@ -49,7 +49,7 @@ curl -N  http://127.0.0.1:9460/v2/events
 scripts/build-docker.sh   # → zwrt-datad-aarch64（静态、已 strip，镜像按 digest 固定）
 ```
 
-或者在 x86_64 Linux 上，需要 Bootlin aarch64 musl 工具链（默认 `~/aarch64--musl--stable-2025.08-1/bin`，可用 `DATAD_MUSL_TOOLCHAIN_DIR` 指定）和 rustup（脚本会装 Rust 1.93.0，和 Docker 编译一致）：
+或者在 x86_64 Linux 上，需要 Bootlin aarch64 musl 工具链（默认 `~/aarch64--musl--stable-2025.08-1/bin`，可用 `DATAD_MUSL_TOOLCHAIN_DIR` 指定）和 rustup（脚本会装 Rust 1.99.0，和 Docker 编译一致）：
 
 ```sh
 bash scripts/build.sh     # → zwrt-datad-aarch64（静态、已 strip）

@@ -20,7 +20,7 @@ jobs:
       ZWRT_DATAD_PID_FILE: ""
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy,rustfmt
       - run: cargo fmt --check
