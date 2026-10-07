@@ -6,7 +6,7 @@
 
 use super::spec::NETWORK_MODE;
 use super::txn::{Phase, Reason, Source, Txn};
-use crate::screen::{ScreenOp, ScreenOpKind};
+use crate::project::screen::{ScreenOp, ScreenOpKind};
 use serde_json::{Value, json};
 
 type Words = (String, String);
@@ -35,7 +35,7 @@ fn item_words(item: &str) -> (&'static str, &'static str, &'static str) {
 /// 值的显示名：网络模式用首页同一张表（自动 / 只用 4G …）。
 pub fn value_words(item: &str, v: &str) -> Words {
     match item {
-        NETWORK_MODE => crate::screen::net_select_word(v),
+        NETWORK_MODE => crate::project::screen::net_select_word(v),
         _ if v.is_empty() => ("-".into(), "-".into()),
         _ => (v.to_owned(), v.to_owned()),
     }

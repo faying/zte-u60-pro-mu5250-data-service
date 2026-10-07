@@ -16,7 +16,7 @@ use super::{
     txn::{self, NewTxn, Phase, ProbeTarget, Reading, Reason, Source, Txn},
     ui,
 };
-use crate::screen::ScreenOp;
+use crate::project::screen::ScreenOp;
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,

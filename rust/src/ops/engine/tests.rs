@@ -1179,7 +1179,7 @@ async fn op_block_follows_the_engine() {
     );
     // 首页：进行中
     let so = e.screen_op().unwrap();
-    assert_eq!(so.kind, crate::screen::ScreenOpKind::Live);
+    assert_eq!(so.kind, crate::project::screen::ScreenOpKind::Live);
     // 立即退回：块马上变
     e.revert(&id(&op)).unwrap();
     assert_eq!(latest(&seen)["active"]["phase"], "rolling_back");
@@ -1249,7 +1249,7 @@ async fn ack_is_shared_and_journaled() {
     assert_eq!(b["last"]["say_zh"], "没通 · 还是只用 4G");
     assert_eq!(
         e.screen_op().unwrap().kind,
-        crate::screen::ScreenOpKind::Sticky
+        crate::project::screen::ScreenOpKind::Sticky
     );
     // 只能点最近结束的那个
     assert!(e.ack("other", Source::Web).is_err());

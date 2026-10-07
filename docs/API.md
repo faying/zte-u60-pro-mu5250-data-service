@@ -85,7 +85,7 @@ curl -s -X POST \
 
 ### `GET /v2/screen`
 
-触屏首页信号卡和状态栏要显示的结论，由当前这份内部快照算出（`rust/src/screen.rs`）。
+触屏首页信号卡和状态栏要显示的结论，由当前这份内部快照算出（`rust/src/project/screen.rs`）。
 这些规则原来在触屏的 C 里，2026-09-26 搬到这里，屏幕只负责画；为了一条规则都不变，
 `rust/tests/fixtures/screen_net_corpus.jsonl` 最初是 C 对 1700 多份快照算出的结果，测试要求逐字段相同（C 的规则随后删除，生成工具在 touch-ui tag `parity-net-v1`）；之后改规则时由 `screen/tests.rs` 的 bless 测试按 Rust 重录，patch 不动。
 「信号弱」只按格数判（`sig` = 状态栏格数），RSRP 只出现在说明里；NR 载波只在现在用着 5G（SA/NSA）时列出，不在 5G 时残留的 `nr_*` 读数不算；3G/2G 上也不列 `lteca` 里残留的 LTE 载波。

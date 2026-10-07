@@ -758,7 +758,7 @@ pub(crate) fn add_roaming_fields(net: &mut Value, imsi: &str) {
         .get("mcc")
         .and_then(Value::as_i64)
         .filter(|m| mcc_country(*m).is_some());
-    let home = crate::screen::imsi_plmn(imsi)
+    let home = crate::project::screen::imsi_plmn(imsi)
         .map(|(c, _)| c)
         .filter(|m| mcc_country(*m).is_some());
     let roaming = match (serving, home) {
@@ -776,8 +776,8 @@ pub(crate) fn qos_query(raw_net: &Value, imsi: &str) -> crate::qos::Query {
     let (mcc, mnc) = (integer(raw_net, "rmcc"), integer(raw_net, "rmnc"));
     crate::qos::Query {
         serving: (mcc > 0).then_some((mcc, mnc)),
-        home: crate::screen::imsi_plmn(imsi),
-        core: crate::screen::data_core(&string(raw_net, "network_type")),
+        home: crate::project::screen::imsi_plmn(imsi),
+        core: crate::project::screen::data_core(&string(raw_net, "network_type")),
     }
 }
 
