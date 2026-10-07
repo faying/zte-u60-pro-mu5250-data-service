@@ -2127,3 +2127,14 @@ fn hot_through_net_view_reads_thermal_hightemp_limit() {
         assert_eq!(state_name(net_view(&state).story.state), want, "{v}");
     }
 }
+
+/// A stale qos (bearer of the other core, e.g. an LTE bearer still in key.log
+/// after moving to SA) must not make the home screen say 限速.
+#[test]
+fn stale_qos_does_not_conclude_limit() {
+    let (mut state, _) = corpus_cases();
+    state["qos"] = serde_json::json!({"qci": 9, "ambr_dl": "4.400", "ambr_ul": "1.000"});
+    assert_eq!(state_name(net_view(&state).story.state), "limit");
+    state["qos"]["stale"] = true.into();
+    assert_ne!(state_name(net_view(&state).story.state), "limit");
+}

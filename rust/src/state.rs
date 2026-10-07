@@ -425,6 +425,17 @@ fn add_roaming_fields(net: &mut Value, imsi: &str) {
     obj.insert("true_roaming".into(), json!(roaming));
 }
 
+/// What `qos` needs to pick the live bearer: the registered PLMN, the SIM's
+/// home PLMN (a home-routed APN abroad names it) and LTE/NSA vs SA.
+fn qos_query(raw_net: &Value, imsi: &str) -> crate::qos::Query {
+    let (mcc, mnc) = (integer(raw_net, "rmcc"), integer(raw_net, "rmnc"));
+    crate::qos::Query {
+        serving: (mcc > 0).then_some((mcc, mnc)),
+        home: crate::screen::imsi_plmn(imsi),
+        core: crate::screen::data_core(&string(raw_net, "network_type")),
+    }
+}
+
 fn valid_imsi(value: &str) -> bool {
     (5..=20).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
@@ -1438,11 +1449,6 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         fields.insert("sms".into(),json!({"unread":integer(&sms_capacity,"sms_dev_unread_num")+integer(&sms_capacity,"sms_sim_unread_num"),"list":list}));
     }
     fields.insert("traffic".into(), Value::Object(tout));
-    let qos = crate::qos::read_for_plmn(integer(&raw_net, "rmcc"), integer(&raw_net, "rmnc"));
-    fields.insert(
-        "qos".into(),
-        json!({"qci":qos.qci,"ambr_dl":qos.ambr_dl,"ambr_ul":qos.ambr_ul,"usb_mode":string(&usb,"mode")}),
-    );
     if let Some(s) = wifi {
         fields.insert("wlan".into(),json!({"ssid":uci_get(&uci_sets,&format!("wireless.{s}.ssid")),"enc":uci_get(&uci_sets,&format!("wireless.{s}.encryption")),"enabled":i64::from(uci_get(&uci_sets,&format!("wireless.{s}.disabled"))!="1")}));
     }
@@ -1591,6 +1597,11 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
             imsi.clear();
         }
     }
+    let qos = crate::qos::read(qos_query(&raw_net, &imsi));
+    fields.insert(
+        "qos".into(),
+        json!({"qci":qos.qci,"ambr_dl":qos.ambr_dl,"ambr_ul":qos.ambr_ul,"bearer":qos.bearer,"stale":qos.stale,"usb_mode":string(&usb,"mode")}),
+    );
     let mut msisdn = string(&sim, "msisdn");
     if !valid_msisdn(&msisdn) {
         msisdn = uci_get(&uci_sets, "zwrt_zte_mdm.sim_info.msisdn").into();
@@ -1618,8 +1629,7 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         } else {
             string(&raw_net, "lte_bandwidth")
         };
-        let x75_qos =
-            crate::qos::read_for_plmn(integer(&raw_net, "rmcc"), integer(&raw_net, "rmnc"));
+        let x75_qos = crate::qos::read(qos_query(&raw_net, &imsi));
         modems.push(json!({
             "id":"x75","role":"integrated_5g","transport":"rmnet","subid":active_subid,
             "ifname":"rmnet_data0","wan_interface":"zte_mwan2",

@@ -282,7 +282,13 @@ fn parse(state: &Value) -> Data {
         d.rx_speed = get_int(t, "rx_speed", 0);
     }
     if let Some(q) = state.get("qos") {
-        d.ambr_dl = raw(q, "ambr_dl").map(|s| atof(&cstr(s, 32))).unwrap_or(0.0);
+        // A bearer of the other core is history: no rate-limit conclusion from it.
+        let stale = q.get("stale").and_then(Value::as_bool).unwrap_or(false);
+        d.ambr_dl = if stale {
+            0.0
+        } else {
+            raw(q, "ambr_dl").map(|s| atof(&cstr(s, 32))).unwrap_or(0.0)
+        };
     }
     d.hot = state
         .get("thermal")
@@ -319,6 +325,15 @@ fn has_ci(s: &str, w: &str) -> bool {
 
 fn has5a(s: &str) -> bool {
     has_ci(s, "5G-A") || has_ci(s, "5GA") || has_ci(s, "5G_A") || has_ci(s, "5G-ADV")
+}
+
+/// The core the data connection rides on: NSA (EN-DC) still uses EPS bearers.
+pub(crate) fn data_core(network_type: &str) -> crate::qos::Core {
+    match rat_of(network_type) {
+        Rat::Sa => crate::qos::Core::Nr,
+        Rat::Nsa | Rat::G4 => crate::qos::Core::Eps,
+        _ => crate::qos::Core::Unknown,
+    }
 }
 
 fn rat_of(raw: &str) -> Rat {

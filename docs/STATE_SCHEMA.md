@@ -175,8 +175,10 @@
   },
   "qos": {
     "qci": 9,
-    "ambr_dl": "20008.641",
-    "ambr_ul": "10008.640",
+    "ambr_dl": "20000.000",
+    "ambr_ul": "10000.000",
+    "bearer": "eps",
+    "stale": false,
     "usb_mode": "debug"
   },
   "device": {
@@ -276,7 +278,9 @@
 - `net.HSR`：高铁专网确认结果。该值只应来自信令确认，不按 ARFCN/EARFCN 直接判定。当前公开版尚未实现 modem SIB1 信令确认链路，因此该字段保持 `false`，直到公开实现具备同等确认能力。
 - WiFi 段的键名用 `wlan` 而不是 `wifi`，避免消费端按子串查找时先命中 `clients.wifi` 计数。`wlan.key` 为明文密码，消费端应自行决定是否打码显示。
 - `qos.usb_mode`：`debug` 表示 ADB 开启，`user` 表示关闭；切换可调用 `ubus call zwrt_bsp.usb set '{"mode":"user|debug"}'`。
-- `qos.qci` / `qos.ambr_*`：来自 `key.log.0` / `key.log` 的 PDU/EPS 建立日志（偶发行）。后端启动时按轮转旧日志到当前日志的顺序扫描，并按日志上下文缓存多个候选；当前 `key.log` 的有效候选优先于 `key.log.0`，后者只补充当前日志缺失的字段；同一日志内再优先采用当前 `net.mcc/net.mnc` 匹配的 `access_point=*.mncXXX.mccYYY.*` 承载。`dnn=ims` / emergency 这类信令承载不会覆盖主数据 AMBR；无 PLMN 的非 IMS `dnn=` 可作为主数据候选。裸 `qci = ...` 只有在紧跟有效数据承载上下文，或完全没有更可信 QCI 时才作为兜底；收到 `SIGUSR1` 或检测到 `sim_iccid/current_sim_slot` 变化时，会清空当前 QoS 缓存并重读。
+- `qos.qci` / `qos.ambr_*`：来自 `key.log.0` / `key.log` 的 PDU/EPS 建立日志（偶发行），只读两份日志末尾各 2 MiB，同一查询 30 秒内复用结果（`ZWRT_DATAD_CACHE=0` 关）；查询条件（所在 PLMN、卡的归属 PLMN、LTE/NSA 还是 SA）一变就重读。当前 `key.log` 的候选优先于 `key.log.0`；同一日志内取**最新**的数据承载（LTE EPS 承载或 NR PDU 会话），只有写明的 PLMN 既不是所在网络、也不是卡的归属网络的承载才降级（国外漫游时归属地路由的 APN 写的是归属 PLMN，算本机承载）。缺的字段只从同一种承载补，LTE 的 AMBR 不会补给 NR 会话。LTE APN-AMBR 按 TS 24.301 解码：厂商日志的 `_ext2` 把 8640 kbps 基值也加了进去（500 Mbps 打印成 `508.640Mbps`），解析时扣回；`_ext2=0.000` 表示没有扩展-2 字节，改用 `_ext`；离整数个 256 Mbps 步长不到 0.01 步的值对齐到整步（`20008.641` → `20000`）。`dnn=ims` / emergency 这类信令承载不参与。收到 `SIGUSR1` 或检测到 `sim_iccid/current_sim_slot` 变化时清缓存重读。
+- `qos.bearer`：`eps`（LTE/NSA 的 EPS 承载，`qci` 是 QCI）、`nr_pdu`（SA 的 PDU 会话，`qci` 里放的是 5QI）、空串（日志里没找到承载）。
+- `qos.stale`：最新承载的种类和现在所在的核心网对不上（如切到 SA 后日志里还只有 LTE 承载，或回到 LTE 后原厂没打新的承载行）。值照给，但只是历史；`/v2/screen` 这时不据此判「限速」。
 - `clients.list` 只包含固件无线/有线访问列表确认在线的设备，无线设备排列在有线设备之前；DHCP 租约只补全主机名和 IP，不决定在线状态。列表上限 32 条，消费端可自行截断显示。NFC 切换用 `ubus call zwrt_nfc zwrt_nfc_wifi_set '{"switch":0|1,"flag":2}'`。
 - `sms.unread` 默认每 5 秒读取一次；`sms.list` 启动时按 NV/SIM 各最多 32 条完整同步，之后未读数变化时各取最新 8 条并按消息 ID 合并。发送、删除和标记已读成功后会使缓存失效并在下一轮完整同步。TopFlow 厂商密文由 datad 使用设备 OpenSSL 3 解密，输出到该字段的号码和正文均为 UTF-8 明文；消费者不应再实现厂商会话密钥或解密逻辑。相关写操作通过私有 [`CONTROL_API.md`](CONTROL_API.md) 执行。
 
