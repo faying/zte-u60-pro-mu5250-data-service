@@ -1,3 +1,4 @@
+use crate::project::snapshot::{self, *};
 use crate::{command, model::Snapshot};
 use serde_json::{Map, Value, json};
 use std::{
@@ -32,49 +33,9 @@ type Cache<T> = Mutex<Option<HashMap<String, Cached<T>>>>;
 static UBUS_CACHE: Cache<Result<Value, String>> = Mutex::new(None);
 static UCI_CACHE: Cache<BTreeMap<String, String>> = Mutex::new(None);
 
-/// 电池、充电器在旧 `/state` 里的样子。读失败（或块 stale）时和原来一样：没有 `battery`，
-/// `power` 看充电器那份 `{}`。
-fn power_fields(
-    fields: &mut Map<String, Value>,
-    template: &str,
-    battery: Result<Value, String>,
-    charger: Result<Value, String>,
-) {
-    let battery_ok = battery.is_ok();
-    let battery = object(battery);
-    let charger = object(charger);
-    let hide_battery = matches!(template, "MC7523" | "MC8532B");
-    if !hide_battery
-        && battery_ok
-        && battery
-            .as_object()
-            .is_some_and(|v| v.keys().any(|k| k.starts_with("battery_")))
-    {
-        fields.insert("battery".into(), battery_object(&battery, &charger));
-    }
-    if let Some(power) = power_object(&charger) {
-        fields.insert("power".into(), power);
-    }
-}
-
-/// 旧 `/state` 的 `battery` 对象（`/v2` 的 battery 块同形）。
-fn battery_object(battery: &Value, charger: &Value) -> Value {
-    json!({"percent":integer_or(battery,"battery_capacity",-1),"temp":integer(battery,"battery_temperature"),"online":integer(battery,"battery_online"),"health":integer(battery,"battery_health"),"time_to_full":integer_or(battery,"battery_time_to_full",-1),"charging":integer(charger,"charge_status"),"charger_connect":integer(charger,"charger_connect"),"charger_type":integer(charger,"charger_type"),"chg_uv":read_i64(host_path("/sys/class/power_supply/usb/voltage_now")),"chg_ua":read_i64(host_path("/sys/class/power_supply/usb/current_now")),"bat_uv":read_i64(host_path("/sys/class/power_supply/battery/voltage_now")),"bat_ua":read_i64(host_path("/sys/class/power_supply/battery/current_now"))})
-}
-
-/// 旧 `/state` 的 `power` 对象；充电器回复里没有 `direct_power_supply_mode` 时旧 `/state` 不输出它。
-fn power_object(charger: &Value) -> Option<Value> {
-    let mode = charger
-        .get("direct_power_supply_mode")
-        .and_then(Value::as_str)?;
-    Some(
-        json!({"direct_supply":{"supported":true,"enabled":match mode{"enable"=>json!(true),"disable"=>json!(false),_=>Value::Null},"mode":if matches!(mode,"enable"|"disable"){json!(mode)}else{Value::Null}}}),
-    )
-}
-
 /// `/v2` battery 块的 data = 旧 `/state` 的 `battery`（充电字段取充电器块最近一次读成功的回复）。
 pub(crate) fn battery_v2(raw: &Value, other: &dyn Fn(&str) -> Option<Value>) -> Value {
-    battery_object(raw, &other("charger").unwrap_or(Value::Null))
+    battery_object(raw, &other("charger").unwrap_or(Value::Null), read_rails())
 }
 
 /// `/v2` charger 块的 data = 旧 `/state` 的 `power`；旧 `/state` 没有 `power` 时是 `{}`。
@@ -204,43 +165,6 @@ async fn uci_show_ttl(ttl_s: u64, package: &str) -> BTreeMap<String, String> {
 fn uci_bin() -> String {
     std::env::var("ZWRT_DATAD_UCI_BIN").unwrap_or_else(|_| "/sbin/uci".into())
 }
-/// `thermal.hightemp_limit`：1 固件在过热限速，0 没有，null 读不到（别的机型没有这个键）。
-fn hightemp_limit(v: &Result<Value, String>) -> Value {
-    v.as_ref()
-        .ok()
-        .and_then(|v| v.get("value"))
-        .and_then(Value::as_str)
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .map_or(Value::Null, |n| json!(i64::from(n != 0)))
-}
-fn object(v: Result<Value, String>) -> Value {
-    v.unwrap_or_else(|_| json!({}))
-}
-fn string(v: &Value, key: &str) -> String {
-    match v.get(key) {
-        Some(Value::String(x)) => x.clone(),
-        Some(Value::Number(x)) => x.to_string(),
-        Some(Value::Bool(x)) => x.to_string(),
-        _ => String::new(),
-    }
-}
-fn integer(v: &Value, key: &str) -> i64 {
-    integer_or(v, key, 0)
-}
-/// Like `integer`, but with an explicit default instead of 0 — for fields
-/// where 0 is a valid reading and "no data" needs its own sentinel (e.g.
-/// battery percent/time_to_full, matching the C implementation's -1).
-fn integer_or(v: &Value, key: &str, default: i64) -> i64 {
-    match v.get(key) {
-        Some(Value::Number(x)) => x.as_i64().unwrap_or(default),
-        Some(Value::String(x)) => x.parse().unwrap_or(default),
-        Some(Value::Bool(x)) => i64::from(*x),
-        _ => default,
-    }
-}
-fn interface(v: &Value) -> Value {
-    json!({"up":v.get("up").and_then(Value::as_bool).unwrap_or(false),"proto":string(v,"proto"),"device":string(v,"l3_device"),"ipv4":v.get("ipv4-address").cloned().unwrap_or_else(||json!([])),"ipv6":v.get("ipv6-address").cloned().unwrap_or_else(||json!([])),"dns":v.get("dns-server").cloned().unwrap_or_else(||json!([]))})
-}
 
 /// `/etc/config`（`ZWRT_DATAD_UCI_CONFIG_DIR` 可改，测试用）。
 fn uci_config_dir() -> std::path::PathBuf {
@@ -358,193 +282,7 @@ pub async fn uci_write(operation: &str, path: &str, value: Option<&str>) -> Resu
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
-fn uci_get<'a>(sets: &'a [BTreeMap<String, String>], path: &str) -> &'a str {
-    sets.iter()
-        .find_map(|s| s.get(path))
-        .map(String::as_str)
-        .unwrap_or_default()
-}
-fn normalize_profile(v: &str) -> String {
-    let mut out = String::new();
-    let mut sep = true;
-    for c in v.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-            sep = false
-        } else if !sep && matches!(c, '-' | '_' | ' ' | '/' | '.') {
-            out.push('_');
-            sep = true
-        }
-    }
-    while out.ends_with('_') {
-        out.pop();
-    }
-    if out.is_empty() {
-        "unknown".into()
-    } else {
-        out
-    }
-}
-/// MCC → 国家。一个国家有几个 MCC 的归到同一个（美国 310–316、印度 404–406、日本 440/441、
-/// 英国 234/235）；港 454、澳 455、台 466 和 460 是不同的。901（国际共享）、001/999（测试）
-/// 和不像 MCC 的值没有国家，给 None。
-fn mcc_country(mcc: i64) -> Option<i64> {
-    match mcc {
-        310..=316 => Some(310),
-        404..=406 => Some(404),
-        440 | 441 => Some(440),
-        234 | 235 => Some(234),
-        901 | 999 => None,
-        200..=799 => Some(mcc),
-        _ => None,
-    }
-}
 
-/// `/v2` signal 块专有的三个字段（E3 D2，全项目一处判断「在哪、是不是真漫游」）：
-/// `serving_mcc` = 所在网络的 MCC（`net.mcc`，没注册上为 null）；`home_mcc` = 卡的 MCC
-/// （IMSI 前三位，读不到为 null）；`true_roaming` = 两者不是同一个国家，任一为 null 就是 null。
-/// 原厂 `roaming`（simcard_roam）在国外插当地卡时说「不漫游」，这里不用它。
-/// 只进 `/v2`：旧 `/state` 的 `net` 冻结，不加。
-fn add_roaming_fields(net: &mut Value, imsi: &str) {
-    let Some(obj) = net.as_object_mut() else {
-        return;
-    };
-    let serving = obj
-        .get("mcc")
-        .and_then(Value::as_i64)
-        .filter(|m| mcc_country(*m).is_some());
-    let home = crate::screen::imsi_plmn(imsi)
-        .map(|(c, _)| c)
-        .filter(|m| mcc_country(*m).is_some());
-    let roaming = match (serving, home) {
-        (Some(s), Some(h)) => Some(mcc_country(s) != mcc_country(h)),
-        _ => None,
-    };
-    obj.insert("serving_mcc".into(), json!(serving));
-    obj.insert("home_mcc".into(), json!(home));
-    obj.insert("true_roaming".into(), json!(roaming));
-}
-
-/// What `qos` needs to pick the live bearer: the registered PLMN, the SIM's
-/// home PLMN (a home-routed APN abroad names it) and LTE/NSA vs SA.
-fn qos_query(raw_net: &Value, imsi: &str) -> crate::qos::Query {
-    let (mcc, mnc) = (integer(raw_net, "rmcc"), integer(raw_net, "rmnc"));
-    crate::qos::Query {
-        serving: (mcc > 0).then_some((mcc, mnc)),
-        home: crate::screen::imsi_plmn(imsi),
-        core: crate::screen::data_core(&string(raw_net, "network_type")),
-    }
-}
-
-fn valid_imsi(value: &str) -> bool {
-    (5..=20).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
-}
-/// SIM service provider name (EF_SPN) as the vendor stores it: UCS-2 big-endian
-/// hex, e.g. "0043004D004C0069006E006B" = "CMLink". Anything else → "".
-fn spn_from_ucs2_hex(value: &str) -> String {
-    let v = value.trim();
-    if v.is_empty() || !v.len().is_multiple_of(4) || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return String::new();
-    }
-    let units: Vec<u16> = (0..v.len())
-        .step_by(4)
-        .filter_map(|i| u16::from_str_radix(&v[i..i + 4], 16).ok())
-        .filter(|&u| u != 0 && u != 0xffff)
-        .collect();
-    String::from_utf16(&units)
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
-}
-fn valid_msisdn(value: &str) -> bool {
-    let digits = value.strip_prefix('+').unwrap_or(value);
-    (3..=32).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
-}
-fn realtime_traffic(value: &Value) -> Value {
-    json!({
-        "rx_speed":integer(value,"real_rx_speed"),
-        "tx_speed":integer(value,"real_tx_speed"),
-        "max_rx_speed":integer(value,"real_max_rx_speed"),
-        "max_tx_speed":integer(value,"real_max_tx_speed"),
-        "rx_bytes":integer(value,"real_rx_bytes"),
-        "tx_bytes":integer(value,"real_tx_bytes"),
-        "session_time":integer(value,"real_time")
-    })
-}
-fn prefixed_string(value: &Value, prefix: &str, suffix: &str) -> String {
-    string(value, &format!("{prefix}{suffix}"))
-}
-fn prefixed_integer(value: &Value, prefix: &str, suffix: &str) -> i64 {
-    integer(value, &format!("{prefix}{suffix}"))
-}
-fn topflow_external_net(
-    live: &Value,
-    sets: &[BTreeMap<String, String>],
-    index: usize,
-    slot: i64,
-) -> Value {
-    let prefix = format!("msim_{}_{}_", index + 1, slot);
-    let uci_prefix = format!("zte_nwinfo.sys_info.{prefix}");
-    let use_uci = live.as_object().is_none_or(|value| value.is_empty());
-    let text = |suffix: &str| {
-        let live_value = prefixed_string(live, &prefix, suffix);
-        if live_value.is_empty() && use_uci {
-            uci_get(sets, &format!("{uci_prefix}{suffix}")).to_owned()
-        } else {
-            live_value
-        }
-    };
-    let number = |suffix: &str| {
-        let live_value = prefixed_string(live, &prefix, suffix);
-        if live_value.is_empty() && use_uci {
-            uci_get(sets, &format!("{uci_prefix}{suffix}"))
-                .parse::<i64>()
-                .unwrap_or_default()
-        } else {
-            prefixed_integer(live, &prefix, suffix)
-        }
-    };
-    let bandwidth = text("lte_bandwidth");
-    let bandwidth = bandwidth
-        .trim_end_matches("MHz")
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|v| [1.4, 3.0, 5.0, 10.0, 15.0, 20.0].contains(v))
-        .map(|v| {
-            if v == 1.4 {
-                "1.4".into()
-            } else {
-                format!("{v:.0}")
-            }
-        });
-    let mut out = json!({
-        "type":text("network_type"),
-        "bars":number("signalbar"),
-        "roaming":text("simcard_roam"),
-        "operator":text("network_provider"),
-        "plmn":text("rplmn_num"),
-        "band":text("wan_active_band"),
-        "lte_rsrp":number("lte_rsrp"),
-        "lte_rsrq":number("lte_rsrq"),
-        "lte_rssi":number("lte_rssi"),
-        "lte_snr":text("lte_snr"),
-        "lte_pci":number("lte_pci"),
-        "cell_id":number("cell_id"),
-        "channel":number("wan_active_channel"),
-        "mode":text("net_select"),
-        "operate_mode":text("operate_mode")
-    });
-    if let Some(bandwidth) = bandwidth {
-        out["bandwidth"] = json!(bandwidth);
-    }
-    out
-}
-fn parse_bool(value: &Value, key: &str) -> bool {
-    value
-        .get(key)
-        .and_then(|v| v.as_bool().or_else(|| v.as_i64().map(|n| n != 0)))
-        .unwrap_or(false)
-}
 fn tcp_aggregation_summary() -> (usize, String, u16, bool) {
     let path = std::env::var("ZWRT_DATAD_PROC_NET_TCP").unwrap_or_else(|_| "/proc/net/tcp".into());
     let owned: Vec<u64> = std::env::var("ZWRT_DATAD_ICG_SOCKET_INODES")
@@ -601,154 +339,7 @@ fn tcp_aggregation_summary() -> (usize, String, u16, bool) {
         .unwrap_or_default();
     (outgoing.len(), ip, port, true)
 }
-fn split_uci_list(value: &str) -> Vec<String> {
-    value
-        .split("' '")
-        .map(|v| v.trim_matches('\'').to_owned())
-        .filter(|v| !v.is_empty())
-        .collect()
-}
-fn topflow_multiwan(sets: &[BTreeMap<String, String>], mode: &str, running: bool) -> Value {
-    let source = sets.iter().find(|set| set.contains_key("mwan3.globals"));
-    let Some(source) = source else {
-        return json!({"mode":mode,"active":mode=="MULTIWAN","service_running":running,"sections":[]});
-    };
-    let mut ids: Vec<_> = source
-        .iter()
-        .filter_map(|(key, value)| {
-            let id = key.strip_prefix("mwan3.")?;
-            (!id.contains('.')
-                && matches!(
-                    value.as_str(),
-                    "interface" | "member" | "policy" | "rule" | "globals"
-                ))
-            .then(|| id.to_owned())
-        })
-        .collect();
-    ids.sort();
-    let mut sections = Vec::new();
-    for id in ids {
-        let kind = source
-            .get(&format!("mwan3.{id}"))
-            .cloned()
-            .unwrap_or_default();
-        let mut item =
-            serde_json::Map::from_iter([("id".into(), json!(id)), ("type".into(), json!(kind))]);
-        let names: &[&str] = match kind.as_str() {
-            "interface" => &[
-                "enabled",
-                "family",
-                "track_method",
-                "reliability",
-                "timeout",
-                "interval",
-                "down",
-                "up",
-            ],
-            "member" => &["interface", "metric", "weight"],
-            "policy" => &["last_resort"],
-            "rule" => &[
-                "family",
-                "proto",
-                "src_ip",
-                "src_port",
-                "dest_ip",
-                "dest_port",
-                "use_policy",
-                "sticky",
-                "logging",
-            ],
-            "globals" => &["mmx_mask"],
-            _ => &[],
-        };
-        for name in names {
-            if let Some(value) = source.get(&format!("mwan3.{id}.{name}")) {
-                item.insert((*name).into(), json!(value));
-            }
-        }
-        for (name, key) in [("track_ip", "track_ip"), ("use_member", "use_member")] {
-            if let Some(value) = source.get(&format!("mwan3.{id}.{key}")) {
-                item.insert(name.into(), json!(split_uci_list(value)));
-            }
-        }
-        sections.push(Value::Object(item));
-    }
-    json!({"mode":mode,"active":mode=="MULTIWAN","service_running":running,"sections":sections})
-}
-/// Which `wireless.*` section feeds the `wlan` block. MU5250 always reads
-/// `main_2g` (C: WIFI_SOURCE_U60_MAIN_2G), even while it is disabled, and shows
-/// the block when any of ssid/key/encryption is set. Every other template picks
-/// the first enabled section with an SSID, else the first with an SSID.
-fn wifi_section(template: &str, sets: &[BTreeMap<String, String>]) -> Option<&'static str> {
-    let get = |s: &str, k: &str| uci_get(sets, &format!("wireless.{s}.{k}"));
-    if template == "MU5250" {
-        return ["ssid", "key", "encryption"]
-            .into_iter()
-            .any(|k| !get("main_2g", k).is_empty())
-            .then_some("main_2g");
-    }
-    ["main_2g", "main_5g"]
-        .into_iter()
-        .find(|s| !get(s, "ssid").is_empty() && get(s, "disabled") != "1")
-        .or_else(|| {
-            ["main_2g", "main_5g"]
-                .into_iter()
-                .find(|s| !get(s, "ssid").is_empty())
-        })
-}
 
-fn topflow_net_fallback(raw: &mut Value, sets: &[BTreeMap<String, String>]) {
-    if raw.get("network_type").is_some_and(|v| !v.is_null()) {
-        return;
-    }
-    let mut out = Map::new();
-    for (key, path) in [
-        ("network_type", "zte_nwinfo.sys_info.network_type"),
-        ("signalbar", "zte_nwinfo.signal_strength.signalbar"),
-        ("simcard_roam", "zte_nwinfo.sys_info.simcard_roam"),
-        (
-            "network_provider_fullname",
-            "zte_nwinfo.plmn_info.network_provider_fullname",
-        ),
-        ("wan_active_band", "zte_nwinfo.wan_active_band.GWLSA_band"),
-        ("nr5g_action_band", "zte_nwinfo.wan_active_band.odu_nrband"),
-        ("nr5g_rsrp", "zte_nwinfo.signal_strength.nr5g_rsrp"),
-        ("nr5g_rsrq", "zte_nwinfo.signal_strength.nr5g_rsrq"),
-        ("nr5g_snr", "zte_nwinfo.signal_strength.nr5g_snr"),
-        ("rmcc", "zte_nwinfo.plmn_info.rmcc"),
-        ("rmnc", "zte_nwinfo.plmn_info.rmnc"),
-        ("cell_id", "zte_nwinfo.cell_info.cell_id"),
-        ("lte_pci", "zte_nwinfo.cell_info.lte_pci"),
-        (
-            "wan_active_channel",
-            "zte_nwinfo.cell_info.wan_active_channel",
-        ),
-        ("nr5g_pci", "zte_nwinfo.cell_info.nr5g_pci"),
-        ("nr5g_cell_id", "zte_nwinfo.cell_info.nr5g_cellid"),
-        (
-            "nr5g_action_channel",
-            "zte_nwinfo.cell_info.nr5g_action_channel",
-        ),
-        ("nr5g_bandwidth", "zte_nwinfo.cell_info.nr5g_bandwidth"),
-        ("lte_bandwidth", "zte_nwinfo.cell_info.lte_bandwidth"),
-        ("net_select", "zte_nwinfo.sys_info.net_select"),
-        (
-            "nr5g_sa_band_lock",
-            "zte_nwinfo.band_lock.nr5g_sa_band_lock",
-        ),
-        (
-            "nr5g_nsa_band_lock",
-            "zte_nwinfo.band_lock.nr5g_nsa_band_lock",
-        ),
-        ("lte_band", "zte_nwinfo.band_lock.lte_ext_band_lock"),
-    ] {
-        let value = uci_get(sets, path);
-        if !value.is_empty() {
-            out.insert(key.into(), json!(value));
-        }
-    }
-    *raw = Value::Object(out);
-}
 fn read_i64(path: impl AsRef<Path>) -> i64 {
     fs::read_to_string(path)
         .ok()
@@ -804,7 +395,16 @@ fn thermal_zones() -> (i64, Value, Value) {
         Value::Array(runtime_zones),
     )
 }
-fn lease_metadata() -> BTreeMap<String, (String, String)> {
+/// 充电口和电池的电压、电流（`battery` 对象的 chg_*/bat_*）。
+fn read_rails() -> Rails {
+    Rails {
+        chg_uv: read_i64(host_path("/sys/class/power_supply/usb/voltage_now")),
+        chg_ua: read_i64(host_path("/sys/class/power_supply/usb/current_now")),
+        bat_uv: read_i64(host_path("/sys/class/power_supply/battery/voltage_now")),
+        bat_ua: read_i64(host_path("/sys/class/power_supply/battery/current_now")),
+    }
+}
+fn lease_metadata() -> Leases {
     let path =
         std::env::var("ZWRT_DATAD_DHCP_LEASES_PATH").unwrap_or_else(|_| "/tmp/dhcp.leases".into());
     fs::read_to_string(path)
@@ -823,55 +423,6 @@ fn lease_metadata() -> BTreeMap<String, (String, String)> {
             })
         })
         .collect()
-}
-
-fn client_array(value: &Value, key: &str) -> Option<Vec<Value>> {
-    let leases = lease_metadata();
-    value.get(key)?.as_array().map(|items| {
-        items
-            .iter()
-            .filter_map(|entry| {
-                let mac = ["mac_address", "mac", "mac_addr"]
-                    .into_iter()
-                    .map(|key| string(entry, key))
-                    .find(|value| !value.is_empty())?
-                    .to_ascii_lowercase();
-                let lease = leases.get(&mac);
-                let ip = ["ip_address", "ip", "ip_addr"]
-                    .into_iter()
-                    .map(|key| string(entry, key))
-                    .find(|value| !value.is_empty())
-                    .or_else(|| lease.map(|value| value.0.clone()))
-                    .unwrap_or_default();
-                let name = ["hostname", "name"]
-                    .into_iter()
-                    .map(|key| string(entry, key))
-                    .find(|value| !value.is_empty() && value != "--" && value != "*")
-                    .or_else(|| lease.map(|value| value.1.clone()))
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| mac.clone());
-                Some(json!({"name":name,"ip":ip,"mac":mac}))
-            })
-            .collect()
-    })
-}
-
-fn connected_clients(lan: &Value, wifi: &Value) -> (Value, i64, i64) {
-    let wifi = client_array(wifi, "wireless_access_list_info").unwrap_or_default();
-    let lan = client_array(lan, "lan_access_list_info").unwrap_or_default();
-    let wifi_count = wifi.len() as i64;
-    let lan_count = lan.len() as i64;
-    (
-        Value::Array(wifi.into_iter().chain(lan).collect()),
-        wifi_count,
-        lan_count,
-    )
-}
-fn memory_fields(info: &Value) -> (i64, i64, i64) {
-    let m = info.get("memory").unwrap_or(&Value::Null);
-    let t = integer(m, "total");
-    let a = integer(m, "available");
-    (t, a, if t > 0 { (t - a) * 100 / t } else { -1 })
 }
 
 type CpuCounters = BTreeMap<String, (u64, u64)>;
@@ -1124,7 +675,34 @@ fn runtime(runtime_zones: Value) -> (i64, Value) {
 
 /// 旧接口的一轮采集。电池、充电器已迁到块模型（`block::phase1_blocks`），从 `hub` 取；
 /// stale 的块按读失败输出（V2-29）。其余读取仍走 `ubus_ttl`。
+/// 一轮采集：读（这里）→ 算（`project::snapshot::project`，纯函数）→ MU5252 外挂模组（边读边算）→ 记 `/v2` 块。
 pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapshot {
+    let projection = snapshot::project(read_inputs(hub).await, sample_interval_ms);
+    let Projection {
+        mut fields,
+        blocks,
+        mu5252,
+    } = projection;
+    if let Some(ctx) = mu5252 {
+        mu5252_extras(ctx, &mut fields).await;
+    }
+    let now = tokio::time::Instant::now();
+    for (name, data) in blocks {
+        hub.record(name, data, now);
+    }
+    Snapshot {
+        ts: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        datad: Default::default(),
+        fields,
+    }
+}
+
+/// 一轮要读的全部东西，顺序和以前在 `collect` 里一样（厂商 ubus 并发会丢回复，所以串行；
+/// 执行者按这个顺序排队）。
+async fn read_inputs(hub: &crate::block::Hub) -> Inputs {
     // Vendor ubus implementations on these devices lose replies under a large
     // burst of concurrent clients, so state collection is deliberately serial.
     let common = ubus_ttl(60, "zwrt_zte_mdm.api", "get_zwrt_common_info", json!({})).await;
@@ -1220,722 +798,310 @@ pub async fn collect(sample_interval_ms: u64, hub: &crate::block::Hub) -> Snapsh
         json!({"source_module":"web","cid":1,"connect_status":""}),
     )
     .await;
-    // `/v2` 派生块的健康：信号块看 nwinfo，live 块看 system info 和实时流量。
-    let signal_ok = net.is_ok();
-    let live_ok = info.is_ok() && traffic.is_ok();
-    // 没发请求、沿用上一次值的不算读到（`ubus_ttl_read`）：块照 V2-12 置 stale。
-    let sim_ok = sim_read;
-    // 旧 /state 读者迁到 /v2 用的块（u60-features.md §0.1，V2-46）：各看自己的来源。
-    let clients_ok = lan_clients.is_ok() && wifi_clients.is_ok();
-    let qos_ok = signal_ok && usb.is_ok();
-    let interfaces_ok = wan4_if.is_ok() && cellular.is_ok();
     // stall 的 30 秒窗口：厂商收发包数（cell_window.rs；没读到就作废窗口）
     crate::cell_window::sample(
         now_ms(),
         traffic.as_ref().ok().and_then(crate::cell_window::counts),
     );
-    let common = object(common);
-    let board = object(board);
-    let info = object(info);
-    let mut raw_net = object(net);
-    let traffic = object(traffic);
-    let accounting = object(accounting);
-    let limit = object(limit);
-    let clear_day = object(clear_day);
-    let sim = object(sim);
-    let imei = object(imei);
-    let lan_clients = object(lan_clients);
-    let wifi_clients = object(wifi_clients);
-    let router_status = object(router_status);
-    let thermal = object(thermal);
-    let usb = object(usb);
-    let nfc_ok = nfc.is_ok();
-    let nfc = object(nfc);
-    let sms_ok = sms_capacity.is_ok();
-    // V2-30：短信块。容量和两库第一页都读成功才算读成功（任一失败 → stale）。
-    let sms_list_ok = matches!((&sms_nv, &sms_sim), (Ok(_), Ok(_))) && nv_read && sim_list_read;
-    let sms_block = match (&sms_capacity, &sms_nv, &sms_sim) {
-        (Ok(capacity), Ok(nv), Ok(sim)) if capacity_read && nv_read && sim_list_read => {
-            Ok(crate::sms::block_data(capacity, nv, sim))
-        }
-        _ => Err("zwrt_wms capacity or SMS list read failed".to_string()),
-    };
-    let sms_capacity = object(sms_capacity);
-    let sms_nv = object(sms_nv);
-    let sms_sim = object(sms_sim);
-    let lan_if = object(lan_if);
-    let wan4_if = object(wan4_if);
-    let wan6_if = object(wan6_if);
-    let lan_config = object(lan_config);
-    let cellular = object(cellular);
-    let packages = [
-        "zwrt_zte_mdm",
-        "zwrt_common_info",
-        "network",
-        "dhcp",
-        "zwrt_data_commit",
-        "system",
-        "zwrt_web",
-        "zwrt_tr069",
-        "zwrt_router",
-        "zte_nwinfo",
-        "zwrt_zte_nwinfo",
-        "wireless",
-        "mwan3",
-    ];
     let mut uci_sets = Vec::new();
     // Configuration packages change only when someone saves settings, and
     // every save through /control clears the cache.
-    for p in packages {
+    for p in snapshot::PACKAGES {
         uci_sets.push(uci_show_ttl(30, p).await)
     }
-    let model_name = string(&common, "model_name");
-    let hardware_version = string(&common, "hardware_version");
-    let profile_source = if !model_name.is_empty() {
-        "model_name"
-    } else {
-        "hardware_version"
+    let sms_list = match &sms_capacity {
+        Ok(_) => Some(
+            crate::sms::normalize_lists(&[object(sms_nv.clone()), object(sms_sim.clone())]).await,
+        ),
+        Err(_) => None,
     };
-    let profile = normalize_profile(if !model_name.is_empty() {
-        &model_name
-    } else {
-        &hardware_version
-    });
-    let template = match profile.as_str() {
-        "mu5250" => "MU5250",
-        "mu5252" => "MU5252",
-        "mc7523" => "MC7523",
-        "mc8532b" => "MC8532B",
-        _ => "legacy_compat",
-    };
-    // Only templates the C side marks NETWORK_SOURCE_NWINFO_UBUS_WITH_UCI_FALLBACK
-    // may fill network fields from the zte_nwinfo UCI cache. MU5250/MC7523 are
-    // ubus-only: a failed nwinfo call must read as "no data", not stale UCI.
-    if matches!(template, "MU5252" | "MC8532B") {
-        topflow_net_fallback(&mut raw_net, &uci_sets);
-    }
-    let mut net = Map::new();
-    for (to, from) in [
-        ("type", "network_type"),
-        ("roaming", "simcard_roam"),
-        ("operator", "network_provider_fullname"),
-        ("band", "wan_active_band"),
-        ("nr_band", "nr5g_action_band"),
-        ("nr_snr", "nr5g_snr"),
-        ("lte_snr", "lte_snr"),
-        ("nr_bw", "nr5g_bandwidth"),
-        ("nrca", "nrca"),
-        ("lteca", "lteca"),
-        ("ltecasig", "ltecasig"),
-        ("net_select", "net_select"),
-        ("sa_bands", "nr5g_sa_band_lock"),
-        ("nsa_bands", "nr5g_nsa_band_lock"),
-        ("lte_bands", "lte_band"),
-        ("lte_supported_bands", "lte_band"),
-        ("nr_sa_supported_bands", "nr5g_sa_band_lock"),
-        ("nr_nsa_supported_bands", "nr5g_nsa_band_lock"),
-    ] {
-        net.insert(to.into(), json!(string(&raw_net, from)));
-    }
-    // The *_band_lock fields are the current lock set: after locking to n78
-    // they read "78", so they cannot list what the modem supports. The stock
-    // web UI takes the choices from zwrt_zte_nwinfo.default_band_lock (the
-    // full set a band reset goes back to); use it, and keep the lock field
-    // only as a fallback for firmware without that section.
-    for (to, opt) in [
-        ("lte_supported_bands", "default_lte_ext_band_lock"),
-        ("nr_sa_supported_bands", "default_nr5g_sa_band_lock"),
-        ("nr_nsa_supported_bands", "default_nr5g_nsa_band_lock"),
-    ] {
-        let v = uci_get(
-            &uci_sets,
-            &format!("zwrt_zte_nwinfo.default_band_lock.{opt}"),
-        );
-        if !v.is_empty() {
-            net.insert(to.into(), json!(v));
-        }
-    }
-    for (to, from) in [
-        ("bars", "signalbar"),
-        ("nr_rsrp", "nr5g_rsrp"),
-        ("nr_rsrq", "nr5g_rsrq"),
-        ("nr_rssi", "nr5g_rssi"),
-        ("lte_rsrp", "lte_rsrp"),
-        ("lte_rsrq", "lte_rsrq"),
-        ("lte_rssi", "lte_rssi"),
-        ("rssi", "rssi"),
-        ("mcc", "rmcc"),
-        ("mnc", "rmnc"),
-        ("lte_pci", "lte_pci"),
-        ("lte_cell_id", "cell_id"),
-        ("lte_channel", "wan_active_channel"),
-        ("nr_pci", "nr5g_pci"),
-        ("nr_cell_id", "nr5g_cell_id"),
-        ("nr_channel", "nr5g_action_channel"),
-    ] {
-        net.insert(to.into(), json!(integer(&raw_net, from)));
-    }
-    net.insert(
-        "wan_status".into(),
-        json!(string(&router_status, "current_wan_status")),
-    );
-    net.insert("HSR".into(), json!(false));
-    let mut tout = Map::new();
-    for (to, from) in [
-        ("rx_speed", "real_rx_speed"),
-        ("tx_speed", "real_tx_speed"),
-        ("max_rx_speed", "real_max_rx_speed"),
-        ("max_tx_speed", "real_max_tx_speed"),
-        ("rx_bytes", "real_rx_bytes"),
-        ("tx_bytes", "real_tx_bytes"),
-        ("session_time", "real_time"),
-    ] {
-        tout.insert(to.into(), json!(integer(&traffic, from)));
-    }
-    for key in [
-        "day_rx_bytes",
-        "day_tx_bytes",
-        "month_rx_bytes",
-        "month_tx_bytes",
-        "total_rx_bytes",
-        "total_tx_bytes",
-    ] {
-        tout.insert(key.into(), json!(integer(&accounting, key)));
-    }
-    tout.insert("limit".into(), limit);
-    tout.insert("clear_day".into(), clear_day);
-    let wifi = wifi_section(template, &uci_sets);
     let (cpu_sys, zones, runtime_zones) = thermal_zones();
-    // MU5250/MU5252 only trust ubus's `cpuss_temp` (matches the C template's
-    // TEMP_SOURCE_U60_UBUS_ONLY) — no other-key or sysfs-average fallback,
-    // since that silently substitutes a plausible-looking but wrong value.
-    let cpu_temp = if matches!(template, "MU5250" | "MU5252") {
-        let v = integer_or(&thermal, "cpuss_temp", -1);
-        if v < 0 {
-            0
-        } else if v >= 1000 {
-            (v + 500) / 1000
-        } else {
-            v
-        }
+    let (cpu_usage_tenths, runtime) = runtime(runtime_zones);
+    Inputs {
+        common,
+        board,
+        info,
+        net,
+        traffic,
+        accounting,
+        limit,
+        clear_day,
+        sim,
+        sim_read,
+        imei,
+        lan_clients,
+        wifi_clients,
+        router_status,
+        thermal,
+        hightemp,
+        usb,
+        battery,
+        charger,
+        nfc,
+        sms_capacity,
+        capacity_read,
+        sms_nv,
+        nv_read,
+        sms_sim,
+        sim_list_read,
+        sms_list,
+        lan_if,
+        wan4_if,
+        wan6_if,
+        lan_config,
+        cellular,
+        uci_sets,
+        qos_logs: crate::qos::logs(),
+        leases: lease_metadata(),
+        rails: read_rails(),
+        cpu_sys,
+        zones,
+        cpu_usage_tenths,
+        runtime,
+    }
+}
+
+/// MU5252（TopFlow）的多模组部分：按卡槽、按外挂模组再调 ubus（和 adb），边读边算，
+/// 补 `modems`、`thermal.modems`、`aggregation`、`multiwan`。Phase 2a 原样留在 IO 层，没拆成纯函数。
+async fn mu5252_extras(ctx: Mu5252Ctx, fields: &mut Map<String, Value>) {
+    let Mu5252Ctx {
+        raw_net,
+        imsi,
+        msisdn,
+        cpu_temp,
+        sim,
+        imei,
+        cellular,
+        wan4_if,
+        wan6_if,
+        uci_sets,
+    } = ctx;
+    let active_subid = integer(&sim, "current_sim_slot").clamp(1, 6);
+    let x75_traffic = object(
+        ubus(
+            "zwrt_data",
+            "get_wwandst",
+            json!({"source_module":"deviceui","cid":1,"type":1,"subid":active_subid}),
+        )
+        .await,
+    );
+    let v3t = object(ubus("zwrt_zte_mdm.api", "get_v3t_sim_info", json!({})).await);
+    let msim = object(ubus("zte_nwinfo_api", "nwinfo_get_msim_netinfo", json!({})).await);
+    let mut modems = Vec::new();
+    let network_type = string(&raw_net, "network_type");
+    let bandwidth = if matches!(network_type.as_str(), "SA" | "NSA") {
+        string(&raw_net, "nr5g_bandwidth")
     } else {
-        ["cpuss_temp", "cpu_temp", "temperature", "temp"]
-            .into_iter()
-            .map(|k| integer(&thermal, k))
-            .find(|v| *v > 0)
-            .map(|v| if v >= 1000 { (v + 500) / 1000 } else { v })
-            .unwrap_or(cpu_sys)
+        string(&raw_net, "lte_bandwidth")
     };
-    let (mt, ma, mp) = memory_fields(&info);
-    let release = board.get("release").unwrap_or(&Value::Null);
-    let sw = {
-        let a = string(&common, "wa_inner_version");
-        if a.is_empty() {
-            string(&common, "integrate_version")
-        } else {
-            a
-        }
-    };
-    let mut fields = Map::new();
-    fields.insert("net".into(), Value::Object(net));
-    let (client_list, wifi_count, lan_count) = connected_clients(&lan_clients, &wifi_clients);
-    fields.insert(
-        "clients".into(),
-        json!({"total":wifi_count+lan_count,"wifi":wifi_count,"lan":lan_count,"list":client_list}),
-    );
-    power_fields(&mut fields, template, battery, charger);
-    if sms_ok {
-        let list = crate::sms::normalize_lists(&[sms_nv.clone(), sms_sim.clone()]).await;
-        fields.insert("sms".into(),json!({"unread":integer(&sms_capacity,"sms_dev_unread_num")+integer(&sms_capacity,"sms_sim_unread_num"),"list":list}));
-    }
-    fields.insert("traffic".into(), Value::Object(tout));
-    if let Some(s) = wifi {
-        fields.insert("wlan".into(),json!({"ssid":uci_get(&uci_sets,&format!("wireless.{s}.ssid")),"enc":uci_get(&uci_sets,&format!("wireless.{s}.encryption")),"enabled":i64::from(uci_get(&uci_sets,&format!("wireless.{s}.disabled"))!="1")}));
-    }
-    if nfc_ok
-        && nfc.as_object().is_some_and(|v| {
-            v.contains_key("switch") || v.contains_key("ap") || v.contains_key("wifi_ap")
-        })
-    {
-        fields.insert("nfc".into(), json!({"switch":integer(&nfc,"switch")}));
-    }
-    fields.insert(
-        "thermal".into(),
-        json!({"cpu_celsius":cpu_temp,"zones":zones,"modems":[],"hightemp_limit":hightemp_limit(&hightemp)}),
-    );
-    fields.insert("interfaces".into(),json!({"lan":interface(&lan_if),"wan4":interface(&wan4_if),"wan6":interface(&wan6_if),"lan_config":lan_config,"cellular":cellular}));
-    const UF: &[(&str, &str)] = &[
-        ("iccid", "zwrt_zte_mdm.sim_info.sim_iccid"),
-        ("imsi", "zwrt_zte_mdm.sim_info.sim_imsi"),
-        ("msisdn", "zwrt_zte_mdm.sim_info.msisdn"),
-        ("mcc", "zwrt_zte_mdm.sim_info.mdm_mcc"),
-        ("mnc", "zwrt_zte_mdm.sim_info.mdm_mnc"),
-        ("imei", "zwrt_zte_mdm.device_info.imei"),
-        ("mac_address", "zwrt_zte_mdm.device_info.wlan_mac_address"),
-        ("modem_msn", "zwrt_zte_mdm.device_info.modem_msn"),
-        (
-            "wa_inner_version",
-            "zwrt_common_info.common_config.wa_inner_version",
-        ),
-        (
-            "integrate_version",
-            "zwrt_common_info.common_config.integrate_version",
-        ),
-        (
-            "common_model_name",
-            "zwrt_common_info.common_config.model_name",
-        ),
-        (
-            "device_alias_name",
-            "zwrt_common_info.common_config.device_alias_name",
-        ),
-        (
-            "device_market_name",
-            "zwrt_common_info.common_config.device_market_name",
-        ),
-        ("lan_ipaddr", "network.lan.ipaddr"),
-        ("lan_netmask", "network.lan.netmask"),
-        ("wan_dns", "network.zte_wan.dns"),
-        ("dhcpEnabled", "dhcp.lan.ignore"),
-        ("dhcpStart", "dhcp.lan.zte_start"),
-        ("dhcpEnd", "dhcp.lan.zte_end"),
-        ("dhcpLease_hour", "dhcp.lan.leasetime"),
-        ("hostname", "system.@system[0].hostname"),
-        ("timezone", "system.@system[0].timezone"),
-        ("web_language", "zwrt_web.setting.web_language"),
-        ("login_timeout", "zwrt_web.config.login_timeout"),
-        ("device_model", "zwrt_tr069.DeviceInfo.ModelName"),
-        ("device_manufacturer", "zwrt_tr069.DeviceInfo.Manufacturer"),
-        ("hardware_version", "zwrt_tr069.DeviceInfo.HardwareVersion"),
-        ("software_version", "zwrt_tr069.DeviceInfo.SoftwareVersion"),
-        ("serial_number", "zwrt_tr069.DeviceInfo.SerialNumber"),
-        ("mtu", "zwrt_router.network.mtu"),
-        ("mss", "zwrt_router.network.mss"),
-        ("sim_states", "zwrt_zte_mdm.sim_info.sim_states"),
-        ("modem_main_state", "zwrt_zte_mdm.sim_info.modem_main_state"),
-        ("pin_status", "zwrt_zte_mdm.sim_info.pin_status"),
-        (
-            "hardware_version_ci",
-            "zwrt_common_info.common_config.hardware_version",
-        ),
-        ("login_fail_num", "zwrt_web.config.login_fail_num"),
-        (
-            "login_fail_lock_timeout",
-            "zwrt_web.config.login_fail_lock_timeout",
-        ),
-        ("day_tx_bytes", "zwrt_data_commit.wwancid1dst.day_tx_bytes"),
-        ("day_rx_bytes", "zwrt_data_commit.wwancid1dst.day_rx_bytes"),
-        ("day_time", "zwrt_data_commit.wwancid1dst.day_time"),
-        (
-            "month_tx_bytes",
-            "zwrt_data_commit.wwancid1dst.month_tx_bytes",
-        ),
-        (
-            "month_rx_bytes",
-            "zwrt_data_commit.wwancid1dst.month_rx_bytes",
-        ),
-        ("month_time", "zwrt_data_commit.wwancid1dst.month_time"),
-        (
-            "total_tx_bytes",
-            "zwrt_data_commit.wwancid1dst.total_tx_bytes",
-        ),
-        (
-            "total_rx_bytes",
-            "zwrt_data_commit.wwancid1dst.total_rx_bytes",
-        ),
-        ("total_time", "zwrt_data_commit.wwancid1dst.total_time"),
-        ("radio_network_type", "zte_nwinfo.sys_info.network_type"),
-        ("radio_signalbar", "zte_nwinfo.signal_strength.signalbar"),
-        (
-            "radio_operator",
-            "zte_nwinfo.plmn_info.network_provider_fullname",
-        ),
-        ("radio_lte_band", "zte_nwinfo.wan_active_band.GWLSA_band"),
-        ("radio_nr_band", "zte_nwinfo.wan_active_band.odu_nrband"),
-        ("radio_lte_rsrp", "zte_nwinfo.signal_strength.lte_rsrp"),
-        ("radio_lte_rsrq", "zte_nwinfo.signal_strength.lte_rsrq"),
-        ("radio_lte_snr", "zte_nwinfo.signal_strength.lte_snr"),
-        ("radio_nr_rsrp", "zte_nwinfo.signal_strength.nr5g_rsrp"),
-        ("radio_nr_rsrq", "zte_nwinfo.signal_strength.nr5g_rsrq"),
-        ("radio_nr_snr", "zte_nwinfo.signal_strength.nr5g_snr"),
-        ("radio_lte_cell_id", "zte_nwinfo.cell_info.cell_id"),
-        ("radio_lte_pci", "zte_nwinfo.cell_info.lte_pci"),
-        (
-            "radio_lte_channel",
-            "zte_nwinfo.cell_info.wan_active_channel",
-        ),
-        ("radio_nr_pci", "zte_nwinfo.cell_info.nr5g_pci"),
-        (
-            "radio_nr_channel",
-            "zte_nwinfo.cell_info.nr5g_action_channel",
-        ),
-        ("radio_nr_bandwidth", "zte_nwinfo.cell_info.nr5g_bandwidth"),
-        ("radio_lteca", "zte_nwinfo.sys_info.lteca"),
-        ("radio_net_select", "zte_nwinfo.sys_info.net_select"),
-        (
-            "radio_nr_sa_bands",
-            "zte_nwinfo.band_lock.nr5g_sa_band_lock",
-        ),
-        (
-            "radio_nr_nsa_bands",
-            "zte_nwinfo.band_lock.nr5g_nsa_band_lock",
-        ),
-        ("radio_lte_bands", "zte_nwinfo.band_lock.lte_ext_band_lock"),
+    let x75_qos = crate::qos::read(qos_query(&raw_net, &imsi));
+    modems.push(json!({
+        "id":"x75","role":"integrated_5g","transport":"rmnet","subid":active_subid,
+        "ifname":"rmnet_data0","wan_interface":"zte_mwan2",
+        "net":{"type":network_type,"bars":integer(&raw_net,"signalbar"),"roaming":string(&raw_net,"simcard_roam"),"operator":string(&raw_net,"network_provider_fullname"),"band":string(&raw_net,"wan_active_band"),"bandwidth":bandwidth,"nr_rsrp":integer(&raw_net,"nr5g_rsrp"),"nr_rsrq":integer(&raw_net,"nr5g_rsrq"),"nr_snr":string(&raw_net,"nr5g_snr"),"nr_pci":integer(&raw_net,"nr5g_pci"),"nr_cell_id":integer(&raw_net,"nr5g_cell_id"),"nr_channel":integer(&raw_net,"nr5g_action_channel"),"lte_rsrp":integer(&raw_net,"lte_rsrp"),"lte_rsrq":integer(&raw_net,"lte_rsrq"),"lte_pci":integer(&raw_net,"lte_pci"),"cell_id":integer(&raw_net,"cell_id")},
+        "sim":{"state":string(&sim,"sim_states"),"slot":integer(&sim,"current_sim_slot"),"iccid":string(&sim,"sim_iccid"),"imsi":imsi,"msisdn":msisdn,"imei":string(&imei,"imei")},
+        "wwan":{"status":string(&cellular,"connect_status"),"ipv4_ifname":string(&cellular,"ipv4_dev_name"),"ipv6_ifname":string(&cellular,"ipv6_dev_name")},
+        "interfaces":{"ipv4":interface(&wan4_if),"ipv6":interface(&wan6_if)},
+        "traffic":realtime_traffic(&x75_traffic),
+        "qos":{"qci":x75_qos.qci,"ambr_dl":x75_qos.ambr_dl,"ambr_ul":x75_qos.ambr_ul,"sampled_at":0}
+    }));
+    let mut thermal_modems = vec![
+        json!({"id":"x75","available":cpu_temp>0,"celsius":if cpu_temp>0 {json!(cpu_temp)} else {Value::Null}}),
     ];
-    let mut ui = Map::new();
-    for (k, p) in UF {
-        let v = uci_get(&uci_sets, p);
-        if !v.is_empty() {
-            ui.insert((*k).into(), json!(v));
-        }
-    }
-    fields.insert("uci_device_info".into(), Value::Object(ui));
-    let mut imsi = string(&sim, "sim_imsi");
-    if !valid_imsi(&imsi) {
-        imsi = uci_get(&uci_sets, "zwrt_zte_mdm.sim_info.sim_imsi").into();
-        if !valid_imsi(&imsi) {
-            imsi.clear();
-        }
-    }
-    let qos = crate::qos::read(qos_query(&raw_net, &imsi));
-    fields.insert(
-        "qos".into(),
-        json!({"qci":qos.qci,"ambr_dl":qos.ambr_dl,"ambr_ul":qos.ambr_ul,"bearer":qos.bearer,"stale":qos.stale,"usb_mode":string(&usb,"mode")}),
-    );
-    let mut msisdn = string(&sim, "msisdn");
-    if !valid_msisdn(&msisdn) {
-        msisdn = uci_get(&uci_sets, "zwrt_zte_mdm.sim_info.msisdn").into();
-        if !valid_msisdn(&msisdn) {
-            msisdn.clear();
-        }
-    }
-    fields.insert("sim".into(),json!({"iccid":string(&sim,"sim_iccid"),"imsi":imsi.clone(),"msisdn":msisdn.clone(),"spn":spn_from_ucs2_hex(&string(&sim,"spn_name_data")),"state":string(&sim,"sim_states"),"modem_state":string(&sim,"modem_main_state"),"pin_status":string(&sim,"pin_status"),"current_slot":integer(&sim,"current_sim_slot"),"dual_sim":integer(&sim,"support_dual_sim"),"sim1_provision":integer(&sim,"sim1_provision_state"),"sim2_provision":integer(&sim,"sim2_provision_state")}));
-    if template == "MU5252" {
-        let active_subid = integer(&sim, "current_sim_slot").clamp(1, 6);
-        let x75_traffic = object(
+    let adb = std::env::var("ZWRT_DATAD_ADB_BIN").ok();
+    for index in 0..2usize {
+        let id = if index == 0 { "v3e1" } else { "v3e2" };
+        let serial = if index == 0 {
+            "V3E1T12345"
+        } else {
+            "V3E2T12345"
+        };
+        let ifname = if index == 0 { "V3E1net0" } else { "V3E2net0" };
+        let wan = if index == 0 { "zte_mwan3" } else { "zte_mwan4" };
+        let usb_path = if index == 0 { "1-1" } else { "1-2" };
+        let usb_id = if index == 0 { "19d2:0581" } else { "19d2:1716" };
+        let sim_prefix = format!("v3t_{}", index + 1);
+        let slot = integer(&v3t, &format!("{sim_prefix}_st_slot")).clamp(0, 1);
+        let subid = if index == 0 { 3 + slot } else { 5 + slot };
+        let ext_net = topflow_external_net(&msim, &uci_sets, index, slot);
+        let wwan = object(
             ubus(
                 "zwrt_data",
-                "get_wwandst",
-                json!({"source_module":"deviceui","cid":1,"type":1,"subid":active_subid}),
+                "get_wwaniface",
+                json!({"source_module":"deviceui","cid":1,"subid":subid}),
             )
             .await,
         );
-        let v3t = object(ubus("zwrt_zte_mdm.api", "get_v3t_sim_info", json!({})).await);
-        let msim = object(ubus("zte_nwinfo_api", "nwinfo_get_msim_netinfo", json!({})).await);
-        let mut modems = Vec::new();
-        let network_type = string(&raw_net, "network_type");
-        let bandwidth = if matches!(network_type.as_str(), "SA" | "NSA") {
-            string(&raw_net, "nr5g_bandwidth")
-        } else {
-            string(&raw_net, "lte_bandwidth")
-        };
-        let x75_qos = crate::qos::read(qos_query(&raw_net, &imsi));
+        let ext_traffic = object(
+            ubus(
+                "zwrt_data",
+                "get_wwandst",
+                json!({"source_module":"deviceui","cid":1,"type":1,"subid":subid}),
+            )
+            .await,
+        );
+        let ipv4 = object(ubus(&format!("network.interface.{wan}"), "status", json!({})).await);
+        let ipv6 = object(ubus(&format!("network.interface.{wan}_6"), "status", json!({})).await);
+        let mut ext_qos = crate::qos::Values::default();
+        let mut sampled_at = 0i64;
+        let mut external_temp = None;
+        if let Some(adb) = &adb {
+            if let Ok(raw) = command::run(
+                adb,
+                [
+                    "-s",
+                    serial,
+                    "shell",
+                    "grep QCI= /logfs/key.log | tail -n 64",
+                ],
+                Duration::from_secs(5),
+            )
+            .await
+                && let Some(parsed) = crate::qos::parse_external(&String::from_utf8_lossy(&raw))
+            {
+                ext_qos = parsed;
+                sampled_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+            }
+            if let Ok(raw) = command::run(
+                adb,
+                [
+                    "-s",
+                    serial,
+                    "shell",
+                    "cat",
+                    "/sys/devices/virtual/power/zte_power/adc2_temp",
+                ],
+                Duration::from_secs(5),
+            )
+            .await
+            {
+                external_temp = String::from_utf8_lossy(&raw)
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|v| (-40..=125).contains(v));
+            }
+        }
+        thermal_modems.push(json!({"id":id,"available":external_temp.is_some(),"celsius":external_temp,"sampled_at":if external_temp.is_some(){sampled_at}else{0}}));
         modems.push(json!({
-            "id":"x75","role":"integrated_5g","transport":"rmnet","subid":active_subid,
-            "ifname":"rmnet_data0","wan_interface":"zte_mwan2",
-            "net":{"type":network_type,"bars":integer(&raw_net,"signalbar"),"roaming":string(&raw_net,"simcard_roam"),"operator":string(&raw_net,"network_provider_fullname"),"band":string(&raw_net,"wan_active_band"),"bandwidth":bandwidth,"nr_rsrp":integer(&raw_net,"nr5g_rsrp"),"nr_rsrq":integer(&raw_net,"nr5g_rsrq"),"nr_snr":string(&raw_net,"nr5g_snr"),"nr_pci":integer(&raw_net,"nr5g_pci"),"nr_cell_id":integer(&raw_net,"nr5g_cell_id"),"nr_channel":integer(&raw_net,"nr5g_action_channel"),"lte_rsrp":integer(&raw_net,"lte_rsrp"),"lte_rsrq":integer(&raw_net,"lte_rsrq"),"lte_pci":integer(&raw_net,"lte_pci"),"cell_id":integer(&raw_net,"cell_id")},
-            "sim":{"state":string(&sim,"sim_states"),"slot":integer(&sim,"current_sim_slot"),"iccid":string(&sim,"sim_iccid"),"imsi":imsi,"msisdn":msisdn,"imei":string(&imei,"imei")},
-            "wwan":{"status":string(&cellular,"connect_status"),"ipv4_ifname":string(&cellular,"ipv4_dev_name"),"ipv6_ifname":string(&cellular,"ipv6_dev_name")},
-            "interfaces":{"ipv4":interface(&wan4_if),"ipv6":interface(&wan6_if)},
-            "traffic":realtime_traffic(&x75_traffic),
-            "qos":{"qci":x75_qos.qci,"ambr_dl":x75_qos.ambr_dl,"ambr_ul":x75_qos.ambr_ul,"sampled_at":0}
+            "id":id,"role":"external_4g","transport":"cdc-ecm","subid":subid,"ifname":ifname,"wan_interface":wan,
+            "usb":{"path":usb_path,"id":usb_id,"present":false,"carrier":0},
+            "debug":{"transport":"adb","serial":serial,"available":adb.is_some()},
+            "net":ext_net,
+            "sim":{"state":prefixed_string(&v3t,&format!("{sim_prefix}_"),"modem_main_state"),"slot":slot,"iccid":prefixed_string(&v3t,&format!("{sim_prefix}_"),"sim_iccid"),"imsi":prefixed_string(&v3t,&format!("{sim_prefix}_"),"sim_imsi"),"msisdn":prefixed_string(&v3t,&format!("{sim_prefix}_"),"msisdn"),"imei":prefixed_string(&v3t,&format!("{sim_prefix}_"),"imei")},
+            "wwan":{"status":string(&wwan,"connect_status"),"ipv4_ifname":string(&wwan,"ipv4_dev_name"),"ipv6_ifname":string(&wwan,"ipv6_dev_name")},
+            "interfaces":{"ipv4":interface(&ipv4),"ipv6":interface(&ipv6)},
+            "traffic":realtime_traffic(&ext_traffic),
+            "qos":{"qci":ext_qos.qci,"ambr_dl":ext_qos.ambr_dl,"ambr_ul":ext_qos.ambr_ul,"sampled_at":sampled_at}
         }));
-        let mut thermal_modems = vec![
-            json!({"id":"x75","available":cpu_temp>0,"celsius":if cpu_temp>0 {json!(cpu_temp)} else {Value::Null}}),
-        ];
-        let adb = std::env::var("ZWRT_DATAD_ADB_BIN").ok();
-        for index in 0..2usize {
-            let id = if index == 0 { "v3e1" } else { "v3e2" };
-            let serial = if index == 0 {
-                "V3E1T12345"
-            } else {
-                "V3E2T12345"
-            };
-            let ifname = if index == 0 { "V3E1net0" } else { "V3E2net0" };
-            let wan = if index == 0 { "zte_mwan3" } else { "zte_mwan4" };
-            let usb_path = if index == 0 { "1-1" } else { "1-2" };
-            let usb_id = if index == 0 { "19d2:0581" } else { "19d2:1716" };
-            let sim_prefix = format!("v3t_{}", index + 1);
-            let slot = integer(&v3t, &format!("{sim_prefix}_st_slot")).clamp(0, 1);
-            let subid = if index == 0 { 3 + slot } else { 5 + slot };
-            let ext_net = topflow_external_net(&msim, &uci_sets, index, slot);
-            let wwan = object(
-                ubus(
-                    "zwrt_data",
-                    "get_wwaniface",
-                    json!({"source_module":"deviceui","cid":1,"subid":subid}),
-                )
-                .await,
-            );
-            let ext_traffic = object(
-                ubus(
-                    "zwrt_data",
-                    "get_wwandst",
-                    json!({"source_module":"deviceui","cid":1,"type":1,"subid":subid}),
-                )
-                .await,
-            );
-            let ipv4 = object(ubus(&format!("network.interface.{wan}"), "status", json!({})).await);
-            let ipv6 =
-                object(ubus(&format!("network.interface.{wan}_6"), "status", json!({})).await);
-            let mut ext_qos = crate::qos::Values::default();
-            let mut sampled_at = 0i64;
-            let mut external_temp = None;
-            if let Some(adb) = &adb {
-                if let Ok(raw) = command::run(
-                    adb,
-                    [
-                        "-s",
-                        serial,
-                        "shell",
-                        "grep QCI= /logfs/key.log | tail -n 64",
-                    ],
-                    Duration::from_secs(5),
-                )
-                .await
-                    && let Some(parsed) = crate::qos::parse_external(&String::from_utf8_lossy(&raw))
-                {
-                    ext_qos = parsed;
-                    sampled_at = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
-                }
-                if let Ok(raw) = command::run(
-                    adb,
-                    [
-                        "-s",
-                        serial,
-                        "shell",
-                        "cat",
-                        "/sys/devices/virtual/power/zte_power/adc2_temp",
-                    ],
-                    Duration::from_secs(5),
-                )
-                .await
-                {
-                    external_temp = String::from_utf8_lossy(&raw)
-                        .trim()
-                        .parse::<i64>()
-                        .ok()
-                        .filter(|v| (-40..=125).contains(v));
-                }
-            }
-            thermal_modems.push(json!({"id":id,"available":external_temp.is_some(),"celsius":external_temp,"sampled_at":if external_temp.is_some(){sampled_at}else{0}}));
-            modems.push(json!({
-                "id":id,"role":"external_4g","transport":"cdc-ecm","subid":subid,"ifname":ifname,"wan_interface":wan,
-                "usb":{"path":usb_path,"id":usb_id,"present":false,"carrier":0},
-                "debug":{"transport":"adb","serial":serial,"available":adb.is_some()},
-                "net":ext_net,
-                "sim":{"state":prefixed_string(&v3t,&format!("{sim_prefix}_"),"modem_main_state"),"slot":slot,"iccid":prefixed_string(&v3t,&format!("{sim_prefix}_"),"sim_iccid"),"imsi":prefixed_string(&v3t,&format!("{sim_prefix}_"),"sim_imsi"),"msisdn":prefixed_string(&v3t,&format!("{sim_prefix}_"),"msisdn"),"imei":prefixed_string(&v3t,&format!("{sim_prefix}_"),"imei")},
-                "wwan":{"status":string(&wwan,"connect_status"),"ipv4_ifname":string(&wwan,"ipv4_dev_name"),"ipv6_ifname":string(&wwan,"ipv6_dev_name")},
-                "interfaces":{"ipv4":interface(&ipv4),"ipv6":interface(&ipv6)},
-                "traffic":realtime_traffic(&ext_traffic),
-                "qos":{"qci":ext_qos.qci,"ambr_dl":ext_qos.ambr_dl,"ambr_ul":ext_qos.ambr_ul,"sampled_at":sampled_at}
-            }));
-        }
-        if let Some(thermal) = fields.get_mut("thermal") {
-            thermal["modems"] = Value::Array(thermal_modems);
-        }
-        fields.insert("modems".into(), Value::Array(modems));
-        let mode = uci_value("zwrt_router.network.opms_wan_mode").await;
-        let mwan_running = std::env::var("ZWRT_DATAD_MWAN3_RUNNING")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .is_some_and(|v| v != 0);
-        let mwan_status = object(ubus("mwan3", "status", json!({})).await);
-        let mut paths = Vec::new();
-        let interfaces = mwan_status
-            .get("interfaces")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        for (id, label, name) in [
-            ("x75", "X75", "zte_mwan2"),
-            ("v3e1", "V3E1", "zte_mwan3"),
-            ("v3e2", "V3E2", "zte_mwan4"),
-            ("ethernet", "Ethernet", "waneth"),
-        ] {
-            let Some(path) = interfaces.get(name) else {
-                continue;
-            };
-            let enabled = parse_bool(path, "enabled");
-            let running = parse_bool(path, "running");
-            let mwan_up = parse_bool(path, "up");
-            let iface =
-                object(ubus(&format!("network.interface.{name}"), "status", json!({})).await);
-            let interface_up = parse_bool(&iface, "up");
-            let up = mwan_up || interface_up;
-            if !enabled && !running && !up {
-                continue;
-            }
-            let status = string(path, "status");
-            let online = status.eq_ignore_ascii_case("online")
-                || (running && mwan_up)
-                || (!mwan_running && interface_up);
-            let mut targets = Vec::new();
-            if let Some(raw_targets) = path.get("track_ip").and_then(Value::as_array) {
-                for target in raw_targets {
-                    let target_status = string(target, "status");
-                    let target_online =
-                        matches!(target_status.to_ascii_lowercase().as_str(), "online" | "up");
-                    targets.push(json!({"ip":string(target,"ip"),"status":target_status,"online":target_online,"latency_ms":target.get("latency").cloned().unwrap_or(Value::Null),"packet_loss_percent":target.get("packetloss").cloned().unwrap_or(Value::Null)}));
-                }
-            }
-            let preferred = targets
-                .iter()
-                .find(|target| target["online"] == true)
-                .or_else(|| targets.iter().find(|target| target["status"] != "skipped"));
-            let mut result = json!({"id":id,"label":label,"interface":name,"enabled":enabled,"running":running,"up":up,"online":online,"interface_up":interface_up,"interface_available":parse_bool(&iface,"available"),"interface_pending":parse_bool(&iface,"pending"),"status":status,"tracking":string(path,"tracking"),"uptime_seconds":integer(path,"uptime"),"targets":targets});
-            if let Some(preferred) = preferred {
-                if !preferred["latency_ms"].is_null() {
-                    result["latency_ms"] = preferred["latency_ms"].clone();
-                }
-                if !preferred["packet_loss_percent"].is_null() {
-                    result["packet_loss_percent"] = preferred["packet_loss_percent"].clone();
-                }
-            }
-            paths.push(result);
-        }
-        let path_count = paths.len();
-        let online_path_count = paths.iter().filter(|path| path["online"] == true).count();
-        let (tcp_tunnel_count, runtime_ip, runtime_port, icg_running) = tcp_aggregation_summary();
-        let provisioned = !uci_value("zwrt_router.icgmwan.IcgDevId").await.is_empty();
-        let remaining = uci_value("zwrt_router.icgmwan.residual_flow").await;
-        let today_used = uci_value("zwrt_router.icgmwan.count_flow_today").await;
-        let config_path = std::env::var("ZWRT_DATAD_ICG_CONFIG")
-            .unwrap_or_else(|_| "/etc/config/icg.conf".into());
-        let icg_config: BTreeMap<String, String> = fs::read_to_string(config_path)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| {
-                let (k, v) = line.split_once('=')?;
-                Some((k.trim().into(), v.trim().into()))
-            })
-            .collect();
-        let server_ip = if runtime_ip.is_empty() {
-            icg_config
-                .get("AggregationServerIP")
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            runtime_ip
-        };
-        let tcp_port = if runtime_port == 0 {
-            icg_config
-                .get("AggregationServerTcpPort")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_default()
-        } else {
-            runtime_port
-        };
-        let udp_port = icg_config
-            .get("AggregationServerUdpStartPort")
-            .and_then(|v| v.parse::<u16>().ok())
-            .unwrap_or_default();
-        let enabled = mode == "SMULTIWAN";
-        fields.insert("aggregation".into(), json!({"enabled":enabled,"mode":mode,"state":if !enabled{"disabled"}else if !provisioned{"unprovisioned"}else if tcp_tunnel_count>0{"online"}else{"waiting"},"provisioned":provisioned,"online":tcp_tunnel_count>0,"controller":{"icg_process_running":icg_running,"mwan3_running":mwan_running},"tcp_tunnel_count":tcp_tunnel_count,"server":{"ip":server_ip,"tcp_port":tcp_port,"udp_start_port":udp_port,"source":if runtime_port>0{"runtime"}else{"config"}},"paths":paths,"path_count":path_count,"online_path_count":online_path_count,"traffic":{"remaining_bytes":remaining.parse::<u64>().ok(),"remaining_raw":remaining,"today_used_bytes":today_used.parse::<u64>().ok(),"today_used_raw":today_used}}));
-        fields.insert(
-            "multiwan".into(),
-            topflow_multiwan(&uci_sets, &mode, mwan_running),
-        );
-    } else {
-        fields.insert("modems".into(), json!([]));
     }
-    fields.insert("dhcp".into(),json!({"ip":uci_get(&uci_sets,"network.lan.ipaddr"),"start":uci_get(&uci_sets,"dhcp.lan.start"),"limit":uci_get(&uci_sets,"dhcp.lan.limit"),"leasetime":uci_get(&uci_sets,"dhcp.lan.leasetime")}));
-    let template_label = if template == "legacy_compat" {
-        "Legacy compatibility fallback"
-    } else {
-        template
-    };
-    fields.insert("device".into(),json!({"profile":profile,"profile_source":profile_source,"api_template":template,"api_template_label":template_label,"api_template_supported":i64::from(template!="legacy_compat"),"full_ubus":1,"vendor":string(&common,"manufacturer"),"model_name":model_name,"hardware_version":hardware_version,"market_name":string(&common,"device_market_name"),"alias_name":string(&common,"device_alias_name"),"board_name":string(&board,"board_name")}));
-    let (cpu_usage_tenths, runtime) = runtime(runtime_zones);
-    let cpu_usage = if cpu_usage_tenths >= 0 {
-        (cpu_usage_tenths + 5) / 10
-    } else {
-        -1
-    };
-    fields.insert("system".into(),json!({"uptime":integer(&info,"uptime"),"cpu_temp":cpu_temp,"cpu_usage":cpu_usage,"mem_used_pct":mp,"mem_total":mt,"mem_avail":ma,"model":string(&board,"model"),"hostname":string(&board,"hostname"),"fw":string(release,"description"),"sw_version":sw,"imei":string(&imei,"imei")}));
-    fields.insert("sample_interval_ms".into(), json!(sample_interval_ms));
-    fields.insert("runtime".into(), runtime);
-    // `/v2` 的派生块（不多调 ubus）：信号块 = `net`，live 块 = `system`、`runtime`、`traffic`。
-    let now = tokio::time::Instant::now();
-    hub.record(
-        "signal",
-        if signal_ok {
-            let mut net = fields["net"].clone();
-            add_roaming_fields(&mut net, &imsi);
-            Ok(net)
-        } else {
-            Err("zte_nwinfo_api nwinfo_get_netinfo failed".into())
-        },
-        now,
-    );
-    hub.record(
-        "live",
-        if live_ok {
-            Ok(json!({"system":fields["system"],"runtime":fields["runtime"],"traffic":fields["traffic"]}))
-        } else {
-            Err("system info or zwrt_data get_wwandst failed".into())
-        },
-        now,
-    );
-    hub.record("sms", sms_block, now);
-    // V2-47：短信列表 = `{list: 旧 /state 的 sms.list}`（块的 data 必须是对象）；两库第一页都读到才算读到（容量另算，在 sms 块里）。
-    hub.record(
-        "sms_list",
-        match fields.get("sms").and_then(|v| v.get("list")) {
-            Some(v) if sms_list_ok => Ok(json!({ "list": v })),
-            _ => Err("zwrt_wms SMS list read failed".into()),
-        },
-        now,
-    );
-    // sim 块 = 旧 `/state` 的 `sim` 对象（含 iccid）。zte-agent 的换卡监视靠它，
-    // 不再自己每 10 秒调 ubus（2026-10-03，apn_pick）。
-    hub.record(
-        "sim",
-        match fields.get("sim") {
-            Some(v) if sim_ok => Ok(v.clone()),
-            _ => Err("zwrt_zte_mdm.api get_sim_info failed".into()),
-        },
-        now,
-    );
-    // V2-46：data 和旧 /state 的同名对象同形；没生成（wlan、nfc）或来源没读到就 stale。
-    let dhcp_ok = !uci_get(&uci_sets, "network.lan.ipaddr").is_empty();
-    let device_ok = fields
-        .get("uci_device_info")
+    if let Some(thermal) = fields.get_mut("thermal") {
+        thermal["modems"] = Value::Array(thermal_modems);
+    }
+    fields.insert("modems".into(), Value::Array(modems));
+    let mode = uci_value("zwrt_router.network.opms_wan_mode").await;
+    let mwan_running = std::env::var("ZWRT_DATAD_MWAN3_RUNNING")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .is_some_and(|v| v != 0);
+    let mwan_status = object(ubus("mwan3", "status", json!({})).await);
+    let mut paths = Vec::new();
+    let interfaces = mwan_status
+        .get("interfaces")
         .and_then(Value::as_object)
-        .is_some_and(|m| !m.is_empty());
-    for (name, ok, why) in [
-        ("qos", qos_ok, "nwinfo or zwrt_bsp.usb read failed"),
-        ("clients", clients_ok, "router access lists read failed"),
-        ("wlan", true, "no wireless section"),
-        ("nfc", true, "zwrt_nfc read failed or no NFC"),
-        ("dhcp", dhcp_ok, "uci network/dhcp read failed"),
-        (
-            "interfaces",
-            interfaces_ok,
-            "zte_wan status or get_wwaniface failed",
-        ),
-        ("uci_device_info", device_ok, "uci read failed"),
+        .cloned()
+        .unwrap_or_default();
+    for (id, label, name) in [
+        ("x75", "X75", "zte_mwan2"),
+        ("v3e1", "V3E1", "zte_mwan3"),
+        ("v3e2", "V3E2", "zte_mwan4"),
+        ("ethernet", "Ethernet", "waneth"),
     ] {
-        hub.record(
-            name,
-            match fields.get(name) {
-                Some(v) if ok => Ok(v.clone()),
-                _ => Err(why.into()),
-            },
-            now,
-        );
+        let Some(path) = interfaces.get(name) else {
+            continue;
+        };
+        let enabled = parse_bool(path, "enabled");
+        let running = parse_bool(path, "running");
+        let mwan_up = parse_bool(path, "up");
+        let iface = object(ubus(&format!("network.interface.{name}"), "status", json!({})).await);
+        let interface_up = parse_bool(&iface, "up");
+        let up = mwan_up || interface_up;
+        if !enabled && !running && !up {
+            continue;
+        }
+        let status = string(path, "status");
+        let online = status.eq_ignore_ascii_case("online")
+            || (running && mwan_up)
+            || (!mwan_running && interface_up);
+        let mut targets = Vec::new();
+        if let Some(raw_targets) = path.get("track_ip").and_then(Value::as_array) {
+            for target in raw_targets {
+                let target_status = string(target, "status");
+                let target_online =
+                    matches!(target_status.to_ascii_lowercase().as_str(), "online" | "up");
+                targets.push(json!({"ip":string(target,"ip"),"status":target_status,"online":target_online,"latency_ms":target.get("latency").cloned().unwrap_or(Value::Null),"packet_loss_percent":target.get("packetloss").cloned().unwrap_or(Value::Null)}));
+            }
+        }
+        let preferred = targets
+            .iter()
+            .find(|target| target["online"] == true)
+            .or_else(|| targets.iter().find(|target| target["status"] != "skipped"));
+        let mut result = json!({"id":id,"label":label,"interface":name,"enabled":enabled,"running":running,"up":up,"online":online,"interface_up":interface_up,"interface_available":parse_bool(&iface,"available"),"interface_pending":parse_bool(&iface,"pending"),"status":status,"tracking":string(path,"tracking"),"uptime_seconds":integer(path,"uptime"),"targets":targets});
+        if let Some(preferred) = preferred {
+            if !preferred["latency_ms"].is_null() {
+                result["latency_ms"] = preferred["latency_ms"].clone();
+            }
+            if !preferred["packet_loss_percent"].is_null() {
+                result["packet_loss_percent"] = preferred["packet_loss_percent"].clone();
+            }
+        }
+        paths.push(result);
     }
-    Snapshot {
-        ts: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+    let path_count = paths.len();
+    let online_path_count = paths.iter().filter(|path| path["online"] == true).count();
+    let (tcp_tunnel_count, runtime_ip, runtime_port, icg_running) = tcp_aggregation_summary();
+    let provisioned = !uci_value("zwrt_router.icgmwan.IcgDevId").await.is_empty();
+    let remaining = uci_value("zwrt_router.icgmwan.residual_flow").await;
+    let today_used = uci_value("zwrt_router.icgmwan.count_flow_today").await;
+    let config_path =
+        std::env::var("ZWRT_DATAD_ICG_CONFIG").unwrap_or_else(|_| "/etc/config/icg.conf".into());
+    let icg_config: BTreeMap<String, String> = fs::read_to_string(config_path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (k, v) = line.split_once('=')?;
+            Some((k.trim().into(), v.trim().into()))
+        })
+        .collect();
+    let server_ip = if runtime_ip.is_empty() {
+        icg_config
+            .get("AggregationServerIP")
+            .cloned()
             .unwrap_or_default()
-            .as_secs() as i64,
-        datad: Default::default(),
-        fields,
-    }
+    } else {
+        runtime_ip
+    };
+    let tcp_port = if runtime_port == 0 {
+        icg_config
+            .get("AggregationServerTcpPort")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_default()
+    } else {
+        runtime_port
+    };
+    let udp_port = icg_config
+        .get("AggregationServerUdpStartPort")
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or_default();
+    let enabled = mode == "SMULTIWAN";
+    fields.insert("aggregation".into(), json!({"enabled":enabled,"mode":mode,"state":if !enabled{"disabled"}else if !provisioned{"unprovisioned"}else if tcp_tunnel_count>0{"online"}else{"waiting"},"provisioned":provisioned,"online":tcp_tunnel_count>0,"controller":{"icg_process_running":icg_running,"mwan3_running":mwan_running},"tcp_tunnel_count":tcp_tunnel_count,"server":{"ip":server_ip,"tcp_port":tcp_port,"udp_start_port":udp_port,"source":if runtime_port>0{"runtime"}else{"config"}},"paths":paths,"path_count":path_count,"online_path_count":online_path_count,"traffic":{"remaining_bytes":remaining.parse::<u64>().ok(),"remaining_raw":remaining,"today_used_bytes":today_used.parse::<u64>().ok(),"today_used_raw":today_used}}));
+    fields.insert(
+        "multiwan".into(),
+        topflow_multiwan(&uci_sets, &mode, mwan_running),
+    );
 }
 
 /// 一次 ubus 调用。经过单一采集执行者（`executor.rs`，V2-18）：执行者里直接发，别处排队；
@@ -2099,12 +1265,19 @@ mod tests {
                 "MU5250",
                 hub.legacy("battery"),
                 hub.legacy("charger"),
+                read_rails(),
             );
             f
         };
         let failed = {
             let mut f = Map::new();
-            power_fields(&mut f, "MU5250", Err("x".into()), Err("x".into()));
+            power_fields(
+                &mut f,
+                "MU5250",
+                Err("x".into()),
+                Err("x".into()),
+                read_rails(),
+            );
             f
         };
         // 从没读成功：和读失败一样。
@@ -2152,7 +1325,7 @@ mod tests {
         hub.record_read(0, Ok(bat.clone()), now);
         hub.record_read(1, Ok(chg.clone()), now);
         let mut f = Map::new();
-        power_fields(&mut f, "MU5250", Ok(bat), Ok(chg));
+        power_fields(&mut f, "MU5250", Ok(bat), Ok(chg), read_rails());
         // 电池先读、充电器后读：充电器读成功后电池的 data 跟着重算。
         assert_eq!(hub.view("battery").unwrap().data, f["battery"]);
         assert_eq!(hub.view("battery").unwrap().data["charging"], 1);
@@ -2452,6 +1625,7 @@ mod tests {
         let (items, wifi, lan) = connected_clients(
             &json!({"lan_access_list_info":[]}),
             &json!({"wireless_access_list_info":[{"mac_address":"AA:BB:CC:DD:EE:FF","ip_address":"192.168.0.2","hostname":"online"}]}),
+            &lease_metadata(),
         );
         assert_eq!(wifi, 1);
         assert_eq!(lan, 0);

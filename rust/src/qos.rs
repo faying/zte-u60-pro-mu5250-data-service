@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::Path,
+    sync::Arc,
 };
 
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
@@ -72,7 +73,8 @@ struct Candidate {
 // NSA does not rescan the logs.
 // ZWRT_DATAD_CACHE=0 turns this off, as for the state cache.
 const REUSE_FOR: std::time::Duration = std::time::Duration::from_secs(30);
-static LAST: std::sync::Mutex<Option<(std::time::Instant, Parsed)>> = std::sync::Mutex::new(None);
+static LAST: std::sync::Mutex<Option<(std::time::Instant, Arc<Parsed>)>> =
+    std::sync::Mutex::new(None);
 
 pub fn invalidate() {
     if let Ok(mut l) = LAST.lock() {
@@ -81,20 +83,25 @@ pub fn invalidate() {
 }
 
 pub fn read(query: Query) -> Values {
+    select(&logs(), query)
+}
+
+/// The parsed bearer lines of both logs (reused for 30 s). Picking one for a
+/// query is [`select`], a pure function.
+pub fn logs() -> Arc<Parsed> {
     let caching = std::env::var("ZWRT_DATAD_CACHE").as_deref() != Ok("0");
     if caching
         && let Ok(l) = LAST.lock()
         && let Some((at, parsed)) = l.as_ref()
         && at.elapsed() < REUSE_FOR
     {
-        return select(parsed, query);
+        return parsed.clone();
     }
-    let parsed = read_logs();
-    let v = select(&parsed, query);
+    let parsed = Arc::new(read_logs());
     if caching && let Ok(mut l) = LAST.lock() {
-        *l = Some((std::time::Instant::now(), parsed));
+        *l = Some((std::time::Instant::now(), parsed.clone()));
     }
-    v
+    parsed
 }
 
 fn read_logs() -> Parsed {
@@ -151,7 +158,7 @@ fn read_tail(path: &Path) -> Option<String> {
 /// Every data bearer found in the logs, oldest first, plus a bare `qci = …`
 /// seen outside any bearer context.
 #[derive(Clone, Default, Debug)]
-struct Parsed {
+pub struct Parsed {
     candidates: Vec<Candidate>,
     fallback_qci: Option<i64>,
 }
@@ -247,7 +254,7 @@ fn collect(texts: &[(&str, bool)]) -> Parsed {
     }
 }
 
-fn select(parsed: &Parsed, query: Query) -> Values {
+pub fn select(parsed: &Parsed, query: Query) -> Values {
     let mut candidates = parsed.candidates.clone();
     // The newest data bearer in the newest log wins. An EPS bearer names its
     // PLMN and an NR PDU session does not, so a PLMN match must not let an old

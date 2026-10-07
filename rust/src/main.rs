@@ -9,6 +9,7 @@ mod executor;
 mod legacy_hits;
 mod model;
 mod ops;
+mod project;
 mod qos;
 mod screen;
 mod server;
