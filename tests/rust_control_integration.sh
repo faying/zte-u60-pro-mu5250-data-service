@@ -177,7 +177,8 @@ for _ in $(seq 1 40); do
 done
 python3 -c 'import json,sys; b=json.load(open(sys.argv[1]))["blocks"]["sms"]; assert b["data"]=={"unread":1,"max_id":600,"count":0}, b' "$TMP/v2.json"
 # V2-31：datad 自己监听 zwrt_wms_status_event；新短信 + 事件后，sms 块在 3 秒内更新（不等 10 秒列表缓存）。
-grep -Fx 'listen zwrt_wms_status_event' "$MOCK_LISTEN_LOG" >/dev/null
+# V2-48：同一个子进程也收两个 USB 事件
+grep -Fx 'listen zwrt_wms_status_event BSP_TYPEC_EVENT BSP_POWERBANK_EVENT' "$MOCK_LISTEN_LOG" >/dev/null
 printf '601\n' >"$MOCK_SMS_COUNT_FILE"
 printf '%s\n' '{ "zwrt_wms_status_event": { "sms_new": 1 } }' >>"$MOCK_LISTEN_EVENTS_FILE"
 ok=0
