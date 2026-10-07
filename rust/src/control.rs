@@ -25,6 +25,7 @@ pub const ACTIONS: &[&str] = &[
     "lan.set",
     "power.direct_supply.set",
     "usb.set",
+    "usb.attach_mode",
     "nfc.set",
     "apn.set_mode",
     "apn.add",
@@ -292,6 +293,7 @@ pub async fn execute(action: &str, params: &Value) -> Outcome {
             )
             .await
         }
+        "usb.attach_mode" => usb_attach_mode(params).await,
         "nfc.set" => nfc(params).await,
         "apn.set_mode" => {
             mapped_call(
@@ -605,6 +607,121 @@ async fn direct_supply(params: &Value) -> Outcome {
     Outcome::Ok(
         json!({"supported":true,"enabled":wanted,"mode":if wanted{"enable"}else{"disable"},"changed":changed,"verified":true}),
     )
+}
+/// 原厂屏幕（`zte_topsw_devui`）调这两个写时带的 `source_module`，照抄。
+const USB_SOURCE_MODULE: &str = "zte_topsw_devui";
+const USB_MODES: &[&str] = &["share", "fast_charge", "accessory"];
+
+fn int_field(v: &Value, name: &str) -> Option<i64> {
+    let f = v.get(name)?;
+    f.as_i64()
+        .or_else(|| f.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+async fn poll_until(
+    object: &str,
+    method: &str,
+    args: Value,
+    tries: u32,
+    ok: impl Fn(&Value) -> bool,
+) -> bool {
+    for attempt in 0..tries {
+        if attempt != 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if state::ubus(object, method, args.clone())
+            .await
+            .is_ok_and(|v| ok(&v))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 插线时的 USB 用法（manager docs/designs/usb-attach-mode.md）。U60 给插上的手机供电时是
+/// source + host，手机没有网卡；原厂屏幕这时弹窗问用法，这里做和它一样的调用（B31 真机 `ubus monitor`
+/// 2026-10-07 抓到的原样，`source_module` 也照抄）：
+/// - `share`（充电 + 上网）：`zwrt_bsp.typec set DR_Swap device`，读回 `data_role` = device；
+/// - `fast_charge`（快速充电宝）：`zwrt_bsp.powerbank set state 1`，读回 `state` = 1；
+/// - `accessory`（网口配件）：原厂什么都不调，这里也不写，回 ok。
+///
+/// 没插东西（`cc_attch_state` 不是 1）就不写。已经是要的状态不再写（`changed:false`）。
+/// `remembered:true`（触屏按记住的选择自动做）时，插着 USB 网口转接头（`zwrt_bsp.usb list` 的
+/// `usb2rj45` = 1）就不切 share：转接头要 U60 当主机。用户在弹窗里亲手选的不拦。
+/// 读回有上限（执行者在等）：角色切换 3 秒、充电宝 2 秒，没确认就回失败。
+async fn usb_attach_mode(params: &Value) -> Outcome {
+    let mode = match string(params, "mode", true) {
+        Ok(Some(m)) if USB_MODES.contains(&m.as_str()) => m,
+        Ok(_) => return Outcome::Invalid("mode must be share, fast_charge or accessory".into()),
+        Err(e) => return Outcome::Invalid(e),
+    };
+    let remembered = match object(params).get("remembered") {
+        None => false,
+        Some(_) => match boolean(params, "remembered") {
+            Ok(v) => v,
+            Err(e) => return Outcome::Invalid(e),
+        },
+    };
+    let typec = match state::ubus("zwrt_bsp.typec", "list", json!({})).await {
+        Ok(v) => v,
+        Err(e) => return Outcome::Failed(e),
+    };
+    if int_field(&typec, "cc_attch_state") != Some(1) {
+        return Outcome::Failed("nothing is plugged into the USB-C port".into());
+    }
+    let done =
+        |changed: bool| Outcome::Ok(json!({"mode": mode, "changed": changed, "verified": true}));
+    match mode.as_str() {
+        "accessory" => done(false),
+        "share" => {
+            if typec.get("data_role").and_then(Value::as_str) == Some("device") {
+                return done(false);
+            }
+            if remembered {
+                match state::ubus("zwrt_bsp.usb", "list", json!({})).await {
+                    Ok(usb) if int_field(&usb, "usb2rj45") == Some(1) => {
+                        return Outcome::Failed(
+                            "a USB network adapter is attached; left in host mode".into(),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Outcome::Failed(e),
+                }
+            }
+            let args = json!({"source_module": USB_SOURCE_MODULE, "DR_Swap": "device"});
+            if let Outcome::Failed(e) = call("zwrt_bsp.typec", "set", args).await {
+                return Outcome::Failed(e);
+            }
+            if poll_until("zwrt_bsp.typec", "list", json!({}), 15, |v| {
+                v.get("data_role").and_then(Value::as_str) == Some("device")
+            })
+            .await
+            {
+                done(true)
+            } else {
+                Outcome::Failed("USB role readback did not show data_role device".into())
+            }
+        }
+        _ => {
+            let get = json!({"property": "state"});
+            let on = |v: &Value| int_field(v, "state") == Some(1);
+            match state::ubus("zwrt_bsp.powerbank", "get", get.clone()).await {
+                Ok(v) if on(&v) => return done(false),
+                Ok(_) => {}
+                Err(e) => return Outcome::Failed(e),
+            }
+            let args = json!({"source_module": USB_SOURCE_MODULE, "state": 1});
+            if let Outcome::Failed(e) = call("zwrt_bsp.powerbank", "set", args).await {
+                return Outcome::Failed(e);
+            }
+            if poll_until("zwrt_bsp.powerbank", "get", get, 10, on).await {
+                done(true)
+            } else {
+                Outcome::Failed("power bank readback did not show state 1".into())
+            }
+        }
+    }
 }
 async fn nfc(params: &Value) -> Outcome {
     let args = match mapped(

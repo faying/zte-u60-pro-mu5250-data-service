@@ -39,6 +39,9 @@ setup_fixture() {
     export ZWRT_DATAD_DHCP_LEASES_PATH="$F/dhcp.leases"
     export MOCK_UCI_STATE_DIR="$F/uci-state"
     export MOCK_SIM_SLOT_FILE="$F/sim-slot"
+    # V2-48：插线状态（cc、data_role、powerbank），空目录 = 什么都没插
+    mkdir -p "$F/usb"
+    export MOCK_USB_STATE_DIR="$F/usb"
     export ZWRT_DATAD_BOOT_ID_PATH="$F/boot-id"
     # E4 事务落盘目录（pending.json）：每个情形一个干净的
     export ZWRT_DATAD_OPS_DIR="$F/ops"

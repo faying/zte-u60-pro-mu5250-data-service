@@ -133,105 +133,132 @@
 ## 45 fail *
 > {"action":"usb.set","params":{"mode":"rndis"}}
 < 502 {"action":"usb.set","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
-## 46 ok -
+## 46 fail -
+> {"action":"usb.attach_mode","params":{"mode":"share"}}
+< 502 {"action":"usb.attach_mode","error":{"code":"device_call_failed","message":"nothing is plugged into the USB-C port"},"ok":false}
+## 47 invalid -
+> {"action":"usb.attach_mode","params":{"mode":"host"}}
+< 400 {"action":"usb.attach_mode","error":{"code":"invalid_parameter","message":"mode must be share, fast_charge or accessory"},"ok":false}
+## 48 invalid -
+> {"action":"usb.attach_mode","params":{}}
+< 400 {"action":"usb.attach_mode","error":{"code":"invalid_parameter","message":"missing parameter: mode"},"ok":false}
+## 49 fail *
+> {"action":"usb.attach_mode","params":{"mode":"share"}}
+< 502 {"action":"usb.attach_mode","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
+## 50 ok usb-attached
+> {"action":"usb.attach_mode","params":{"mode":"accessory"}}
+< 200 {"action":"usb.attach_mode","ok":true,"result":{"changed":false,"mode":"accessory","verified":true}}
+## 51 ok -
+> {"action":"usb.attach_mode","params":{"mode":"share","remembered":true}}
+< 200 {"action":"usb.attach_mode","ok":true,"result":{"changed":true,"mode":"share","verified":true}}
+## 52 ok -
+> {"action":"usb.attach_mode","params":{"mode":"share"}}
+< 200 {"action":"usb.attach_mode","ok":true,"result":{"changed":false,"mode":"share","verified":true}}
+## 53 ok -
+> {"action":"usb.attach_mode","params":{"mode":"fast_charge"}}
+< 200 {"action":"usb.attach_mode","ok":true,"result":{"changed":true,"mode":"fast_charge","verified":true}}
+## 54 ok -
+> {"action":"usb.attach_mode","params":{"mode":"fast_charge"}}
+< 200 {"action":"usb.attach_mode","ok":true,"result":{"changed":false,"mode":"fast_charge","verified":true}}
+## 55 ok -
 > {"action":"nfc.set","params":{"enabled":1}}
 < 200 {"action":"nfc.set","ok":true,"result":{"result":"success"}}
-## 47 invalid -
+## 56 invalid -
 > {"action":"nfc.set","params":{"enabled":"on"}}
 < 400 {"action":"nfc.set","error":{"code":"invalid_parameter","message":"enabled must be an integer"},"ok":false}
-## 48 fail *
+## 57 fail *
 > {"action":"nfc.set","params":{"enabled":1}}
 < 502 {"action":"nfc.set","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
-## 49 ok -
+## 58 ok -
 > {"action":"apn.set_mode","params":{"mode":0}}
 < 200 {"action":"apn.set_mode","ok":true,"result":{"result":"success"}}
-## 50 invalid -
+## 59 invalid -
 > {"action":"apn.set_mode","params":{}}
 < 400 {"action":"apn.set_mode","error":{"code":"invalid_parameter","message":"missing parameter: mode"},"ok":false}
-## 51 fail *
+## 60 fail *
 > {"action":"apn.set_mode","params":{"mode":0}}
 < 502 {"action":"apn.set_mode","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
-## 52 ok -
+## 61 ok -
 > {"action":"apn.add","params":{"name":"golden","apn":"internet","auth_mode":0}}
 < 200 {"action":"apn.add","ok":true,"result":{"result":"success"}}
-## 53 invalid -
+## 62 invalid -
 > {"action":"apn.add","params":{}}
 < 400 {"action":"apn.add","error":{"code":"invalid_parameter","message":"missing parameter: name"},"ok":false}
-## 54 fail *
+## 63 fail *
 > {"action":"apn.add","params":{"name":"golden","apn":"internet","auth_mode":0}}
 < 502 {"action":"apn.add","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
-## 55 ok -
+## 64 ok -
 > {"action":"apn.modify","params":{"profile_id":"2","name":"golden","apn":"internet2","auth_mode":0}}
 < 200 {"action":"apn.modify","ok":true,"result":{"result":"success"}}
-## 56 invalid -
+## 65 invalid -
 > {"action":"apn.modify","params":{"name":"golden"}}
 < 400 {"action":"apn.modify","error":{"code":"invalid_parameter","message":"missing parameter: profile_id"},"ok":false}
-## 57 fail *
+## 66 fail *
 > {"action":"apn.modify","params":{"profile_id":"2","name":"golden","apn":"internet2","auth_mode":0}}
 < 502 {"action":"apn.modify","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
-## 58 ok -
+## 67 ok -
 > {"action":"apn.delete","params":{"profile_id":"2"}}
 < 200 {"action":"apn.delete","ok":true,"result":{"result":"success"}}
-## 59 invalid -
+## 68 invalid -
 > {"action":"apn.delete","params":{}}
 < 400 {"action":"apn.delete","error":{"code":"invalid_parameter","message":"missing parameter: profile_id"},"ok":false}
-## 60 fail *
+## 69 fail *
 > {"action":"apn.delete","params":{"profile_id":"2"}}
 < 502 {"action":"apn.delete","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
-## 61 ok -
+## 70 ok -
 > {"action":"apn.enable","params":{"profile_id":"1"}}
 < 200 {"action":"apn.enable","ok":true,"result":{"result":"success"}}
-## 62 invalid -
+## 71 invalid -
 > {"action":"apn.enable","params":{}}
 < 400 {"action":"apn.enable","error":{"code":"invalid_parameter","message":"missing parameter: profile_id"},"ok":false}
-## 63 fail *
+## 72 fail *
 > {"action":"apn.enable","params":{"profile_id":"1"}}
 < 502 {"action":"apn.enable","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
-## 64 ok -
+## 73 ok -
 > {"action":"sms.delete","params":{"ids":"1;2"}}
 < 200 {"action":"sms.delete","ok":true,"result":{"result":"success"}}
-## 65 invalid -
+## 74 invalid -
 > {"action":"sms.delete","params":{}}
 < 400 {"action":"sms.delete","error":{"code":"invalid_parameter","message":"missing parameter: ids"},"ok":false}
-## 66 fail *
+## 75 fail *
 > {"action":"sms.delete","params":{"ids":"1;2"}}
 < 502 {"action":"sms.delete","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
-## 67 ok -
+## 76 ok -
 > {"action":"sms.mark_read","params":{"ids":"1","tag":0}}
 < 200 {"action":"sms.mark_read","ok":true,"result":{"result":"success"}}
-## 68 invalid -
+## 77 invalid -
 > {"action":"sms.mark_read","params":{}}
 < 400 {"action":"sms.mark_read","error":{"code":"invalid_parameter","message":"missing parameter: ids"},"ok":false}
-## 69 fail *
+## 78 fail *
 > {"action":"sms.mark_read","params":{"ids":"1","tag":0}}
 < 502 {"action":"sms.mark_read","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
-## 70 ok -
+## 79 ok -
 > {"action":"sms.send_raw","params":{"sender":"host","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}
 < 200 {"action":"sms.send_raw","ok":true,"result":{"sender":"host","status":3}}
-## 71 invalid -
+## 80 invalid -
 > {"action":"sms.send_raw","params":{"sender":"host"}}
 < 400 {"action":"sms.send_raw","error":{"code":"invalid_parameter","message":"missing SMS parameters"},"ok":false}
-## 72 fail *
+## 81 fail *
 > {"action":"sms.send_raw","params":{"sender":"host","number":"10086","message_hex":"6D4B8BD5","sms_time":"26;08;27;04;00;00;+;0"}}
 < 502 {"action":"sms.send_raw","error":{"code":"device_call_failed","message":"<root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
-## 73 ok -
+## 82 ok -
 > {"action":"sms.list_after","params":{"after_id":0,"limit":5}}
 < 200 {"action":"sms.list_after","ok":true,"result":{"has_more":false,"items":[{"content":"6D4B8BD5","date":"26,08,27,04,00,00,+,0","id":7,"number":"10086","tag":"1"}]}}
-## 74 invalid -
+## 83 invalid -
 > {"action":"sms.list_after","params":{"after_id":"x"}}
 < 400 {"action":"sms.list_after","error":{"code":"invalid_parameter","message":"after_id must be a non-negative integer"},"ok":false}
-## 75 fail *
+## 84 fail *
 > {"action":"sms.list_after","params":{"after_id":0,"limit":5}}
 < 502 {"action":"sms.list_after","error":{"code":"device_call_failed","message":"mem_store 1: <root>/tests/golden/fail_ubus.sh exited with exit status: 1"},"ok":false}
-## 76 unknown -
+## 85 unknown -
 > {"action":"fixture.unknown","params":{}}
 < 404 {"action":"fixture.unknown","error":{"code":"unknown_action","message":"unsupported control action"},"ok":false}
-## 77 no-action -
+## 86 no-action -
 > {"params":{}}
 < 400 {"error":{"code":"invalid_request","message":"missing action"},"ok":false}
-## 78 bad-json -
+## 87 bad-json -
 > {"action":
 < 400 {"error":{"code":"invalid_request","message":"request body must be valid JSON"},"ok":false}
-## 79 params-not-object -
+## 88 params-not-object -
 > {"action":"device.reboot","params":[]}
 < 400 {"action":"device.reboot","error":{"code":"invalid_request","message":"params must be a JSON object"},"ok":false}

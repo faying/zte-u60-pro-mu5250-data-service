@@ -276,9 +276,9 @@ async fn executor_is_only_ubus_caller() {
             "{name}：后端只在 server.rs 建一次，交给执行者"
         );
     }
-    // V2-31：短信事件监听只订阅（`ubus listen`），不发请求。
+    // V2-31、V2-48：原厂事件监听只订阅（`ubus listen`），不发请求。
     let listen = include_str!("../ubus/listen.rs");
-    assert!(listen.contains(".args([\"listen\", EVENT])"));
+    assert!(listen.contains(".arg(\"listen\")"));
     assert!(!listen.contains("\"call\""), "listen.rs 不能发 ubus call");
     let state = include_str!("../state.rs");
     assert!(

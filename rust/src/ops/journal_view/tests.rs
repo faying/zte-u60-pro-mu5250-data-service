@@ -37,6 +37,7 @@ fn every_entry_kind_reads_as_a_sentence() {
         json!({"action": "wifi.apply", "source": "screen",
                "params": {"set": {"wireless.main_2g.disabled": "1", "wireless.main_5g.disabled": "1"}, "reload": true},
                "result": "failed", "status": 502}),
+        json!({"action": "usb.attach_mode", "source": "screen", "params": {"mode": "share"}, "result": "ok", "status": 200}),
     ];
     decorate(&mut e);
     // 「知道了」只记账，不单独成行
@@ -96,6 +97,14 @@ fn every_entry_kind_reads_as_a_sentence() {
             get(&e[8], "mark")
         ),
         ("关掉", "没改成", "bad")
+    );
+    assert_eq!(
+        (
+            get(&e[9], "what_zh"),
+            get(&e[9], "change_zh"),
+            get(&e[9], "change_en")
+        ),
+        ("插线用法", "充电 + 上网", "charge + internet")
     );
     for x in &e {
         for k in ["what_en", "change_en", "result_en", "source_en"] {

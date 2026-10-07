@@ -86,7 +86,7 @@ status=$(curl -sS -o "$TMP/bad.json" -w '%{http_code}' -H 'content-type: applica
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["error"]["code"]=="invalid_parameter"' "$TMP/bad.json"
 
 curl -fsS "http://127.0.0.1:$PORT/capabilities" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==25; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert "discovery" not in d; assert "passthrough" not in d; assert d["transport"]==["http","sse"]'
+    python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["control"]==d["controls"]; assert len(d["control"])==len(set(d["control"]))==26; assert "usb.attach_mode" in d["control"]; assert "network.set_mode" in d["control"]; assert "sms.send_raw" in d["control"]; assert "discovery" not in d; assert "passthrough" not in d; assert d["transport"]==["http","sse"]'
 # R10：ubus 透传已删除，三个路由都必须 404
 route_status() {
     curl -sS -o /dev/null -w '%{http_code}' "$@"

@@ -1,5 +1,6 @@
 # /control 回复 golden 的用例（E4 T1，D26）。一行一个：情形<TAB>ubus 失败（- 不失败、* 全部失败）<TAB>请求体
-# 顺序有意义：同一个 datad 依次跑，后面的用例看得到前面的写入（mock 的 uci 状态）。
+# 顺序有意义：同一个 datad 依次跑，后面的用例看得到前面的写入（mock 的 uci 状态、插线状态）。
+# 第二列 usb-attached：从这条起 mock 插着手机（之前的 usb.attach_mode 用例是没插东西）。
 # 这个 fixture 下 power.direct_supply.set 的 ok 情形也回 502（不支持直供），
 # 锁住的是这个回复；它们的成功路径在 rust_control_integration.sh、direct_supply_test.py 里测。
 ok	-	{"action":"state.set_interval","params":{"milliseconds":500}}
@@ -47,6 +48,15 @@ fail	*	{"action":"power.direct_supply.set","params":{"enabled":false}}
 ok	-	{"action":"usb.set","params":{"mode":"rndis"}}
 invalid	-	{"action":"usb.set","params":{}}
 fail	*	{"action":"usb.set","params":{"mode":"rndis"}}
+fail	-	{"action":"usb.attach_mode","params":{"mode":"share"}}
+invalid	-	{"action":"usb.attach_mode","params":{"mode":"host"}}
+invalid	-	{"action":"usb.attach_mode","params":{}}
+fail	*	{"action":"usb.attach_mode","params":{"mode":"share"}}
+ok	usb-attached	{"action":"usb.attach_mode","params":{"mode":"accessory"}}
+ok	-	{"action":"usb.attach_mode","params":{"mode":"share","remembered":true}}
+ok	-	{"action":"usb.attach_mode","params":{"mode":"share"}}
+ok	-	{"action":"usb.attach_mode","params":{"mode":"fast_charge"}}
+ok	-	{"action":"usb.attach_mode","params":{"mode":"fast_charge"}}
 ok	-	{"action":"nfc.set","params":{"enabled":1}}
 invalid	-	{"action":"nfc.set","params":{"enabled":"on"}}
 fail	*	{"action":"nfc.set","params":{"enabled":1}}

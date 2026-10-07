@@ -50,6 +50,7 @@ fn name(key: &str) -> Words {
         "nfc.set" => ("碰一碰", "NFC"),
         "power.direct_supply.set" => ("直供电", "Direct power"),
         "usb.set" => ("USB", "USB"),
+        "usb.attach_mode" => ("插线用法", "USB use"),
         "sleep.set" => ("自动休眠", "Auto sleep"),
         "device.reboot" => ("重启", "Restart"),
         "device.poweroff" => ("关机", "Power off"),
@@ -140,6 +141,15 @@ fn change_of(action: &str, params: &Value) -> Words {
         | "wifi.power_save" => params
             .get("enabled")
             .and_then(|v| on("打开", "关掉", "on", "off", v)),
+        "usb.attach_mode" => params.get("mode").and_then(Value::as_str).and_then(|m| {
+            let (zh, en) = match m {
+                "share" => ("充电 + 上网", "charge + internet"),
+                "fast_charge" => ("快速充电宝", "fast charging"),
+                "accessory" => ("网口配件", "Ethernet adapter"),
+                _ => return None,
+            };
+            Some((zh.to_owned(), en.to_owned()))
+        }),
         "wifi.apply" => params.get("set").and_then(Value::as_object).and_then(|m| {
             let ap: Vec<bool> = ["wireless.main_2g.disabled", "wireless.main_5g.disabled"]
                 .iter()

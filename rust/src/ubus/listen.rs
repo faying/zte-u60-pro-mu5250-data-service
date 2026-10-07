@@ -1,16 +1,18 @@
-//! 短信事件监听（docs/STATE_V2.md V2-31）。
+//! 原厂事件监听（docs/STATE_V2.md V2-31、V2-48）。
 //!
-//! datad 起一个长期运行的 `ubus listen zwrt_wms_status_event` 子进程，逐行读它的输出；
-//! 看到这个事件就（300 ms 去抖后）让短信读取「立即读」、唤醒执行者尽快开始一轮。
-//! 两次触发之间至少隔 2 秒（`KICK_MIN_INTERVAL`）：短信密集时不会每 300 ms 整轮重采。
+//! datad 起一个长期运行的 `ubus listen <事件…>` 子进程，逐行读它的输出；每行按事件名查 [`Handler`] 表，
+//! 每种事件各自（300 ms 去抖后）调它的回调：短信事件让短信读取「立即读」，Type-C 插拔和快充充电宝事件
+//! 让 `typec`、`powerbank`、`charger` 块立即读，都唤醒执行者尽快开始一轮。
+//! 同一种事件两次触发之间至少隔 `Handler::min_interval`（短信 2 秒）：密集时不会每 300 ms 整轮重采。
 //!
 //! - 这是**订阅**，不发任何请求（没有 `ubus call`、不经执行者后端），所以不违反「执行者单一在途」（V2-24/V2-28）：
-//!   短信本身仍由执行者在它的采集轮里读。
+//!   数据本身仍由执行者在它的采集轮里读。
 //! - 只用 cli 方式（子进程），`ZWRT_DATAD_UBUS=socket` 时也一样：socket 后端在 Gate 0 之前不上机，
 //!   直连 ubusd 的订阅（WATCH/SUBSCRIBE）以后再做。
 //! - 子进程退出（或起不来）就退避重启：1 秒起、每次翻倍、最多 30 秒；连续跑满 60 秒算正常，退避回到 1 秒。
 //!   日志只在第一次失败和退避到顶时各写一行，不刷屏。
-//! - `ZWRT_DATAD_SMS_LISTEN=0` 关闭（默认开）。
+//! - `ZWRT_DATAD_SMS_LISTEN=0` 关掉整个监听（默认开；名字是只有短信事件时起的）：短信退回按节拍读，
+//!   `typec`、`powerbank` 退回 60 秒兜底轮询。
 //! - 子进程不能比 datad 活得久：spawn 时设 `PR_SET_PDEATHSIG=SIGKILL`（datad 被 SIGKILL 也跟着死），
 //!   datad 收到 SIGTERM/SIGINT 时先 [`shutdown`]（kill + wait 子进程）再退出。
 
@@ -23,16 +25,31 @@ use tokio::{
     time::{Instant, sleep},
 };
 
+/// 短信事件。
 pub const EVENT: &str = "zwrt_wms_status_event";
+/// Type-C 插拔：`{"cc_attch_state":1}`（拔掉为 0），B31 真机 2026-10-07。
+pub const TYPEC_EVENT: &str = "BSP_TYPEC_EVENT";
+/// 快充充电宝开关：`{"state":1}`，拔线后固件自己回 0。
+pub const POWERBANK_EVENT: &str = "BSP_POWERBANK_EVENT";
 pub const ENV_ENABLE: &str = "ZWRT_DATAD_SMS_LISTEN";
 /// 短时间多次事件合并成一次。
 pub const DEBOUNCE: Duration = Duration::from_millis(300);
-/// 两次触发（踢执行者）之间的最小间隔，期间来的事件并进下一次。
+/// 短信事件两次触发（踢执行者）之间的最小间隔，期间来的事件并进下一次。
 pub const KICK_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// USB 事件的最小间隔：插线和随后的角色切换要很快反映到屏幕上。
+pub const USB_KICK_MIN_INTERVAL: Duration = Duration::from_secs(1);
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// 子进程连续跑满这么久，退避回到最小值。
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
+
+/// 一种事件和它的回调（去抖后调用）。
+#[derive(Clone)]
+pub struct Handler {
+    pub event: &'static str,
+    pub min_interval: Duration,
+    pub fire: Arc<dyn Fn() + Send + Sync>,
+}
 
 /// 停止信号：`shutdown()` 置 true，监听任务 kill + wait 子进程后返回。
 fn stop_tx() -> &'static watch::Sender<bool> {
@@ -55,11 +72,14 @@ pub fn enabled_from(value: Option<&str>) -> bool {
     value.map(str::trim) != Some("0")
 }
 
-/// `ubus listen` 的一行是不是短信事件：`{ "zwrt_wms_status_event": {...} }`。
-pub fn is_event(line: &str) -> bool {
+/// `ubus listen` 的一行是 `events` 里的哪个事件：`{ "<事件名>": {...} }`，顶层只看第一个键。
+pub fn event_of(line: &str, events: &[&str]) -> Option<usize> {
     match serde_json::from_str::<serde_json::Value>(line) {
-        Ok(serde_json::Value::Object(m)) => m.contains_key(EVENT),
-        _ => false,
+        Ok(serde_json::Value::Object(m)) => {
+            let name = m.keys().next()?;
+            events.iter().position(|e| e == name)
+        }
+        _ => None,
     }
 }
 
@@ -69,7 +89,6 @@ pub struct Options {
     pub backoff_min: Duration,
     pub backoff_max: Duration,
     pub debounce: Duration,
-    pub min_interval: Duration,
 }
 
 impl Options {
@@ -79,24 +98,25 @@ impl Options {
             backoff_min: BACKOFF_MIN,
             backoff_max: BACKOFF_MAX,
             debounce: DEBOUNCE,
-            min_interval: KICK_MIN_INTERVAL,
         }
     }
 }
 
-/// 按环境变量起监听；关闭时返回 `false`、不起子进程。`fire` 在去抖后调用。
-pub fn spawn_if_enabled(
-    value: Option<&str>,
-    opts: Options,
-    fire: Arc<dyn Fn() + Send + Sync>,
-) -> bool {
+/// 按环境变量起监听；关闭时返回 `false`、不起子进程。每种事件的 `fire` 在各自去抖后调用。
+pub fn spawn_if_enabled(value: Option<&str>, opts: Options, handlers: Vec<Handler>) -> bool {
     if !enabled_from(value) {
-        eprintln!("zwrt-datad: {ENV_ENABLE}=0，不监听 {EVENT}");
+        eprintln!("zwrt-datad: {ENV_ENABLE}=0，不监听原厂事件");
         return false;
     }
-    let (tx, rx) = mpsc::channel(64);
-    tokio::spawn(debounce(rx, opts.debounce, opts.min_interval, fire));
-    let task = tokio::spawn(supervise(opts, tx));
+    let mut events = Vec::new();
+    let mut txs = Vec::new();
+    for h in handlers {
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(debounce(rx, opts.debounce, h.min_interval, h.fire));
+        events.push(h.event);
+        txs.push(tx);
+    }
+    let task = tokio::spawn(supervise(opts, events, txs));
     // 登记给 shutdown() 收尾；进程里只起一份，已有就换成新的（旧的 abort 后子进程靠 kill_on_drop 收掉）。
     if let Ok(mut slot) = TASK.lock()
         && let Some(old) = slot.replace(task)
@@ -126,14 +146,15 @@ pub async fn debounce(
     }
 }
 
-/// 一直跑：起子进程、逐行读、退出就退避重启。
-pub async fn supervise(opts: Options, tx: mpsc::Sender<()>) {
+/// 一直跑：起子进程、逐行读、退出就退避重启。`txs[i]` 收 `events[i]`。
+pub async fn supervise(opts: Options, events: Vec<&'static str>, txs: Vec<mpsc::Sender<()>>) {
     let mut backoff = opts.backoff_min;
     let mut failing = false;
+    let names = events.join(" ");
     loop {
         let started = Instant::now();
-        let outcome = run_once(&opts.program, &tx).await;
-        if tx.is_closed() || *stop_tx().borrow() {
+        let outcome = run_once(&opts.program, &events, &txs).await;
+        if txs.iter().any(|t| t.is_closed()) || *stop_tx().borrow() {
             return;
         }
         if started.elapsed() >= HEALTHY_RUN {
@@ -141,14 +162,14 @@ pub async fn supervise(opts: Options, tx: mpsc::Sender<()>) {
             failing = false;
         }
         if !failing {
-            eprintln!("zwrt-datad: ubus listen {EVENT} 退出（{outcome}），{backoff:?} 后重启");
+            eprintln!("zwrt-datad: ubus listen {names} 退出（{outcome}），{backoff:?} 后重启");
             failing = true;
         }
         sleep(backoff).await;
         let next = (backoff * 2).min(opts.backoff_max);
         if next == opts.backoff_max && backoff != opts.backoff_max {
             eprintln!(
-                "zwrt-datad: ubus listen {EVENT} 反复退出（{outcome}），之后每 {next:?} 重试"
+                "zwrt-datad: ubus listen {names} 反复退出（{outcome}），之后每 {next:?} 重试"
             );
         }
         backoff = next;
@@ -156,13 +177,14 @@ pub async fn supervise(opts: Options, tx: mpsc::Sender<()>) {
 }
 
 /// 跑一次子进程直到它退出；返回退出原因（写日志用）。
-async fn run_once(program: &str, tx: &mpsc::Sender<()>) -> String {
+async fn run_once(program: &str, events: &[&str], txs: &[mpsc::Sender<()>]) -> String {
     let mut stop = stop_tx().subscribe();
     if *stop.borrow_and_update() {
         return "datad 退出".into();
     }
     let child = crate::command::die_with_parent(&mut Command::new(program))
-        .args(["listen", EVENT])
+        .arg("listen")
+        .args(events)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -186,7 +208,9 @@ async fn run_once(program: &str, tx: &mpsc::Sender<()>) -> String {
         };
         match next {
             Ok(Some(line)) => {
-                if is_event(&line) && tx.send(()).await.is_err() {
+                if let Some(i) = event_of(&line, events)
+                    && txs[i].send(()).await.is_err()
+                {
                     return "datad 退出".into();
                 }
             }
@@ -219,8 +243,11 @@ mod tests {
         )
     }
 
+    const ALL: &[&str] = &[EVENT, TYPEC_EVENT, POWERBANK_EVENT];
+
     #[test]
     fn sms_listen_event_line_parsed() {
+        let is_event = |l: &str| event_of(l, ALL) == Some(0);
         assert!(is_event(r#"{ "zwrt_wms_status_event": { "sms_new": 1 } }"#));
         assert!(is_event(r#"{"zwrt_wms_status_event":{}}"#));
         assert!(!is_event(
@@ -228,6 +255,20 @@ mod tests {
         ));
         assert!(!is_event("zwrt_wms_status_event"));
         assert!(!is_event(""));
+    }
+
+    /// V2-48：USB 事件按名字分到各自的回调（B31 真机抓到的原样）。
+    #[test]
+    fn usb_event_lines_parsed() {
+        assert_eq!(
+            event_of(r#"{ "BSP_TYPEC_EVENT": {"cc_attch_state":1} }"#, ALL),
+            Some(1)
+        );
+        assert_eq!(
+            event_of(r#"{ "BSP_POWERBANK_EVENT": {"state":1} }"#, ALL),
+            Some(2)
+        );
+        assert_eq!(event_of(r#"{ "BSP_CHARGER_EVENT": {} }"#, ALL), None);
     }
 
     /// V2-31：短时间多次事件只触发一次读取。
@@ -291,7 +332,12 @@ mod tests {
             program: "/nonexistent/ubus".into(),
             ..Options::from_env()
         };
-        assert!(!spawn_if_enabled(Some("0"), opts, fire));
+        let h = Handler {
+            event: EVENT,
+            min_interval: KICK_MIN_INTERVAL,
+            fire,
+        };
+        assert!(!spawn_if_enabled(Some("0"), opts, vec![h]));
     }
 
     fn mock_script() -> String {
@@ -327,9 +373,9 @@ mod tests {
             backoff_min: Duration::from_millis(50),
             backoff_max: Duration::from_millis(200),
             debounce: DEBOUNCE,
-            min_interval: KICK_MIN_INTERVAL,
         };
-        let h = tokio::spawn(supervise(opts, tx));
+        let (tx2, _rx2) = mpsc::channel(64);
+        let h = tokio::spawn(supervise(opts, vec![EVENT, TYPEC_EVENT], vec![tx, tx2]));
         let mut got = 0;
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while got < 3 && std::time::Instant::now() < deadline {
@@ -346,7 +392,11 @@ mod tests {
         let starts = std::fs::read_to_string(&log).unwrap_or_default();
         let starts: Vec<_> = starts.lines().collect();
         assert!(starts.len() >= 3, "至少重启两次：{starts:?}");
-        assert!(starts.iter().all(|l| *l == format!("listen {EVENT}")));
+        assert!(
+            starts
+                .iter()
+                .all(|l| *l == format!("listen {EVENT} {TYPEC_EVENT}"))
+        );
         assert!(got >= 3, "每个子进程的事件都送到了：{got}");
         let _ = std::fs::remove_dir_all(&dir);
     }

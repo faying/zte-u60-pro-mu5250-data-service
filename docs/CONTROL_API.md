@@ -141,6 +141,14 @@ AT 只发这两条固定命令。AT 口和 zte-agent 共用，两边都拿 `ZWRT
 |---|---|
 | `usb.set` | `mode/port_switch/network_protocol` |
 | `nfc.set` | `enabled`, `flag?` |
+| `usb.attach_mode` | `mode`：`share` / `fast_charge` / `accessory`；可选 `remembered`（布尔或 0/1） |
+
+`usb.attach_mode` 是插上手机时的用法（manager `docs/designs/usb-attach-mode.md`），做原厂屏幕弹窗选项的同一调用（B31 真机抓到的，`source_module` 照抄 `zte_topsw_devui`）：
+`share`（充电 + 上网）= `zwrt_bsp.typec set {"DR_Swap":"device"}`，读回 `data_role` 是 `device`（最多 3 秒）；
+`fast_charge`（快速充电宝）= `zwrt_bsp.powerbank set {"state":1}`，读回 `state` 是 1（最多 2 秒）；`accessory`（网口配件）不写。
+先读 `zwrt_bsp.typec list`：`cc_attch_state` 不是 1（没插东西）回 502、不写；已经是要的状态回 `changed:false`、不写。
+`remembered:true`（触屏按记住的选择自动做）时，`zwrt_bsp.usb list` 的 `usb2rj45` 是 1（插着 USB 网口转接头）就不切 `share`，回 502。
+成功回 `{"mode","changed","verified":true}`，之后 `typec`、`powerbank`、`charger` 块立即读（STATE_V2.md V2-48）。不用 `DR_Swap:"host"`、`PR_Swap`（没验证过效果）。
 
 ## Sampling
 

@@ -74,6 +74,12 @@ impl BlockSpec {
         }
     }
 
+    /// ubus 调用带参数（默认 `{}`）。
+    pub fn with_args(mut self, args: Value) -> Self {
+        self.args = args;
+        self
+    }
+
     pub fn with_shape(mut self, shape: ShapeFn, deps: &'static [&'static str]) -> Self {
         self.shape = Some(shape);
         self.deps = deps;
@@ -100,6 +106,17 @@ pub fn phase1_blocks() -> Vec<BlockSpec> {
             Duration::from_secs(5),
         )
         .with_shape(crate::state::charger_v2, &[]),
+        // 插线时的 USB 用法（2026-10-07，manager docs/designs/usb-attach-mode.md）：Type-C 口的角色和插线状态、
+        // 快充充电宝状态。插拔靠 BSP_TYPEC_EVENT / BSP_POWERBANK_EVENT 立即重读（ubus/listen.rs），这里只是 60 秒兜底。
+        // data 是原厂回复原样：typec = {power_role, data_role, cc_attch_state}，powerbank = {state}。
+        BlockSpec::new("typec", "zwrt_bsp.typec", "list", Duration::from_secs(60)),
+        BlockSpec::new(
+            "powerbank",
+            "zwrt_bsp.powerbank",
+            "get",
+            Duration::from_secs(60),
+        )
+        .with_args(serde_json::json!({"property": "state"})),
         BlockSpec::derived("signal", Box::new(SignalPolicy)),
         BlockSpec::derived("live", Box::new(LivePolicy)),
         // V2-30：短信摘要，由旧采集按原来的短信节拍（容量 30 秒、列表 10 秒）交进来。
@@ -1100,6 +1117,37 @@ pub(crate) mod tests {
             cache: true,
             sample_interval: Duration::from_secs(1),
         }
+    }
+
+    /// V2-48：插线用的两块读原厂对象，powerbank 带参数，60 秒兜底。
+    #[test]
+    fn usb_blocks_read_vendor_objects() {
+        let hub = Hub::new(phase1_blocks(), Box::new(NoSink));
+        let find = |name: &str| {
+            (0..hub.len())
+                .find(|&i| hub.lock().blocks[i].spec.name == name)
+                .map(|i| (hub.request(i), hub.lock().blocks[i].spec.interval))
+                .unwrap()
+        };
+        let ((o, m, a), every) = find("typec");
+        assert_eq!(
+            (o, m, a, every),
+            (
+                "zwrt_bsp.typec",
+                "list",
+                serde_json::json!({}),
+                Duration::from_secs(60)
+            )
+        );
+        let ((o, m, a), _) = find("powerbank");
+        assert_eq!(
+            (o, m, a),
+            (
+                "zwrt_bsp.powerbank",
+                "get",
+                serde_json::json!({"property": "state"})
+            )
+        );
     }
 
     #[test]

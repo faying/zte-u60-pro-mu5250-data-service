@@ -17,7 +17,7 @@ set -eu
 # MOCK_LISTEN_LOG：每次启动追加一行；MOCK_LISTEN_EVENTS_FILE：把这个文件新追加的行原样输出（当作事件）；
 # MOCK_LISTEN_EXIT_AFTER：输出完已有的行后过这么多秒就退出（模拟监听挂掉）。
 [ "$1" = "listen" ] && {
-    [ -n "${MOCK_LISTEN_LOG:-}" ] && printf 'listen %s\n' "${2:-}" >>"$MOCK_LISTEN_LOG"
+    [ -n "${MOCK_LISTEN_LOG:-}" ] && { shift; printf 'listen %s\n' "$*" >>"$MOCK_LISTEN_LOG"; }
     parent=$PPID seen=0 ticks=0
     while kill -0 "$parent" 2>/dev/null; do
         if [ -n "${MOCK_LISTEN_EVENTS_FILE:-}" ] && [ -f "$MOCK_LISTEN_EVENTS_FILE" ]; then
@@ -244,6 +244,29 @@ print(json.dumps({"messages": rows}))' "$args" "$n"
     # 其余字段按 manager 管理网页的 UsbStatus 形状。
     zwrt_bsp.usb:list)
         printf '%s\n' '{"connect":0,"mode":"user","typec_cc":"no_cc","usb2rj45":0}'
+        ;;
+    # 插线时的 USB 用法（V2-48）。形状是 B31 真机的回复。MOCK_USB_STATE_DIR 里：cc = 1 表示插着手机
+    # （U60 供电、当主机：source + host），data_role、powerbank 是写进来的状态；没有这个目录 = 什么都没插。
+    # 两个 set 成功时什么都不回（按 NoData 处理的那条路）。
+    zwrt_bsp.typec:list)
+        d=${MOCK_USB_STATE_DIR:-}
+        if [ -n "$d" ] && [ "$(cat "$d/cc" 2>/dev/null)" = 1 ]; then
+            role=$(cat "$d/data_role" 2>/dev/null || printf host)
+            printf '{"power_role":"source","data_role":"%s","cc_attch_state":1}\n' "$role"
+        else
+            printf '%s\n' '{"power_role":"sink","data_role":"host","cc_attch_state":0}'
+        fi
+        ;;
+    zwrt_bsp.typec:set)
+        d=${MOCK_USB_STATE_DIR:-}
+        case "$args" in *'"DR_Swap":"device"'*) [ -z "$d" ] || printf device >"$d/data_role" ;; esac
+        ;;
+    zwrt_bsp.powerbank:get)
+        printf '{"state":%s}\n' "$(cat "${MOCK_USB_STATE_DIR:-/nonexistent}/powerbank" 2>/dev/null || printf 0)"
+        ;;
+    zwrt_bsp.powerbank:set)
+        d=${MOCK_USB_STATE_DIR:-}
+        case "$args" in *'"state":1'*) [ -z "$d" ] || printf 1 >"$d/powerbank" ;; esac
         ;;
     network.interface.zte_mwan2:status|network.interface.zte_mwan2_6:status|network.interface.zte_mwan3:status|network.interface.zte_mwan3_6:status|network.interface.zte_mwan4:status|network.interface.zte_mwan4_6:status)
         printf '%s\n' '{"up":true,"pending":false,"available":true,"proto":"dhcp","l3_device":"fixture0","ipv4-address":[],"ipv6-address":[],"dns-server":[]}'

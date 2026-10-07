@@ -499,6 +499,7 @@ fn read_only(action: &str) -> bool {
 fn blocks_for_action(action: &str) -> Option<&'static [&'static str]> {
     match action {
         "power.direct_supply.set" => Some(&["charger"]),
+        "usb.attach_mode" => Some(&["typec", "powerbank", "charger"]),
         "sms.list_after" => Some(&[]),
         _ => None,
     }

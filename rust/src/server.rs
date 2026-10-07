@@ -190,17 +190,36 @@ impl App {
                 .hub()
                 .record("op", Ok(v), tokio::time::Instant::now());
         }));
-        // V2-31：监听短信事件，收到后短信读取立即重读、执行者立即开一轮（只订阅，不发请求）。
-        let exec = app.inner.exec.clone();
-        crate::ubus::listen::spawn_if_enabled(
-            std::env::var(crate::ubus::listen::ENV_ENABLE)
-                .ok()
-                .as_deref(),
-            crate::ubus::listen::Options::from_env(),
-            Arc::new(move || {
-                state::invalidate_sms_cache();
-                exec.kick(&["sms"]);
-            }),
+        // V2-31、V2-48：监听原厂事件（只订阅，不发请求）。短信事件：短信读取立即重读；
+        // Type-C 插拔、快充充电宝：typec、powerbank、charger 块立即重读。都让执行者立即开一轮。
+        use crate::ubus::listen::{self, Handler};
+        let sms_exec = app.inner.exec.clone();
+        let usb_exec = app.inner.exec.clone();
+        let usb: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || usb_exec.kick(&["typec", "powerbank", "charger"]));
+        listen::spawn_if_enabled(
+            std::env::var(listen::ENV_ENABLE).ok().as_deref(),
+            listen::Options::from_env(),
+            vec![
+                Handler {
+                    event: listen::EVENT,
+                    min_interval: listen::KICK_MIN_INTERVAL,
+                    fire: Arc::new(move || {
+                        state::invalidate_sms_cache();
+                        sms_exec.kick(&["sms"]);
+                    }),
+                },
+                Handler {
+                    event: listen::TYPEC_EVENT,
+                    min_interval: listen::USB_KICK_MIN_INTERVAL,
+                    fire: usb.clone(),
+                },
+                Handler {
+                    event: listen::POWERBANK_EVENT,
+                    min_interval: listen::USB_KICK_MIN_INTERVAL,
+                    fire: usb,
+                },
+            ],
         );
         app.inner.stage.send_replace(Stage::Ready);
     }
@@ -728,8 +747,8 @@ mod tests {
     #[test]
     fn capability_controls_are_the_kept_actions() {
         let controls = capability_controls();
-        assert_eq!(controls.len(), 25);
-        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 25);
+        assert_eq!(controls.len(), 26);
+        assert_eq!(controls.iter().copied().collect::<HashSet<_>>().len(), 26);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 #   tests/golden/control_golden.sh check  [BIN]   对照：HTTP 状态码和回复体逐字节相同
 #
 # 起一个 datad（tests/mock_ubus.sh 做设备，fixture 同 golden.sh），按 control_cases.txt 的顺序
+# （第二列：- 不失败、* 全部失败、usb-attached 从这条起 mock 插着手机）
 # 发每个 /control 请求：每个动作的成功回复、参数不对的回复、ubus 调用失败时的回复，外加请求层面的错误。
 # 旧触屏只靠这些回复工作（data.c 的 control_reap 看状态码 503），E4 改 /control 时它们不能变。
 # 只把临时目录路径和时间字段（normalize.py）换成占位符，其余原样比。
@@ -64,6 +65,8 @@ while IFS="$TAB" read -r kind fail body; do
     case "$kind" in '' | '#'*) continue ;; esac
     n=$((n + 1))
     if [ "$fail" = '*' ]; then printf '*\n' >"$GOLDEN_FAIL_FILE"; else : >"$GOLDEN_FAIL_FILE"; fi
+    # usb-attached：从这条起插着手机（usb.attach_mode 的用例；之前的用例是没插东西）
+    [ "$fail" != usb-attached ] || printf 1 >"$MOCK_USB_STATE_DIR/cc"
     code=$(curl -sS --max-time 30 -o "$TMP/body" -w '%{http_code}' \
         -H 'Content-Type: application/json' --data-binary "$body" "http://127.0.0.1:$PORT/control") ||
         { echo "control golden: 第 $n 条没有回复：$body" >&2; tail -n 20 "$TMP/server.log" >&2; exit 1; }

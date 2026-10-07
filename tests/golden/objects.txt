@@ -6,7 +6,9 @@ uci
 zte_nwinfo_api
 zwrt_bsp.battery
 zwrt_bsp.charger
+zwrt_bsp.powerbank
 zwrt_bsp.thermal
+zwrt_bsp.typec
 zwrt_bsp.usb
 zwrt_data
 zwrt_nfc

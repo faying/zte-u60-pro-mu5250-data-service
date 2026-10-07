@@ -101,6 +101,8 @@ data: {"epoch":"5f2c9a1e","seq":43,"blocks":{"battery":1782396735,"charger":1782
 | `op` | 写操作的界面数据（第 12 节，E4 T13）：`{ "rollback_enabled", "active", "last" }` | 事务引擎（不调 ubus） |
 | `qos`、`clients`、`wlan`、`nfc`、`dhcp`、`interfaces`、`uci_device_info` | 旧 `/state` 的同名对象（V2-46，2026-10-05 加）；变了才发 | 旧采集读好的结果（不另调 ubus） |
 | `sms_list` | `{ "list" }`：旧 `/state` 的 `sms.list`（两库第一页解密后的最新几条，V2-47，2026-10-05 加）；变了才发 | 旧采集读好的两库第一页（不另调 ubus） |
+| `typec` | `{ "power_role", "data_role", "cc_attch_state" }`，原厂回复原样（V2-48，2026-10-07 加）；变了才发 | `zwrt_bsp.typec list`，插拔事件时立即读，另有 60 秒兜底 |
+| `powerbank` | `{ "state" }`：快充充电宝开着是 1，原厂回复原样（V2-48）；变了才发 | `zwrt_bsp.powerbank get {"property":"state"}`，同上 |
 
 stale 时 `/v2` 保留旧值，旧 `/state` 仍按读失败输出（V2-29）。
 `signal` 在 `nwinfo_get_netinfo` 失败时读失败；`live` 在 `system info` 或实时流量 `get_wwandst` 失败时读失败。
@@ -410,3 +412,14 @@ cancelled 里 sim_changed 不能（「换过卡」）、superseded 不能（「�
 `sms` 块（V2-30）的形状不变，仍不带内容；要完整历史（转发、补漏）的订阅方照旧用 `sms.list_after`。
 测试：`v2_sms_list_block_mirrors_legacy_list`
 
+## 15. 插线时的 USB 用法（2026-10-07）
+
+**V2-48** `typec`、`powerbank` 两块给触屏判断「插上了手机」、显示当前用法（设计在 manager `docs/designs/usb-attach-mode.md`）。
+`typec` 是 `zwrt_bsp.typec list` 的回复原样：没插东西时 B31 回 `{"power_role":"sink","data_role":"host","cc_attch_state":0}`，
+插上手机（U60 给它供电、当主机）是 `source` + `host` + `1`，切成「充电 + 上网」后 `data_role` 变成 `device`。
+`powerbank` 是 `zwrt_bsp.powerbank get {"property":"state"}` 的回复原样（`{"state":0|1}`）。两块采集间隔 60 秒，只是兜底：
+V2-31 的监听子进程同时订阅 `BSP_TYPEC_EVENT`（插拔，`{"cc_attch_state":1|0}`）和 `BSP_POWERBANK_EVENT`，
+收到后各自去抖 300 ms、两次至少隔 1 秒，把 `typec`、`powerbank`、`charger` 标成立即读并唤醒执行者。
+一个 `ubus listen` 子进程收全部事件；`ZWRT_DATAD_SMS_LISTEN=0` 关掉的是整个监听，这两块退回 60 秒轮询。
+写在 `/control` 的 `usb.attach_mode`（CONTROL_API.md），成功后这三块立即读。
+测试：`usb_blocks_read_vendor_objects`、`usb_event_lines_parsed`
